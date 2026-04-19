@@ -1,0 +1,4 @@
+[submodule "swe_bench_test/SWE-bench"]
+	path = swe_bench_test/SWE-bench
+	url = git@github.com:albert-lv/SWE-bench.git
+	branch = nano-agent

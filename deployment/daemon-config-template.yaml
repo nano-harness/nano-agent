@@ -1,0 +1,207 @@
+---
+# nano-agent daemon configuration (template)
+api_key: "${NANO_API_KEY}"
+base_url: "${NANO_BASE_URL}"
+model: "${NANO_MODEL}"
+verbose: ${NANO_VERBOSE}
+
+# Working directory - agent tools are restricted to this directory tree
+working_dir: "${NANO_WORKING_DIR}"
+
+# Reasoning tokens configuration (for supported models)
+reasoning:
+  enabled: ${NANO_REASONING_ENABLED}
+  effort: "${NANO_REASONING_EFFORT}"
+  max_tokens: ${NANO_REASONING_MAX_TOKENS}
+  exclude: ${NANO_REASONING_EXCLUDE}
+
+# 系统限制和超时设置
+max_file_size: ${NANO_MAX_FILE_SIZE}
+response_timeout: "${NANO_RESPONSE_TIMEOUT}"
+http_timeout: "${NANO_HTTP_TIMEOUT}"
+
+# 上下文管理
+context:
+  max_tokens: ${NANO_CONTEXT_MAX_TOKENS}
+  compression_ratio: ${NANO_CONTEXT_COMPRESSION_RATIO}
+  preserve_recent_turns: ${NANO_CONTEXT_PRESERVE_RECENT_TURNS}
+  enable_compression: ${NANO_CONTEXT_ENABLE_COMPRESSION}
+
+# 内存系统配置 (Mem0 集成)
+memory:
+  api_key: "${NANO_MEMORY_API_KEY}"
+  base_url: "${NANO_MEMORY_BASE_URL}"
+  org_id: "${NANO_MEMORY_ORG_ID}"
+  project_id: "${NANO_MEMORY_PROJECT_ID}"
+  user_id: "${NANO_MEMORY_USER_ID}"
+  agent_id: "${NANO_MEMORY_AGENT_ID}"
+
+# 安全设置
+confirm_destructive: ${NANO_CONFIRM_DESTRUCTIVE}
+
+# 机密编校（全局）
+secret_redaction:
+  enabled: true
+  include_defaults: true
+  sensitive_keys:
+    - password
+    - passwd
+    - secret
+    - api_key
+    - apikey
+    - token
+    - access_token
+    - authorization
+    - auth
+    - cookie
+    - set-cookie
+    - session
+    - private_key
+    - client_secret
+  additional_patterns:
+    - name: github_token
+      regex: "ghp_[A-Za-z0-9]{36,}"
+      replacement: "[REDACTED_GH_TOKEN]"
+    - name: aws_access_key_id
+      regex: "AKIA[0-9A-Z]{16}"
+      replacement: "[REDACTED_AWS_AK]"
+    - name: aws_secret_access_key
+      regex: "(?i)aws(.{0,20})?secret(.{0,20})?key[^\\S\\r\\n]*[:=][^\\S\\r\\n]*([A-Za-z0-9/+=]{40})"
+      replacement: "[REDACTED_AWS_SK]"
+
+# 工具配置
+enabled_tools: []
+disabled_tools: []
+
+# 网络搜索API密钥
+web_search_api_keys:
+  serper: "${SERPER_API_KEY}"
+  tavily: "${TAVILY_API_KEY}"
+  duckduckgo: ""
+
+# MCP 配置
+enable_mcp: ${NANO_ENABLE_MCP}
+mcp:
+  enable_client: true
+  default_transport: "stdio"
+  timeout: 180s
+  max_retries: 3
+  enable_health_check: true
+  health_check_interval: 30s
+  health_check_timeout: 10s
+  servers:
+    - name: "playwright"
+      description: "playwright headless browser"
+      command: ["npx", "@playwright/mcp@latest"]
+      enabled: true
+      transport: "stdio"
+      timeout: 60s
+    - name: "chrome-devtools"
+      description: "chrome-devtools-mcp (headless, isolated)"
+      command:
+        [
+          "npx",
+          "-y",
+          "chrome-devtools-mcp@latest",
+          "--headless=true",
+          "--isolated=true",
+          "--viewport=1920x1080",
+        ]
+      enabled: true
+      transport: "stdio"
+      timeout: 60s
+    - name: deepwiki
+      description: "DeepWiki MCP server (HTTP)"
+      transport: streamable
+      url: https://mcp.deepwiki.com/mcp
+      enabled: true
+      timeout: 120s
+      headers:
+        Authorization: "${NANO_MCP_DEEPWIKI_AUTHORIZATION}"
+    - name: github
+      description: "Github MCP server (HTTP)"
+      transport: streamable
+      url: https://api.githubcopilot.com/mcp/
+      enabled: true
+      timeout: 120s
+      headers:
+        Authorization: "Bearer ${NANO_MCP_GITHUB_TOKEN}"
+
+# Daemon模式配置
+daemon:
+  port: ${NANO_DAEMON_PORT}
+  host: "${NANO_DAEMON_HOST}"
+  pid_file: "${NANO_DAEMON_PID_FILE}"
+  log_file: "${NANO_DAEMON_LOG_FILE}"
+  enable_cors: ${NANO_DAEMON_ENABLE_CORS}
+  api_key: "${NANO_DAEMON_API_KEY}"
+  tls_cert_file: "${NANO_DAEMON_TLS_CERT_FILE}"
+  tls_key_file: "${NANO_DAEMON_TLS_KEY_FILE}"
+
+oss:
+  enabled: ${OSS_ENABLED}
+  access_key_id: "${OSS_ACCESS_KEY_ID}"
+  access_key_secret: "${OSS_ACCESS_KEY_SECRET}"
+  endpoint: "${OSS_ENDPOINT}"
+  default_bucket: "${OSS_DEFAULT_BUCKET}"
+  region: "${OSS_REGION}"
+  timeout: ${OSS_TIMEOUT}
+  callback_url: "${OSS_CALLBACK_URL}"
+  callback_token: "${OSS_CALLBACK_TOKEN}"
+
+# 图像生成器配置
+image_generator:
+  providers:
+    - provider: "openrouter"
+      model: "${OPENROUTER_IMAGE_MODEL:-google/gemini-2.5-flash-image}"
+      api_key: "${IMAGE_API_KEY}"
+      base_url: "${IMAGE_BASE_URL}"
+      enabled: true
+    - provider: "seedream"
+      model: "${SEEDREAM_IMAGE_MODEL:-doubao-seedream-4-0-250828}"
+      api_key: "${SEEDREAM_API_KEY}"
+      base_url: "${SEEDREAM_BASE_URL}"
+      enabled: true
+
+# 沙箱配置
+# enabled=false 时沙箱完全禁用，工具直接执行，无任何隔离。
+# enabled=true 时:
+#   - Shell 命令 (run_shell_command): Linux 使用 bwrap 进程隔离, macOS 使用 sandbox-exec
+#   - 文件系统工具 (read_file/write_file 等): 使用 allowed_paths/blocked_paths/read_only_paths 路径检查
+sandbox:
+  # 主开关，默认 true（开启）。通过环境变量 NANO_SANDBOX_ENABLED=false 禁用。
+  enabled: ${NANO_SANDBOX_ENABLED:-true}
+
+  # 是否允许沙箱内的 shell 命令访问网络，默认 true（允许）。
+  # 设为 false 可隔离网络（Linux: --unshare-net; macOS: deny network*）。
+  # 通过环境变量 NANO_SANDBOX_NETWORK_ACCESS=false 关闭。
+  network_access: true
+
+  # 文件系统工具路径白名单（空列表 = 不限制）。
+  # 非空时, read_file/write_file/edit_file/delete_file/list_directory 只允许访问列表内路径。
+  # 通过环境变量 NANO_SANDBOX_ALLOWED_PATHS=path1,path2 设置。
+  allowed_paths: []
+
+  # 文件系统工具路径黑名单，优先级高于白名单。
+  # 通过环境变量 NANO_SANDBOX_BLOCKED_PATHS=path1,path2 设置。
+  blocked_paths:
+    - /etc
+    - /sys
+    - /proc
+    - /dev
+
+  # 文件系统工具只读路径（允许读取，拒绝写入/删除）。
+  # 通过环境变量 NANO_SANDBOX_READ_ONLY_PATHS=path1,path2 设置。
+  read_only_paths: []
+
+  # Shell 沙箱内额外只读挂载路径（除默认系统路径外）。
+  # 通过环境变量 NANO_SANDBOX_EXTRA_READ_ONLY_PATHS=path1,path2 设置。
+  extra_read_only_paths: []
+
+  # Shell 沙箱内额外可写挂载路径（除工作目录和 /tmp 外）。
+  # 通过环境变量 NANO_SANDBOX_EXTRA_WRITABLE_PATHS=path1,path2 设置。
+  extra_writable_paths: []
+
+  # (仅 Linux) bwrap 可执行文件路径，为空时从 PATH 自动查找。
+  # 通过环境变量 NANO_SANDBOX_BWRAP_PATH=/usr/bin/bwrap 设置。
+  bwrap_path: ""

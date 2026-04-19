@@ -1,0 +1,463 @@
+package agent
+
+import (
+	"context"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/nano-harness/nano-agent/pkg/config"
+	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/interfaces"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/nano-harness/nano-agent/pkg/tools"
+	"github.com/nano-harness/nano-agent/pkg/tools/system"
+)
+
+type testTool struct {
+	name    string
+	started chan struct{}
+	done    <-chan struct{}
+	wg      *sync.WaitGroup
+}
+
+func (t *testTool) Name() string {
+	return t.name
+}
+
+func (t *testTool) Description() string {
+	return "test tool"
+}
+
+func (t *testTool) Category() interfaces.ToolCategory {
+	return interfaces.CategoryDebug
+}
+
+func (t *testTool) RequiresConfirmation() bool {
+	return false
+}
+
+func (t *testTool) ConcurrencySafe() bool { return true }
+
+func (t *testTool) Schema() *interfaces.ToolSchema {
+	return interfaces.CreateSchema("test tool", map[string]*interfaces.PropertySchema{}, nil)
+}
+
+func (t *testTool) Execute(ctx context.Context, params map[string]interface{}) (*interfaces.ToolResult, error) {
+	if t.wg != nil {
+		t.wg.Add(1)
+		defer t.wg.Done()
+	}
+	if t.started != nil {
+		select {
+		case <-t.started:
+		default:
+			close(t.started)
+		}
+	}
+	<-t.done
+	return nil, ctx.Err()
+}
+
+func ensureConfigLoaded(t *testing.T) {
+	t.Helper()
+	tmp := t.TempDir()
+	path := tmp + "/nano.yaml"
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	if _, err := config.LoadConfig(path); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+}
+
+func TestToolScheduler_ToolNotFoundEmitsEventsAndResult(t *testing.T) {
+	ensureConfigLoaded(t)
+	tb := tools.NewToolbox(".", nil, nil)
+
+	var mu sync.Mutex
+	var events []event.StreamEvent
+	handler := func(e event.StreamEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     handler,
+		RecoveryStrategy: NewToolRecoveryStrategy(handler),
+	})
+
+	results, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "call-1",
+		Name:       "does_not_exist",
+		Parameters: map[string]interface{}{"x": 1},
+	}})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	tr := results["call-1"]
+	if tr == nil {
+		t.Fatalf("expected tool result for call-1")
+	}
+	if tr.Success {
+		t.Fatalf("expected failure")
+	}
+	if tr.Metadata == nil || tr.Metadata["code"] != "tool_not_found" {
+		t.Fatalf("expected metadata code tool_not_found, got %v", tr.Metadata)
+	}
+
+	var sawCall, sawResult, sawUse bool
+	mu.Lock()
+	defer mu.Unlock()
+	for _, e := range events {
+		switch e.Type {
+		case event.EventTypeToolCall:
+			sawCall = true
+		case event.EventTypeToolResult:
+			sawResult = true
+		case event.EventTypeToolUse:
+			sawUse = true
+		}
+	}
+	if !sawCall || !sawResult || !sawUse {
+		t.Fatalf("expected ToolCall/ToolResult/ToolUse events, got call=%v result=%v use=%v", sawCall, sawResult, sawUse)
+	}
+}
+
+type deadlineOnlyContext struct {
+	deadline time.Time
+	done     chan struct{}
+}
+
+func (c *deadlineOnlyContext) Deadline() (time.Time, bool) {
+	return c.deadline, true
+}
+
+func (c *deadlineOnlyContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *deadlineOnlyContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+func (c *deadlineOnlyContext) Value(key interface{}) interface{} {
+	return nil
+}
+
+func TestToolScheduler_ExecutionTimeoutEmitsToolResultAndUpdatesStatus(t *testing.T) {
+	ensureConfigLoaded(t)
+	tb := tools.NewToolbox(".", nil, nil)
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	slow := &testTool{
+		name:    "slow_tool",
+		started: make(chan struct{}),
+		done:    done,
+		wg:      &wg,
+	}
+	if err := tb.Register(slow); err != nil {
+		t.Fatalf("failed to register tool: %v", err)
+	}
+
+	var mu sync.Mutex
+	var events []event.StreamEvent
+	handler := func(e event.StreamEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     handler,
+		RecoveryStrategy: NewToolRecoveryStrategy(handler),
+	})
+
+	ctx := &deadlineOnlyContext{
+		deadline: time.Now().Add(20 * time.Millisecond),
+		done:     make(chan struct{}),
+	}
+
+	resultCh := make(chan map[string]*interfaces.ToolResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		results, err := ts.ExecuteParallel(ctx, []ToolToExecute{{
+			ID:   "call-2",
+			Name: "slow_tool",
+		}})
+		resultCh <- results
+		errCh <- err
+	}()
+
+	select {
+	case <-slow.started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("tool did not start")
+	}
+
+	var results map[string]*interfaces.ToolResult
+	select {
+	case err := <-errCh:
+		// Timeout no longer propagates as an error; ExecuteParallel returns partial results.
+		if err != nil {
+			t.Fatalf("expected nil error on timeout (partial results returned), got: %v", err)
+		}
+		results = <-resultCh
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected ExecuteParallel to return")
+	}
+
+	mu.Lock()
+	sawTimeoutResult := false
+	for _, e := range events {
+		if e.Type == event.EventTypeToolResult && e.ToolResult != nil && e.ToolResult.Error == "execution timeout" {
+			sawTimeoutResult = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !sawTimeoutResult {
+		t.Fatalf("expected ToolResult event with execution timeout")
+	}
+
+	close(done)
+	close(ctx.done)
+	wg.Wait()
+
+	// Verify the timeout result is present in the returned map (not in internal state,
+	// which may have been cleared by the async ClearSpecificToolCalls).
+	tr, ok := results["call-2"]
+	if !ok || tr == nil || tr.Metadata == nil {
+		t.Fatalf("expected timeout result in returned map, got: %v", results)
+	}
+	if tr.Metadata["code"] != "execution_timeout" {
+		t.Fatalf("expected code execution_timeout, got %v", tr.Metadata["code"])
+	}
+}
+
+// ─── Security pre-analysis tests ─────────────────────────────────────────────
+
+// newShellToolbox creates a Toolbox backed by a real ShellTool rooted at
+// workDir, replacing the default shell tool registration.
+func newShellToolbox(t *testing.T, workDir string) *tools.Toolbox {
+	t.Helper()
+	tb := tools.NewToolbox(".", nil, nil)
+	// The default toolbox registers run_shell_command; swap it for one rooted
+	// at the test's working directory.
+	if err := tb.Unregister("run_shell_command"); err != nil {
+		t.Fatalf("unregister default ShellTool: %v", err)
+	}
+	shellTool := system.NewShellTool(workDir, nil, nil)
+	if err := tb.Register(shellTool); err != nil {
+		t.Fatalf("register ShellTool: %v", err)
+	}
+	return tb
+}
+
+// TestToolScheduler_BlockedShellCommand_NoApproval verifies that a command
+// classified as ActionBlock is rejected immediately without invoking the
+// approval handler (user confirmation must not be triggered for blocked cmds).
+func TestToolScheduler_BlockedShellCommand_NoApproval(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+
+	var mu sync.Mutex
+	var events []event.StreamEvent
+	handler := func(e event.StreamEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	approvalCalled := false
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     handler,
+		RecoveryStrategy: NewToolRecoveryStrategy(handler),
+		ApprovalHandler: func(_ *ToolCallInfo) bool {
+			approvalCalled = true
+			return true
+		},
+	})
+
+	results, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "blocked-1",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "mkfs /dev/sda"},
+	}})
+	if err != nil {
+		t.Fatalf("ExecuteParallel: unexpected error: %v", err)
+	}
+
+	tr := results["blocked-1"]
+	if tr == nil {
+		t.Fatal("expected a result for blocked-1")
+	}
+	if tr.Success {
+		t.Error("expected failure for blocked command")
+	}
+	if tr.Metadata == nil || tr.Metadata["code"] != "security_blocked" {
+		t.Errorf("expected code=security_blocked, got metadata: %v", tr.Metadata)
+	}
+	if approvalCalled {
+		t.Error("approval handler must not be called for blocked commands")
+	}
+}
+
+// TestToolScheduler_ConfirmShellCommand_TriggersApproval verifies that a
+// command classified as ActionConfirm still triggers the approval handler.
+func TestToolScheduler_ConfirmShellCommand_TriggersApproval(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+
+	var mu sync.Mutex
+	var events []event.StreamEvent
+	handler := func(e event.StreamEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	approvalCalled := false
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     handler,
+		RecoveryStrategy: NewToolRecoveryStrategy(handler),
+		ApprovalHandler: func(_ *ToolCallInfo) bool {
+			approvalCalled = true
+			return true // sync-approve
+		},
+	})
+
+	// "cmd1 && cmd2" is a compound command → ActionConfirm.
+	_, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "confirm-1",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "cmd1 && cmd2"},
+	}})
+	if err != nil {
+		t.Fatalf("ExecuteParallel: unexpected error: %v", err)
+	}
+
+	if !approvalCalled {
+		t.Error("approval handler should have been called for ActionConfirm command")
+	}
+}
+
+// TestToolScheduler_AllowShellCommand_NoApproval verifies that a read-only
+// command (ActionAllow) is executed without triggering the approval handler.
+func TestToolScheduler_AllowShellCommand_NoApproval(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+
+	var mu sync.Mutex
+	var events []event.StreamEvent
+	handler := func(e event.StreamEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	approvalCalled := false
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     handler,
+		RecoveryStrategy: NewToolRecoveryStrategy(handler),
+		ApprovalHandler: func(_ *ToolCallInfo) bool {
+			approvalCalled = true
+			return true
+		},
+	})
+
+	results, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "allow-1",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "echo hello"},
+	}})
+	if err != nil {
+		t.Fatalf("ExecuteParallel: unexpected error: %v", err)
+	}
+
+	tr := results["allow-1"]
+	if tr == nil {
+		t.Fatal("expected result for allow-1")
+	}
+	if !tr.Success {
+		t.Errorf("expected success for allowed command, got error: %s", tr.Error)
+	}
+	if approvalCalled {
+		t.Error("approval handler must not be called for ActionAllow commands")
+	}
+}
+
+// TestToolScheduler_SecurityDecisionInjectedInContext verifies that the
+// pre-computed security decision is injected into the execution context so
+// downstream layers (SecurityMiddleware, ShellTool.Execute) can skip redundant
+// analysis.
+func TestToolScheduler_SecurityDecisionInjectedInContext(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+
+	// Create a spy ShellTool that records whether a security decision was in
+	// the context when Execute was called.
+	spyTool := &spyShellTool{
+		ShellTool: system.NewShellTool(tempDir, nil, nil),
+	}
+	tb := tools.NewToolbox(".", nil, nil)
+	if err := tb.Unregister("run_shell_command"); err != nil {
+		t.Fatalf("unregister default ShellTool: %v", err)
+	}
+	if err := tb.Register(spyTool); err != nil {
+		t.Fatalf("register spy tool: %v", err)
+	}
+
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     func(_ event.StreamEvent) {},
+		RecoveryStrategy: NewToolRecoveryStrategy(nil),
+	})
+
+	_, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "spy-1",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "echo hello"},
+	}})
+	if err != nil {
+		t.Fatalf("ExecuteParallel: %v", err)
+	}
+
+	if !spyTool.hadDecision {
+		t.Error("expected security decision to be present in execution context")
+	}
+}
+
+// spyShellTool wraps ShellTool and records whether a security decision was
+// present in the context when Execute was called.
+type spyShellTool struct {
+	*system.ShellTool
+	hadDecision bool
+}
+
+func (s *spyShellTool) Name() string { return "run_shell_command" }
+
+func (s *spyShellTool) Execute(ctx context.Context, params map[string]interface{}) (*interfaces.ToolResult, error) {
+	s.hadDecision = middleware.HasSecurityDecision(ctx)
+	return s.ShellTool.Execute(ctx, params)
+}

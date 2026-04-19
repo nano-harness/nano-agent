@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux/amd64
+            os: ubuntu-latest
+            artifact_name: nano-linux-amd64
+          - target: linux/arm64
+            os: ubuntu-latest
+            artifact_name: nano-linux-arm64
+          - target: darwin/amd64
+            os: macos-latest
+            artifact_name: nano-darwin-amd64
+          - target: darwin/arm64
+            os: macos-latest
+            artifact_name: nano-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ fromJSON('{"linux/amd64":"linux","linux/arm64":"linux","darwin/amd64":"darwin","darwin/arm64":"darwin"}')[matrix.target] }}
+          GOARCH: ${{ fromJSON('{"linux/amd64":"amd64","linux/arm64":"arm64","darwin/amd64":"amd64","darwin/arm64":"arm64"}')[matrix.target] }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT_HASH: ${{ github.sha }}
+        run: |
+          SHORT_HASH="${COMMIT_HASH:0:7}"
+          BUILD_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          LDFLAGS="-X github.com/nano-harness/nano-agent/pkg/version.Version=${VERSION} -X github.com/nano-harness/nano-agent/pkg/version.BuildTime=${BUILD_TIME} -X github.com/nano-harness/nano-agent/pkg/version.CommitHash=${SHORT_HASH}"
+          go build -ldflags "${LDFLAGS}" -o ${{ matrix.artifact_name }} ./cmd/nano
+          sha256sum ${{ matrix.artifact_name }} | awk '{print $1}' > ${{ matrix.artifact_name }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+          retention-days: 1
+
+  release:
+    name: GitHub Release & OSS Upload
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/nano-linux-amd64
+            dist/nano-linux-amd64.sha256
+            dist/nano-linux-arm64
+            dist/nano-linux-arm64.sha256
+            dist/nano-darwin-amd64
+            dist/nano-darwin-amd64.sha256
+            dist/nano-darwin-arm64
+            dist/nano-darwin-arm64.sha256
+          generate_release_notes: true
+
+      - name: Setup ossutil
+        run: |
+          curl -sSL https://gosspublic.alicdn.com/ossutil/v2/2.2.1/ossutil-2.2.1-linux-amd64.zip -o ossutil.zip
+          unzip ossutil.zip
+          sudo mv ossutil-2.2.1-linux-amd64/ossutil /usr/local/bin/ossutil
+
+      - name: Upload binaries to OSS (versioned)
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.RELEASE_OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.RELEASE_OSS_ACCESS_KEY_SECRET }}
+        run: |
+          TAG=${{ github.ref_name }}
+          ossutil cp dist/nano-linux-amd64         oss://binary-releases/nano/releases/${TAG}/nano-linux-amd64         --force --region cn-hangzhou
+          ossutil cp dist/nano-linux-amd64.sha256  oss://binary-releases/nano/releases/${TAG}/nano-linux-amd64.sha256  --force --region cn-hangzhou
+          ossutil cp dist/nano-linux-arm64         oss://binary-releases/nano/releases/${TAG}/nano-linux-arm64         --force --region cn-hangzhou
+          ossutil cp dist/nano-linux-arm64.sha256  oss://binary-releases/nano/releases/${TAG}/nano-linux-arm64.sha256  --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-amd64        oss://binary-releases/nano/releases/${TAG}/nano-darwin-amd64        --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-amd64.sha256 oss://binary-releases/nano/releases/${TAG}/nano-darwin-amd64.sha256 --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-arm64        oss://binary-releases/nano/releases/${TAG}/nano-darwin-arm64        --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-arm64.sha256 oss://binary-releases/nano/releases/${TAG}/nano-darwin-arm64.sha256 --force --region cn-hangzhou
+
+      - name: Upload binaries to OSS (latest)
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.RELEASE_OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.RELEASE_OSS_ACCESS_KEY_SECRET }}
+        run: |
+          TAG=${{ github.ref_name }}
+          echo "${TAG}" > version.txt
+          ossutil cp dist/nano-linux-amd64         oss://binary-releases/nano/latest/nano-linux-amd64         --force --region cn-hangzhou
+          ossutil cp dist/nano-linux-amd64.sha256  oss://binary-releases/nano/latest/nano-linux-amd64.sha256  --force --region cn-hangzhou
+          ossutil cp dist/nano-linux-arm64         oss://binary-releases/nano/latest/nano-linux-arm64         --force --region cn-hangzhou
+          ossutil cp dist/nano-linux-arm64.sha256  oss://binary-releases/nano/latest/nano-linux-arm64.sha256  --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-amd64        oss://binary-releases/nano/latest/nano-darwin-amd64        --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-amd64.sha256 oss://binary-releases/nano/latest/nano-darwin-amd64.sha256 --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-arm64        oss://binary-releases/nano/latest/nano-darwin-arm64        --force --region cn-hangzhou
+          ossutil cp dist/nano-darwin-arm64.sha256 oss://binary-releases/nano/latest/nano-darwin-arm64.sha256 --force --region cn-hangzhou
+          ossutil cp scripts/install.sh            oss://binary-releases/nano/latest/install.sh               --force --region cn-hangzhou
+          ossutil cp version.txt                   oss://binary-releases/nano/latest/version.txt              --force --region cn-hangzhou

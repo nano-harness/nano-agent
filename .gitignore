@@ -1,0 +1,76 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Configuration files with secrets
+.env
+.nano.yaml
+client-config.yaml
+daemon-config.yaml
+
+# Output directories
+output/
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+
+*.log
+*.tar.gz
+*.json
+*.jsonl
+
+venv/
+
+__pycache__/
+
+.zoekt
+
+results
+
+node_modules
+.nano/
+.nano-agent/
+
+# Root Binaries
+/gateway
+/nano
+/runtime-cli
+/runtime-nano-agent
+/worker
+/connector
+/nano-connector
+/test-client
