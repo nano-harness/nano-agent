@@ -7,7 +7,8 @@
 ## ✨ 特性
 
 - **多种运行模式**: TUI交互模式、Bubble Tea TUI 模式、Daemon后台服务模式、Client客户端模式和一次性 Binary 模式
-- **Fork子代理**: 以类型化角色（explore、plan、verify、execute）派生子代理，支持并行子任务委派和深度限制递归
+- **专家系统**: 通过`@expert-name`语法调用专门的子代理,包括内置的`@investigator`（只读代码探索）、`@help`（CLI帮助）和`@generalist`（通用代理）。支持通过YAML前置元数据在Markdown文件中定义自定义专家
+- **后台任务管理**: 支持在后台运行长时间运行的Shell命令，具有实时输出流、任务监控和优雅关闭功能
 - **基于回合的架构**: 通过智能工作流选择消除简单查询的过度规划
 - **动态规划系统**: 实时待办事项列表生成和自适应执行
 - **模块化工具系统**: 全面的文件操作、搜索、Web功能和内存管理
@@ -324,6 +325,179 @@ make deps-update
   - 仅使用 `image_urls` 作为图像输入；单图编辑传一个元素的数组即可。
   - URL 会上传到临时 OSS 存储，便于分享与复用。
 
+## 👥 专家系统
+
+nano-agent提供了一个专门的专家系统，允许您使用`@expert-name`语法将任务委托给专用代理。
+
+> **⚠️ 重要变更**: 从v0.8.0开始，旧的`fork`工具已被移除。LLM不能再自主派生子代理。所有专家调用必须由用户使用`@expert-name`语法显式触发。
+
+### 内置专家
+
+nano-agent包含三个始终可用的内置专家：
+
+- **`@investigator`** - 只读代码库探索和分析
+  - 用于理解代码库、查找实现、分析架构
+  - 无法修改文件——完全只读访问
+  - 非常适合："在哪里处理认证？"、"此组件如何工作？"
+
+- **`@help`** - nano-agent CLI使用助手
+  - 回答关于nano-agent功能和用法的问题
+  - 从nano-agent文档提供帮助
+  - 非常适合："如何配置MCP服务器？"、"可用哪些斜杠命令？"
+
+- **`@generalist`** - 具有完整工具访问权限的通用代理
+  - 可以读取、写入、执行——具有完整工具集访问权限
+  - 用于需要多种工具的通用任务
+  - 与主代理类似，但作为专注的子任务运行
+
+### 使用专家
+
+通过`@expert-name`语法触发专家，后跟您的请求：
+
+```bash
+# 探索代码库（只读）
+@investigator 查找所有认证代码并解释其工作原理
+
+# 获取nano-agent使用帮助
+@help 如何配置MCP服务器？
+
+# 使用完整工具访问委托任务
+@generalist 重构用户模块以使用新的auth系统
+```
+
+### 专家命令
+
+使用斜杠命令管理和检查专家：
+
+```bash
+# 列出所有可用专家
+/agents
+
+# 显示特定专家的详细信息
+/agents:show investigator
+```
+
+### 自定义专家
+
+通过在以下位置创建带有YAML前置元数据的Markdown文件来定义您自己的专家：
+
+- **用户级**: `~/.config/nano/agents/` - 您的个人专家
+- **项目级**: `.nano/agents/` - 特定项目的专家
+
+示例自定义专家文件 (`~/.config/nano/agents/my-coder.md`):
+
+```markdown
+---
+name: coder
+displayName: "精英编码员"
+description: "擅长编写生产质量代码的专家编码员"
+model: "claude-opus-4"
+temperature: 0.7
+maxTurns: 30
+maxTimeMinutes: 15
+allowedTools:
+  - read_file
+  - write_file
+  - edit_file
+  - execute_shell
+input:
+  objective:
+    type: string
+    description: "要实现的编码目标"
+output:
+  name: code
+  description: "生成的代码和解释"
+---
+
+您是一位专业的编码专家。编写干净、可维护、经过充分测试的代码。
+遵循最佳实践并包含适当的错误处理。
+```
+
+然后使用以下命令触发：
+
+```bash
+@coder 实现一个带有速率限制的缓存系统
+```
+
+### 专家vs主代理
+
+**何时使用专家：**
+- 您想委托特定的子任务
+- 您需要专门的行为（只读、特定工具集）
+- 您想要一个专注的上下文用于子任务
+- 您更喜欢显式控制何时使用子代理
+
+**何时使用主代理：**
+- 您正在进行对话式工作流程
+- 任务不需要特殊的工具限制
+- 您想要单一、连续的上下文
+
+### 配置
+
+在`.nano.yaml`中配置专家系统：
+
+```yaml
+# 自动发现目录中的自定义专家
+expert_directories:
+  - "~/.config/nano/agents"  # 用户级专家
+  - ".nano/agents"           # 项目级专家
+
+# 专家默认设置
+expert_defaults:
+  maxTurns: 20
+  maxTimeMinutes: 10
+  temperature: 0.7
+```
+
+### 与旧版Fork系统的主要区别
+
+> **⚠️ 重大变更**: 专家系统取代了之前的`fork`工具：
+>
+> 1. **仅显式触发**: LLM不能自主调用专家。只有用户可以通过`@expert-name`触发它们。
+> 2. **更好的可观测性**: 您始终知道何时调用了专家以及成本是多少。
+> 3. **短横线命名**: 使用`@investigator`而不是`@codebase_investigator`。名称会从YAML配置自动转换。
+> 4. **移除隐式fork**: 旧的`fork`工具已被完全移除 - 所有子代理调用必须由用户显式触发。
+
+## 🔄 后台任务管理
+
+nano-agent支持在后台运行长时间运行的Shell命令，具有全面的任务管理功能。
+
+### 功能特性
+
+- **非阻塞执行**: 超过超时限制的命令会自动在后台模式下运行
+- **实时输出流**: 使用可配置的回调和16MB缓冲区限制流式传输命令输出
+- **任务监控**: 列出、监控和检索后台任务的输出
+- **优雅关闭**: 使用 SIGTERM → 宽限期 → SIGKILL 自动清理，确保进程正确终止
+- **会话隔离**: 任务按会话隔离，每个会话最多100个任务
+- **日志管理**: 每个任务100MB日志文件大小限制，防止磁盘耗尽
+
+### 后台任务工具
+
+- **`execute_shell`** 配合 `is_background: true`: 显式以后台模式运行命令
+- **`bash_output`**: 使用增量读取和偏移跟踪检索任务输出
+- **`kill_bash`**: 优雅地终止后台任务
+- **`list_background_tasks`**: 列出当前会话的所有任务及其状态
+
+### 使用示例
+
+```bash
+# 在后台运行长时间运行的命令
+execute_shell "npm run build" --is-background true
+
+# 检查后台任务输出
+bash_output <task_id>
+
+# 列出所有后台任务
+list_background_tasks
+
+# 终止后台任务
+kill_bash <task_id>
+```
+
+### 自动后台模式
+
+超过超时限制（默认120秒，最大600秒）的命令会自动转换为后台执行，返回任务ID以供监控。
+
 ## 🧠 推理支持
 
 nano-agent为OpenAI的o1推理模型提供原生支持，通过可配置的推理参数实现增强的问题解决能力。
@@ -540,17 +714,38 @@ nano config paths
 
 ### MCP配置
 
-为模型上下文协议设置创建`.nano.yaml`配置文件:
+模型上下文协议（MCP）使 nano-agent 能够连接到外部服务器以扩展功能。
+
+#### 支持的传输类型
+
+- **`stdio`**: 标准输入/输出进程通信（本地服务器的默认方式）
+- **`streamable`**: 使用服务器发送事件（SSE）的 HTTP 传输，用于远程服务器
+- **`inmemory`**: 内存传输，用于测试
+
+**注意**: 旧的传输类型（`http`、`sse`、`websocket`）不再受支持。请使用 `streamable` 用于基于 HTTP 的服务器。
+
+#### 快速入门
 
 ```bash
-# 复制示例配置
-cp .nano.yaml.example .nano.yaml
+# 交互式配置向导
+nano mcp wizard
 
-# 或使用交互式配置
-nano mcp config
+# 非交互式添加服务器
+nano mcp add filesystem npx -y @modelcontextprotocol/server-filesystem /tmp
+
+# 添加远程 HTTP 服务器
+nano mcp add myserver --transport streamable https://api.example.com/mcp
+
+# 列出已配置的服务器
+nano mcp list
+
+# 测试服务器连接
+nano mcp test filesystem
 ```
 
-示例MCP配置:
+#### 配置文件
+
+创建或编辑 `~/.nano/config.yaml`:
 
 ```yaml
 enable_mcp: true
@@ -560,11 +755,55 @@ mcp:
   timeout: 30s
   max_retries: 3
   servers:
+    # 本地 stdio 服务器
     - name: "filesystem"
       description: "文件系统操作"
       transport: "stdio"
       command: ["npx", "@modelcontextprotocol/server-filesystem", "./workspace"]
       enabled: true
+
+    # 带 OAuth 的远程 HTTP 服务器
+    - name: "api-server"
+      description: "远程 API 服务器"
+      transport: "streamable"
+      url: "https://api.example.com/mcp"
+      enabled: true
+      oauth:
+        authorization_url: "https://auth.example.com/oauth/authorize"
+        token_url: "https://auth.example.com/oauth/token"
+        client_id: "your-client-id"
+        scopes: "read write"
+```
+
+#### OAuth 2.0 身份验证
+
+对于需要 OAuth 身份验证的服务器：
+
+```bash
+# 使用 OAuth 授权（打开浏览器）
+nano mcp auth api-server
+
+# 查看已存储的令牌
+nano mcp auth --list
+
+# 撤销令牌
+nano mcp auth api-server --revoke
+```
+
+令牌会自动注入到请求中，并在需要时自动刷新。详细的 OAuth 配置请参见 [docs/MCP_OAUTH.md](docs/MCP_OAUTH.md)。
+
+#### 从旧传输类型迁移
+
+如果您的服务器配置使用了 `transport: http`、`transport: sse` 或 `transport: websocket`，请更新为使用 `transport: streamable`：
+
+```yaml
+# 之前（不支持）
+transport: http
+url: https://api.example.com/mcp
+
+# 之后（正确）
+transport: streamable
+url: https://api.example.com/mcp
 ```
 
 ## 🔄 Daemon模式

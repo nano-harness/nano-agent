@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nano-harness/nano-agent/pkg/middleware"
 )
 
 func TestShellTool(t *testing.T) {
@@ -157,7 +159,11 @@ func TestShellTool(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := tool.Execute(context.Background(), tt.params)
+			// Add security decision to context to allow command execution in tests
+			decision := &middleware.Decision{Action: middleware.ActionAllow}
+			ctx := middleware.WithSecurityDecision(context.Background(), decision)
+
+			result, err := tool.Execute(ctx, tt.params)
 
 			if tt.wantErr {
 				if err != nil || !result.Success {

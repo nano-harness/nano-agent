@@ -8,6 +8,7 @@ import (
 
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/engine"
+	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/slash"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -51,16 +52,22 @@ const (
 // constant so the scrolling window stays consistent.
 const commandsPaletteVisibleRows = 15
 
+// commandsPaletteScrollPadding controls the minimum number of rows between the
+// selected item and the top/bottom edges of the visible window. When the selection
+// comes within this many rows of the edge, the viewport scrolls to keep the
+// selection comfortably positioned (avoiding "edge-hugging" behavior).
+const commandsPaletteScrollPadding = 3
+
 // -- Model --
 
 // displayPhase represents the current content display phase
 type displayPhase int
 
 const (
-	phaseIdle displayPhase = iota
-	phaseThinking   // 正在展示推理内容
-	phaseToolCall   // 正在展示工具调用
-	phaseResponse   // 正在展示最终回复
+	phaseIdle     displayPhase = iota
+	phaseThinking              // 正在展示推理内容
+	phaseToolCall              // 正在展示工具调用
+	phaseResponse              // 正在展示最终回复
 )
 
 type Model struct { //nolint:revive
@@ -94,6 +101,11 @@ type Model struct { //nolint:revive
 	// allowlistHandler is invoked when the user picks option 2 ("同意并不再询问").
 	allowlistHandler func(toolName string, params map[string]interface{})
 
+	// newSessionHandler is invoked when the user requests a brand-new session
+	// (via Ctrl+R or /clear). The handler is expected to create a new agent
+	// session and return its ID for status display.
+	newSessionHandler func() string
+
 	// Token status (令牌细分展示)
 	tokenStatus string
 
@@ -108,6 +120,10 @@ type Model struct { //nolint:revive
 	// Permission management
 	permissionManager *permission.Manager
 	permissionMode    string // cached permission mode for status bar display
+
+	// Persistent allowlist for /disallow cleanup
+	persistentAllowlist *permission.PersistentAllowlistStore
+	workdir             string
 
 	// Engine management
 	engine *engine.Engine
@@ -184,11 +200,28 @@ func (m *Model) Init() tea.Cmd { //nolint:revive
 	)
 }
 
-// ClearSession clears the current session and starts fresh
-func (m *Model) ClearSession() {
-	// Reset session state
+// ClearSession resets all UI state and (if handler set) starts a new agent session.
+// Returns the new session ID if one was created.
+func (m *Model) ClearSession() string {
+	// Reset all session state
 	m.lines = make([]string, 0)
 	m.sessionStartTime = time.Now()
+	m.thinkingTitle = ""
+	m.thinkingReasoning = ""
+	m.thinkingCompleted = false
+	m.thinkingCollapsed = false
+	m.streamingBuf.Reset()
+	m.isStreaming = false
+	m.activeToolCalls = make(map[string]string)
+	m.currentPhase = phaseIdle
+	m.tokenStatus = ""
+	m.status = "等待输入"
+
+	newID := ""
+	if m.newSessionHandler != nil {
+		newID = m.newSessionHandler()
+	}
+	return newID
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
@@ -201,18 +234,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			case "up", "k":
 				if m.commandsIndex > 0 {
 					m.commandsIndex--
-					// Scroll up if selection moved above visible window.
-					if m.commandsIndex < m.commandsScrollOffset {
-						m.commandsScrollOffset = m.commandsIndex
+					// Sticky scroll: scroll up when selection approaches top edge
+					if m.commandsIndex-m.commandsScrollOffset < commandsPaletteScrollPadding {
+						m.commandsScrollOffset = m.commandsIndex - commandsPaletteScrollPadding
+						if m.commandsScrollOffset < 0 {
+							m.commandsScrollOffset = 0
+						}
 					}
 				}
 				return m, nil
 			case "down", "j":
 				if m.commandsIndex < len(m.commands)-1 {
 					m.commandsIndex++
-					// Scroll down if selection moved below visible window.
-					if m.commandsIndex >= m.commandsScrollOffset+commandsPaletteVisibleRows {
-						m.commandsScrollOffset = m.commandsIndex - commandsPaletteVisibleRows + 1
+					maxOffset := len(m.commands) - commandsPaletteVisibleRows
+					if maxOffset < 0 {
+						maxOffset = 0
+					}
+					// Sticky scroll: scroll down when selection approaches bottom edge
+					if m.commandsIndex-m.commandsScrollOffset >= commandsPaletteVisibleRows-commandsPaletteScrollPadding {
+						m.commandsScrollOffset = m.commandsIndex - commandsPaletteVisibleRows + commandsPaletteScrollPadding + 1
+						if m.commandsScrollOffset > maxOffset {
+							m.commandsScrollOffset = maxOffset
+						}
 					}
 				}
 				return m, nil
@@ -351,6 +394,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		case "ctrl+p":
 			m.openCommandsPalette()
 			return m, nil
+		case "ctrl+r":
+			// Ctrl+R: Start a new session (clear context)
+			newID := m.ClearSession()
+			msg := "已开启新会话"
+			if newID != "" {
+				msg = fmt.Sprintf("已开启新会话 (id: %s)", newID)
+			}
+			line := formatLine("system", msg)
+			m.lines = append(m.lines, line)
+			return m, tea.Sequence(
+				tea.ClearScreen,
+				tea.Printf("%s", line),
+			)
 		}
 
 	case tea.WindowSizeMsg:
@@ -700,15 +756,15 @@ func (m *Model) renderInputSection(b *strings.Builder) {
 // renderer's line count to differ from actual displayed lines, leading to
 // duplicate View output in non-AltScreen (inline) mode.
 func (m *Model) buildHelpText() string {
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
 	if m.termWidth <= 0 || lipgloss.Width(full) <= m.termWidth {
 		return full
 	}
-	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
+	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
 	if lipgloss.Width(short) <= m.termWidth {
 		return short
 	}
-	minimal := "^C退出 | ^Z取消 | ^P命令 | Tab补全"
+	minimal := "^C退出 | ^Z取消 | ^R新会话 | ^P命令 | Tab补全"
 	if lipgloss.Width(minimal) <= m.termWidth {
 		return minimal
 	}
@@ -852,6 +908,13 @@ func (m *Model) SetPermissionManager(mgr *permission.Manager) {
 	}
 }
 
+// SetPersistentAllowlist wires the persistent allowlist store and workdir
+// so /disallow can remove rules from persistent storage.
+func (m *Model) SetPersistentAllowlist(store *permission.PersistentAllowlistStore, workdir string) {
+	m.persistentAllowlist = store
+	m.workdir = workdir
+}
+
 // SetEngine wires an Engine so that slash commands (/think) can control
 // thinking mode and other engine-level settings at runtime.
 func (m *Model) SetEngine(eng *engine.Engine) {
@@ -861,6 +924,12 @@ func (m *Model) SetEngine(eng *engine.Engine) {
 // SetAvailableToolNames sets the list of tool names used for Tab completion.
 func (m *Model) SetAvailableToolNames(names []string) {
 	m.availableToolNames = names
+}
+
+// SetNewSessionHandler wires the callback used by Ctrl+R / /clear to create
+// a new agent session.
+func (m *Model) SetNewSessionHandler(h func() string) {
+	m.newSessionHandler = h
 }
 
 // handlePermissionSlashCommand intercepts locally-handled slash commands and
@@ -967,6 +1036,12 @@ func (m *Model) handlePermissionSlashCommand(input string) (bool, tea.Cmd) {
 			return true, tea.Printf("%s", line)
 		}
 		pm.GetSessionAllowlist().RemoveRule(raw)
+		// Also remove from persistent storage
+		if m.persistentAllowlist != nil && m.workdir != "" {
+			if _, err := m.persistentAllowlist.RemoveRuleForWorkdir(m.workdir, raw); err != nil {
+				logger.Warnf("Failed to remove persistent allowlist rule %q: %v", raw, err)
+			}
+		}
 		line := m.renderPermissionFeedback("success",
 			fmt.Sprintf("🗑️ 已移除白名单规则：%s", raw), "")
 		m.lines = append(m.lines, line)
@@ -985,6 +1060,20 @@ func (m *Model) handlePermissionSlashCommand(input string) (bool, tea.Cmd) {
 		line := m.renderPermissionFeedback("info", result, "")
 		m.lines = append(m.lines, line)
 		return true, tea.Printf("%s", line)
+
+	case lower == "/clear", lower == "/new":
+		// /clear or /new: Start a new session (clear context) - equivalent to Ctrl+R
+		newID := m.ClearSession()
+		msg := "已开启新会话"
+		if newID != "" {
+			msg = fmt.Sprintf("已开启新会话 (id: %s)", newID)
+		}
+		line := formatLine("system", msg)
+		m.lines = append(m.lines, line)
+		return true, tea.Sequence(
+			tea.ClearScreen,
+			tea.Printf("%s", line),
+		)
 	}
 
 	return false, nil
@@ -1302,35 +1391,45 @@ func (m *Model) renderCommandsPalette(b *strings.Builder) {
 	categoryLabels := map[slash.Category]string{
 		slash.CategoryPermission: "权限",
 		slash.CategorySkill:      "Skills",
-		slash.CategorySchedule:   "调度",
+		slash.CategoryRoutines:   "调度",
 		slash.CategoryOpenSpec:   "OpenSpec",
 		slash.CategoryCustom:     "自定义",
 	}
 	categoryColors := map[slash.Category]string{
 		slash.CategoryPermission: colorWarning,
 		slash.CategorySkill:      colorSuccess,
-		slash.CategorySchedule:   colorStatus,
+		slash.CategoryRoutines:   colorStatus,
 		slash.CategoryOpenSpec:   colorOpenSpec,
 		slash.CategoryCustom:     colorSystem,
 	}
 
-	// Only render the visible slice.
-	end := m.commandsScrollOffset + visibleRows
-	if end > total {
-		end = total
-	}
-	visible := m.commands[m.commandsScrollOffset:end]
-
+	// Render commands with dynamic row calculation that accounts for category headers.
+	// We iterate through all commands starting from the scroll offset, rendering
+	// each command and its category header (if it's the first in that category).
+	// We stop when we've rendered visibleRows worth of content (commands + headers).
 	currentCat := slash.Category("")
-	for idx, it := range visible {
-		i := m.commandsScrollOffset + idx
+	renderedRows := 0
+	startIdx := m.commandsScrollOffset
+
+	for i := startIdx; i < total && renderedRows < visibleRows; i++ {
+		it := m.commands[i]
+
+		// If entering a new category, render the header (counts as 2 rows: blank line + header)
 		if it.Category != currentCat {
 			currentCat = it.Category
 			label := categoryLabels[currentCat]
 			color := categoryColors[currentCat]
 			catStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(color))
 			b.WriteString("\n" + catStyle.Render("── "+label+" ──") + "\n")
+			renderedRows += 2
+
+			// If we've already hit the limit with just the header, stop
+			if renderedRows >= visibleRows {
+				break
+			}
 		}
+
+		// Render the command item (counts as 1 row)
 		prefix := "  "
 		if i == m.commandsIndex {
 			prefix = "> "
@@ -1340,6 +1439,7 @@ func (m *Model) renderCommandsPalette(b *strings.Builder) {
 			line = fmt.Sprintf("%s/%s  [%s] %s\n", prefix, it.Name, it.Source, it.Description)
 		}
 		b.WriteString(line)
+		renderedRows++
 	}
 	b.WriteString("\n")
 

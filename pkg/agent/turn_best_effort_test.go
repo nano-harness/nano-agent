@@ -118,8 +118,10 @@ func TestTurn_ToolFailureDoesNotCauseEarlyTermination(t *testing.T) {
 		Tools:         tb.List(),
 		ToolScheduler: scheduler,
 	})
-	// Low threshold: without the fix this would terminate after 2 failures.
-	turn.CompletionCriteria.ErrorThreshold = 2
+	// Set threshold to 4 to allow 3 failing iterations without early termination.
+	// ConsecutiveErrors increments once per iteration when all tools fail and
+	// none succeed, so ErrorThreshold > 3 allows implicit completion to fire.
+	turn.CompletionCriteria.ErrorThreshold = 4
 
 	if err := turn.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute returned error: %v", err)
@@ -170,5 +172,56 @@ func TestTurn_ErrorThresholdDefault(t *testing.T) {
 	}
 	if turn.CompletionCriteria.ErrorThreshold != 10 {
 		t.Fatalf("expected ErrorThreshold=10, got %d", turn.CompletionCriteria.ErrorThreshold)
+	}
+}
+
+// TestTurn_AllToolsFailedIncrementsConsecutiveErrors verifies the production
+// helper updateConsecutiveErrorsFromToolResults:
+//  1. Increments ConsecutiveErrors once when all tools in a batch fail.
+//  2. Resets ConsecutiveErrors to 0 when at least one tool in the batch succeeds.
+//
+// This is the exact logic used by the main Execute() loop after addToolResultsToContext,
+// so testing the helper directly guarantees the production code path is covered
+// without re-implementing the branching in the test.
+func TestTurn_AllToolsFailedIncrementsConsecutiveErrors(t *testing.T) {
+	turn := newTestTurn()
+	turn.CompletionCriteria.ConsecutiveErrors = 0
+
+	// All tools fail → ConsecutiveErrors should increment by exactly 1 per batch,
+	// regardless of how many individual tool results failed.
+	allFailed := map[string]*interfaces.ToolResult{
+		"call_1": {Success: false, Error: "tool failed", LLMContent: "Tool failed", UserContent: "Tool failed"},
+		"call_2": {Success: false, Error: "another tool failed", LLMContent: "Another tool failed", UserContent: "Another tool failed"},
+	}
+	turn.updateConsecutiveErrorsFromToolResults(allFailed)
+	if turn.CompletionCriteria.ConsecutiveErrors != 1 {
+		t.Fatalf("expected ConsecutiveErrors=1 after all-failed batch, got %d",
+			turn.CompletionCriteria.ConsecutiveErrors)
+	}
+
+	// A second all-failed batch → increments again.
+	turn.updateConsecutiveErrorsFromToolResults(allFailed)
+	if turn.CompletionCriteria.ConsecutiveErrors != 2 {
+		t.Fatalf("expected ConsecutiveErrors=2 after second all-failed batch, got %d",
+			turn.CompletionCriteria.ConsecutiveErrors)
+	}
+
+	// A batch with at least one success → reset to 0.
+	mixed := map[string]*interfaces.ToolResult{
+		"call_3": {Success: true, LLMContent: "Tool succeeded", UserContent: "Tool succeeded"},
+		"call_4": {Success: false, LLMContent: "Tool failed", UserContent: "Tool failed"},
+	}
+	turn.updateConsecutiveErrorsFromToolResults(mixed)
+	if turn.CompletionCriteria.ConsecutiveErrors != 0 {
+		t.Fatalf("expected ConsecutiveErrors=0 after batch containing a success, got %d",
+			turn.CompletionCriteria.ConsecutiveErrors)
+	}
+
+	// An empty batch must not change ConsecutiveErrors.
+	turn.CompletionCriteria.ConsecutiveErrors = 3
+	turn.updateConsecutiveErrorsFromToolResults(map[string]*interfaces.ToolResult{})
+	if turn.CompletionCriteria.ConsecutiveErrors != 3 {
+		t.Fatalf("expected ConsecutiveErrors unchanged (3) on empty batch, got %d",
+			turn.CompletionCriteria.ConsecutiveErrors)
 	}
 }

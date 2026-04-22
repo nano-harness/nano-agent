@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -329,6 +331,12 @@ func (tb *Toolbox) registerDefaultTools() {
 	tb.readFileState = readFileState // expose for per-turn reset
 	var sandboxCfg = tb.config.sandboxConfig()
 	pathChecker := sandbox.NewPathChecker(sandboxCfg)
+
+	// Initialize singleton BackgroundTaskManager for background task support
+	homeDir, _ := os.UserHomeDir()
+	bgRootDir := filepath.Join(homeDir, ".nano", "bg-tasks")
+	bgManager := system.NewBackgroundTaskManager(bgRootDir)
+
 	coreTools := []interfaces.Tool{
 		filesystem.NewReadFileToolWithState(tb.workingDir, config, pathChecker, readFileState),
 		filesystem.NewCodeSkeletonTool(tb.workingDir, config, nil),
@@ -338,9 +346,11 @@ func (tb *Toolbox) registerDefaultTools() {
 		filesystem.NewDeleteToolWithState(tb.workingDir, config, pathChecker, readFileState),
 		search.NewGrepTool(tb.workingDir, config, pathChecker),
 		search.NewGlobTool(tb.workingDir, config, pathChecker),
-		system.NewShellTool(tb.workingDir, config, sandboxCfg),
+		system.NewShellToolWithBgManager(tb.workingDir, config, sandboxCfg, bgManager),
 		system.NewTodoWriteTool(),
-		system.NewScheduleTaskTool(),
+		system.NewBashOutputTool(bgManager),
+		system.NewKillBashTool(bgManager),
+		system.NewListBackgroundTool(bgManager),
 	}
 
 	// Register core tools first (with filtering)

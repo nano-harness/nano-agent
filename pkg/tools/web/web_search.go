@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
 	"reflect"
 	"strings"
@@ -278,7 +279,10 @@ func (t *WebSearchTool) Execute(ctx context.Context, params map[string]interface
 
 	// Format content for display
 	userContent := t.formatForUser(result, metadata)
-	llmContent := t.formatForLLM(result, metadata)
+	llmContentRaw := t.formatForLLM(result, metadata)
+
+	// Wrap LLM content with isolation tags for search results
+	llmContent := wrapSearchContentForLLM(llmContentRaw, query)
 
 	return &interfaces.ToolResult{
 		Success:     result.Success,
@@ -831,4 +835,11 @@ func (t *WebSearchTool) formatForLLM(result *WebSearchResult, metadata map[strin
 	}
 
 	return output.String()
+}
+
+// wrapSearchContentForLLM wraps search result content with isolation tags
+func wrapSearchContentForLLM(content, query string) string {
+	// Escape query for safe XML attribute usage
+	escapedQuery := html.EscapeString(query)
+	return fmt.Sprintf("<external_data source=\"search:%s\" type=\"search\">\n%s\n</external_data>", escapedQuery, content)
 }

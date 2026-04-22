@@ -18,7 +18,8 @@ type Category string
 const (
 	CategoryPermission Category = "permission"
 	CategorySkill      Category = "skill"
-	CategorySchedule   Category = "schedule"
+	CategoryAgent      Category = "agent"
+	CategoryRoutines   Category = "routines"
 	CategoryOpenSpec   Category = "openspec"
 	CategoryCustom     Category = "custom"
 )
@@ -27,7 +28,8 @@ const (
 var categoryOrder = []Category{
 	CategoryPermission,
 	CategorySkill,
-	CategorySchedule,
+	CategoryAgent,
+	CategoryRoutines,
 	CategoryOpenSpec,
 	CategoryCustom,
 }
@@ -94,6 +96,20 @@ var builtinCommands = []Command{
 		Category:    CategoryPermission,
 		Source:      "built-in",
 	},
+	{
+		Name:        "clear",
+		Description: "清空当前对话上下文，开启全新会话（等价于 Ctrl+R）",
+		Usage:       "/clear",
+		Category:    CategoryPermission,
+		Source:      "built-in",
+	},
+	{
+		Name:        "new",
+		Description: "开启全新会话（/clear 的别名，等价于 Ctrl+R）",
+		Usage:       "/new",
+		Category:    CategoryPermission,
+		Source:      "built-in",
+	},
 
 	// ── skill ────────────────────────────────────────────────────────────────
 	{
@@ -132,54 +148,70 @@ var builtinCommands = []Command{
 		Source:      "built-in",
 	},
 
-	// ── schedule ─────────────────────────────────────────────────────────────
+	// ── agent ────────────────────────────────────────────────────────────────
 	{
-		Name:        "loop",
-		Description: "创建定时循环任务",
-		Usage:       "/loop <interval> <command>  例: /loop 5m check build",
-		Category:    CategorySchedule,
+		Name:        "agents",
+		Description: "列出所有可用的专家代理",
+		Usage:       "/agents",
+		Category:    CategoryAgent,
 		Source:      "built-in",
 	},
 	{
-		Name:        "loop list",
-		Description: "列出所有活跃的定时任务",
-		Usage:       "/loop list",
-		Category:    CategorySchedule,
+		Name:        "agents:list",
+		Description: "列出所有可用的专家代理（别名）",
+		Usage:       "/agents:list",
+		Category:    CategoryAgent,
 		Source:      "built-in",
 	},
 	{
-		Name:        "loop stop",
-		Description: "停止指定定时任务",
-		Usage:       "/loop stop <task-id>",
-		Category:    CategorySchedule,
+		Name:        "agents:show",
+		Description: "显示特定专家代理的详细信息",
+		Usage:       "/agents:show <expert-name>",
+		Category:    CategoryAgent,
+		Source:      "built-in",
+	},
+
+	// ── routines ─────────────────────────────────────────────────────────────
+	{
+		Name:        "routines list",
+		Description: "列出所有定时任务",
+		Usage:       "/routines list",
+		Category:    CategoryRoutines,
 		Source:      "built-in",
 	},
 	{
-		Name:        "schedule",
-		Description: "用自然语言创建定时任务",
-		Usage:       "/schedule <interval> <command>  例: /schedule every 5 minutes check build",
-		Category:    CategorySchedule,
+		Name:        "routines add",
+		Description: "添加定时任务（自然语言或 cron 表达式）",
+		Usage:       "/routines add <description>  例: /routines add 每5分钟运行 go test",
+		Category:    CategoryRoutines,
 		Source:      "built-in",
 	},
 	{
-		Name:        "watcher",
-		Description: "配置事件监听规则（支持自然语言）",
-		Usage:       "/watcher <natural-language>  例: /watcher 监听 aone/a1 的新 MR，自动评审",
-		Category:    CategorySchedule,
+		Name:        "routines remove",
+		Description: "删除指定定时任务",
+		Usage:       "/routines remove <id>",
+		Category:    CategoryRoutines,
 		Source:      "built-in",
 	},
 	{
-		Name:        "watcher list",
-		Description: "列出所有活跃的事件监听规则",
-		Usage:       "/watcher list",
-		Category:    CategorySchedule,
+		Name:        "routines status",
+		Description: "查看定时任务运行状态",
+		Usage:       "/routines status [id]",
+		Category:    CategoryRoutines,
 		Source:      "built-in",
 	},
 	{
-		Name:        "watcher status",
-		Description: "查看事件监听规则状态",
-		Usage:       "/watcher status",
-		Category:    CategorySchedule,
+		Name:        "routines pause",
+		Description: "暂停定时任务",
+		Usage:       "/routines pause <id>",
+		Category:    CategoryRoutines,
+		Source:      "built-in",
+	},
+	{
+		Name:        "routines resume",
+		Description: "恢复定时任务",
+		Usage:       "/routines resume <id>",
+		Category:    CategoryRoutines,
 		Source:      "built-in",
 	},
 

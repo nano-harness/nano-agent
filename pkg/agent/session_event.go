@@ -14,26 +14,26 @@ import (
 // SessionEvent represents a single event in the JSONL session log.
 // Each line in the .jsonl file is one SessionEvent.
 type SessionEvent struct {
-	Type        string                 `json:"type"`                  // "user_message", "assistant_message", "tool_call", "tool_result"
-	Content     string                 `json:"content,omitempty"`     // Text content for messages
-	Contents    []llm.MessageContent   `json:"contents,omitempty"`    // Multimodal content support
-	Role        string                 `json:"role,omitempty"`        // "user", "assistant", "tool"
-	ToolCalls   []tools.ToolCall       `json:"tool_calls,omitempty"`  // Tool calls in assistant message
+	Type        string                 `json:"type"`                   // "user_message", "assistant_message", "tool_call", "tool_result"
+	Content     string                 `json:"content,omitempty"`      // Text content for messages
+	Contents    []llm.MessageContent   `json:"contents,omitempty"`     // Multimodal content support
+	Role        string                 `json:"role,omitempty"`         // "user", "assistant", "tool"
+	ToolCalls   []tools.ToolCall       `json:"tool_calls,omitempty"`   // Tool calls in assistant message
 	ToolResults []tools.ToolResult     `json:"tool_results,omitempty"` // Tool results
 	ToolCallID  string                 `json:"tool_call_id,omitempty"` // Tool call ID for tool results
-	Reasoning   string                 `json:"reasoning,omitempty"`   // Reasoning tokens from the model
-	Timestamp   int64                  `json:"timestamp"`             // Unix timestamp
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`    // Additional metadata
+	Reasoning   string                 `json:"reasoning,omitempty"`    // Reasoning tokens from the model
+	Timestamp   int64                  `json:"timestamp"`              // Unix timestamp
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`     // Additional metadata
 }
 
 // SessionIndexEntry represents metadata for a single session in sessions-index.json
 type SessionIndexEntry struct {
 	ID           string `json:"id"`
-	Summary      string `json:"summary,omitempty"`       // First user message or AI-generated summary
+	Summary      string `json:"summary,omitempty"` // First user message or AI-generated summary
 	MessageCount int    `json:"message_count"`
-	CreatedAt    int64  `json:"created_at"`    // Unix timestamp
-	ModifiedAt   int64  `json:"modified_at"`   // Unix timestamp
-	WorkingDir   string `json:"working_dir"`   // Project working directory
+	CreatedAt    int64  `json:"created_at"`  // Unix timestamp
+	ModifiedAt   int64  `json:"modified_at"` // Unix timestamp
+	WorkingDir   string `json:"working_dir"` // Project working directory
 }
 
 // SessionEventsToMessages converts a slice of SessionEvent to llm.Message slice

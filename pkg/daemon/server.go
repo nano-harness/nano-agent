@@ -29,7 +29,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/slash"
-	"github.com/nano-harness/nano-agent/pkg/watcher"
+	"github.com/nano-harness/nano-agent/pkg/version"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -44,14 +44,14 @@ type Server struct {
 	upgrader      websocket.Upgrader
 	systemMonitor *middleware.SystemMonitor
 	scheduler     *cron.Scheduler
-	watcher       *watcher.Watcher
+	startTime     time.Time
 
 	// Task management for cancellation support
 	activeTasks map[string]*ActiveTask
 	tasksMutex  sync.RWMutex
 	draining    bool
 
-	// engineManaged indicates that scheduler/watcher lifecycle is managed by Engine
+	// engineManaged indicates that scheduler lifecycle is managed by Engine
 	engineManaged bool
 }
 
@@ -143,6 +143,7 @@ func NewServer(agentInstance *agent.Agent, daemonConfig *config.DaemonConfig) *S
 		config:        daemonConfig,
 		systemMonitor: systemMonitor,
 		activeTasks:   make(map[string]*ActiveTask),
+		startTime:     time.Now(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool {
 				return daemonConfig.EnableCORS // Allow CORS if enabled
@@ -161,7 +162,7 @@ func NewServer(agentInstance *agent.Agent, daemonConfig *config.DaemonConfig) *S
 }
 
 // NewServerWithEngine builds a Server from a pre-constructed Engine.
-// The Engine's Scheduler and Watcher replace the server's default instances so
+// The Engine's Scheduler replaces the server's default instance so
 // that all components share a single executor and state store.
 func NewServerWithEngine(eng *engine.Engine, daemonConfig *config.DaemonConfig) *Server {
 	server := NewServer(eng.Agent, daemonConfig)
@@ -172,10 +173,6 @@ func NewServerWithEngine(eng *engine.Engine, daemonConfig *config.DaemonConfig) 
 	if eng.Scheduler != nil {
 		server.scheduler = eng.Scheduler
 		server.engineManaged = true
-	}
-	// Wire in the watcher if present.
-	if eng.Watcher != nil {
-		server.watcher = eng.Watcher
 	}
 	return server
 }
@@ -395,6 +392,7 @@ func (ds *Server) setupRoutes() *mux.Router {
 
 	// Session management endpoints
 	authenticatedAPI.HandleFunc("/sessions", ds.sessionsHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/sessions/reset", ds.resetSessionHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/sessions/{id}", ds.getSessionHandler).Methods("GET")
 	authenticatedAPI.HandleFunc("/sessions/{id}", ds.deleteSessionHandler).Methods("DELETE")
 	authenticatedAPI.HandleFunc("/sessions/{id}/execute", ds.sessionExecuteHandler).Methods("POST")
@@ -404,11 +402,6 @@ func (ds *Server) setupRoutes() *mux.Router {
 	authenticatedAPI.HandleFunc("/scheduler/tasks", ds.scheduleTaskHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/scheduler/tasks", ds.listTasksHandler).Methods("GET")
 	authenticatedAPI.HandleFunc("/scheduler/tasks/{id}", ds.deleteTaskHandler).Methods("DELETE")
-
-	// Watcher endpoints
-	authenticatedAPI.HandleFunc("/watcher/rules", ds.watcherListRulesHandler).Methods("GET")
-	authenticatedAPI.HandleFunc("/watcher/rules", ds.watcherAddRuleHandler).Methods("POST")
-	authenticatedAPI.HandleFunc("/watcher/rules/{id}", ds.watcherDeleteRuleHandler).Methods("DELETE")
 
 	if strings.TrimSpace(os.Getenv("NANO_DAEMON_LOG_ROUTES")) == "true" {
 		_ = router.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
@@ -475,7 +468,15 @@ func (ds *Server) authMiddleware(next http.Handler) http.Handler {
 func (ds *Server) healthHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+
+	uptime := time.Since(ds.startTime).Seconds()
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":    "healthy",
+		"timestamp": time.Now().Unix(),
+		"version":   version.Version,
+		"uptime":    uptime,
+	})
 }
 
 func (ds *Server) statusHandler(w http.ResponseWriter, _ *http.Request) {
@@ -919,6 +920,73 @@ func (ds *Server) cancelSessionPostHandler(w http.ResponseWriter, r *http.Reques
 	ds.cancelSessionHandler(w, r)
 }
 
+// resetSessionHandler handles POST /api/v1/sessions/reset by clearing a
+// session's conversation history, metadata (including title), and stats
+// while preserving its ID and CreatedAt for continued use.
+func (ds *Server) resetSessionHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req struct {
+		SessionID string `json:"session_id"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": false,
+				"error":   "invalid request body",
+			})
+			return
+		}
+	}
+
+	if req.SessionID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": false,
+			"error":   "session_id required",
+		})
+		return
+	}
+
+	if ds.agent == nil || ds.agent.GetSessionManager() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": false,
+			"error":   "session manager unavailable",
+		})
+		return
+	}
+
+	sm := ds.agent.GetSessionManager()
+	session, exists := sm.GetSession(req.SessionID)
+	if !exists || session == nil {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": false,
+			"error":   "session not found",
+		})
+		return
+	}
+
+	session.SetConversationHistory([]llm.Message{})
+	session.ClearMetadata()
+	if err := sm.SaveSession(req.SessionID); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": false,
+			"error":   fmt.Sprintf("failed to save session: %v", err),
+		})
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success":    true,
+		"session_id": req.SessionID,
+		"status":     "reset",
+	})
+}
+
 // cancelSessionHandler handles PUT /api/v1/session/{id} - cancels a session (task)
 func (ds *Server) cancelSessionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -985,8 +1053,9 @@ func (ds *Server) cancelSessionHandler(w http.ResponseWriter, r *http.Request) {
 
 	if ds.agent != nil && ds.agent.GetSessionManager() != nil {
 		sm := ds.agent.GetSessionManager()
-		sm.GetOrCreateSession(id)
-		_ = sm.SaveSession(id)
+		if _, exists := sm.GetSession(id); exists {
+			_ = sm.SaveSession(id)
+		}
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -1346,8 +1415,9 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 
 	if ds.agent != nil && ds.agent.GetSessionManager() != nil {
 		sm := ds.agent.GetSessionManager()
-		sm.GetOrCreateSession(sessionID)
-		_ = sm.SaveSession(sessionID)
+		if _, exists := sm.GetSession(sessionID); exists {
+			_ = sm.SaveSession(sessionID)
+		}
 	}
 
 	// Start async title generation
@@ -1581,16 +1651,12 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 		// Ensure session persistence consistency at completion
 		if ds.agent != nil && ds.agent.GetSessionManager() != nil {
 			sm := ds.agent.GetSessionManager()
-			// Fetch the session first to ensure we have the latest history in memory
+			// Only save if session still exists - don't resurrect deleted sessions
 			if session, exists := sm.GetSession(currentSessionID); exists {
 				// Make sure we save it to disk/OSS
 				_ = sm.SaveSession(currentSessionID)
 				logger.Infof("Saved session %s history to storage upon completion (history length: %d)",
 					currentSessionID, len(session.GetConversationHistory()))
-			} else {
-				// Fallback to get or create
-				sm.GetOrCreateSession(currentSessionID)
-				_ = sm.SaveSession(currentSessionID)
 			}
 		}
 

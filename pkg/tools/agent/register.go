@@ -13,11 +13,22 @@ func RegisterAgentTools(registry interfaces.ToolRegistry, cfg *config.Config, ma
 		return
 	}
 
+	// Register main_agent tool
 	mainAgentTool := NewMainAgentTool(cfg, mainAgent)
 	if err := registry.Register(mainAgentTool); err != nil {
 		logger.Warnf("Failed to register main agent tool: %v", err)
 	} else {
 		logger.Infof("Registered agent tool: %s", mainAgentTool.Name())
+	}
+
+	// Register task tool (only for main agent, not sub-agents)
+	if !cfg.IsSubAgent {
+		taskTool := NewTaskTool(cfg, mainAgent)
+		if err := registry.Register(taskTool); err != nil {
+			logger.Warnf("Failed to register task tool: %v", err)
+		} else {
+			logger.Infof("Registered agent tool: %s", taskTool.Name())
+		}
 	}
 }
 
@@ -25,6 +36,7 @@ func RegisterAgentTools(registry interfaces.ToolRegistry, cfg *config.Config, ma
 func GetAgentToolNames() []string {
 	return []string{
 		"main_agent",
+		"task",
 	}
 }
 

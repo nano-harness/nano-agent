@@ -11,12 +11,33 @@ import (
 	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/tools"
+	"github.com/nano-harness/nano-agent/pkg/tools/system"
 )
+
+// toolCallIDKey is the context key for storing the tool call ID
+type toolCallIDKey struct{}
+
+// WithToolCallID injects the tool call ID into the context
+func WithToolCallID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, toolCallIDKey{}, id)
+}
+
+// ToolCallIDFromContext extracts the tool call ID from the context
+func ToolCallIDFromContext(ctx context.Context) string {
+	if id, ok := ctx.Value(toolCallIDKey{}).(string); ok {
+		return id
+	}
+	return ""
+}
 
 // ToolCallStatus represents the status of a tool call
 type ToolCallStatus string
@@ -57,12 +78,6 @@ type ToolCallInfo struct {
 	cancel           context.CancelFunc
 }
 
-// stateStoreIface provides persistent pending-approval tracking.
-type stateStoreIface interface {
-	SetPendingApproval(callID, toolName string)
-	ClearPendingApproval(callID string)
-}
-
 // ToolScheduler manages parallel execution of tools with advanced state management
 type ToolScheduler struct {
 	toolbox           *tools.Toolbox
@@ -77,10 +92,11 @@ type ToolScheduler struct {
 	allowedExact      map[string]struct{}
 	allowedPatterns   []string
 	permissionManager *permission.Manager
-	stateStore        stateStoreIface
 	// securityDecisions caches the pre-computed security Decision for each tool
 	// call ID so it can be injected into the execution context.
 	securityDecisions map[string]*middleware.Decision
+	// agentConfig is used to check daemon confirm policy when no approval handler is present
+	agentConfig *config.Config
 }
 
 // SetEventHandler sets the event handler for the tool scheduler and propagates
@@ -114,11 +130,11 @@ func (ts *ToolScheduler) SetPermissionManager(mgr *permission.Manager) {
 	ts.permissionManager = mgr
 }
 
-// SetStateStore wires a persistent state store for pending approval tracking.
-func (ts *ToolScheduler) SetStateStore(store stateStoreIface) {
+// SetAgentConfig sets the agent config used to check daemon confirm policy.
+func (ts *ToolScheduler) SetAgentConfig(cfg *config.Config) {
 	ts.mutex.Lock()
 	defer ts.mutex.Unlock()
-	ts.stateStore = store
+	ts.agentConfig = cfg
 }
 
 // ToolSchedulerOptions contains configuration options for the tool scheduler
@@ -254,6 +270,11 @@ func (ts *ToolScheduler) setStatus(callID string, status ToolCallStatus, result 
 		for _, call := range ts.toolCalls {
 			// Create a shallow copy to avoid data races
 			callCopy := *call
+			// Deep copy pointer fields to avoid data race
+			if call.Result != nil {
+				resultCopy := *call.Result
+				callCopy.Result = &resultCopy
+			}
 			updateCalls = append(updateCalls, &callCopy)
 		}
 	}
@@ -272,6 +293,11 @@ func (ts *ToolScheduler) setStatus(callID string, status ToolCallStatus, result 
 		for _, call := range ts.toolCalls {
 			// Create a shallow copy to avoid data races
 			callCopy := *call
+			// Deep copy pointer fields to avoid data race
+			if call.Result != nil {
+				resultCopy := *call.Result
+				callCopy.Result = &resultCopy
+			}
 			completeCalls = append(completeCalls, &callCopy)
 		}
 	}
@@ -727,19 +753,114 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 		}
 
 		// Handle approval flow
-		if toolCall.RequiresApproval && ts.approvalHandler != nil {
-			ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
-			if ts.stateStore != nil {
-				ts.stateStore.SetPendingApproval(tool.ID, tool.Name)
-			}
-			// In TUI mode the handler is async; true means sync-approved.
-			if ts.approvalHandler(toolCall) {
-				if ts.stateStore != nil {
-					ts.stateStore.ClearPendingApproval(tool.ID)
+		if toolCall.RequiresApproval {
+			if ts.approvalHandler != nil {
+				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
+				// In TUI mode the handler is async; true means sync-approved.
+				if ts.approvalHandler(toolCall) {
+					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
 				}
-				ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+				// else: remain in StatusAwaitingApproval until HandleConfirmationResponse is called
+			} else {
+				// No approval handler: check daemon confirm policy
+				ts.mutex.RLock()
+				cfg := ts.agentConfig
+				ts.mutex.RUnlock()
+
+				if cfg != nil && cfg.Daemon != nil {
+					switch cfg.Daemon.ConfirmPolicy {
+					case config.ConfirmPolicyAllow:
+						// Auto-approve
+						logger.Debugf("Tool %s auto-approved by daemon confirm policy: allow", tool.Name)
+						ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+					case config.ConfirmPolicyBlock:
+						// Reject
+						tr := &interfaces.ToolResult{
+							Success:     false,
+							Error:       "tool requires approval but daemon confirm policy is 'block'",
+							Metadata:    map[string]interface{}{"code": "approval_blocked", "tool_name": tool.Name},
+							LLMContent:  fmt.Sprintf("Tool '%s' call rejected: requires approval but daemon confirm policy is 'block'.", tool.Name),
+							UserContent: fmt.Sprintf("工具 '%s' 需要确认但守护进程确认策略为 'block'，已拒绝。", tool.Name),
+						}
+						if ts.eventHandler != nil {
+							ts.eventHandler(event.StreamEvent{
+								Type: event.EventTypeToolResult,
+								ToolResult: &tools.ToolResult{
+									ID:      toolCall.ID,
+									Content: tr.LLMContent,
+									Error:   tr.Error,
+								},
+							})
+							ts.eventHandler(event.StreamEvent{
+								Type:   event.EventTypeToolUse,
+								Source: "agent_turn",
+								ToolUse: &event.ToolUse{
+									ID:         toolCall.ID,
+									ToolName:   toolCall.Name,
+									Parameters: toolCall.Parameters,
+									Status:     string(StatusError),
+									Result:     tr.UserContent,
+								},
+							})
+						}
+						ts.setStatus(tool.ID, StatusError, tr, fmt.Errorf("approval blocked by daemon policy"))
+						continue
+					case config.ConfirmPolicyAllowlist:
+						// Check if tool is in allowlist
+						allowed := false
+						for _, allowedTool := range cfg.Daemon.AllowlistedTools {
+							if allowedTool == tool.Name {
+								allowed = true
+								break
+							}
+						}
+						if allowed {
+							logger.Debugf("Tool %s auto-approved by daemon allowlist", tool.Name)
+							ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+						} else {
+							// Not in allowlist: reject
+							tr := &interfaces.ToolResult{
+								Success:     false,
+								Error:       "tool requires approval but is not in daemon allowlist",
+								Metadata:    map[string]interface{}{"code": "not_in_allowlist", "tool_name": tool.Name},
+								LLMContent:  fmt.Sprintf("Tool '%s' call rejected: requires approval but is not in daemon allowlist.", tool.Name),
+								UserContent: fmt.Sprintf("工具 '%s' 需要确认但不在守护进程白名单中，已拒绝。", tool.Name),
+							}
+							if ts.eventHandler != nil {
+								ts.eventHandler(event.StreamEvent{
+									Type: event.EventTypeToolResult,
+									ToolResult: &tools.ToolResult{
+										ID:      toolCall.ID,
+										Content: tr.LLMContent,
+										Error:   tr.Error,
+									},
+								})
+								ts.eventHandler(event.StreamEvent{
+									Type:   event.EventTypeToolUse,
+									Source: "agent_turn",
+									ToolUse: &event.ToolUse{
+										ID:         toolCall.ID,
+										ToolName:   toolCall.Name,
+										Parameters: toolCall.Parameters,
+										Status:     string(StatusError),
+										Result:     tr.UserContent,
+									},
+								})
+							}
+							ts.setStatus(tool.ID, StatusError, tr, fmt.Errorf("not in allowlist"))
+							continue
+						}
+					default:
+						// Unknown policy: fail-safe to allow (backward compatibility)
+						logger.Warnf("Unknown daemon confirm policy %s, defaulting to allow", cfg.Daemon.ConfirmPolicy)
+						ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+					}
+				} else {
+					// No daemon config: default to allow for backward compatibility
+					logger.Debugf("Tool %s auto-approved (no daemon config)", tool.Name)
+					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+				}
 			}
-			// else: remain in StatusAwaitingApproval until HandleConfirmationResponse is called
 		} else {
 			ts.setStatus(tool.ID, StatusScheduled, nil, nil)
 		}
@@ -1124,6 +1245,10 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 	ts.setStatus(toolCall.ID, StatusExecuting, nil, nil)
 
 	callCtx, cancel := context.WithCancel(ctx)
+
+	// Inject tool call ID into context for sub-agent WorkerID derivation
+	callCtx = WithToolCallID(callCtx, toolCall.ID)
+
 	ts.mutex.Lock()
 	if call, ok := ts.toolCalls[toolCall.ID]; ok {
 		call.cancel = cancel
@@ -1135,6 +1260,35 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 		callCtx = middleware.WithSecurityDecision(callCtx, d)
 		delete(ts.securityDecisions, toolCall.ID)
 	}
+
+	// Inject output streaming callback if outputHandler is configured
+	if ts.outputHandler != nil {
+		cb := func(stream, chunk string) {
+			// Update live output in tool call info
+			ts.mutex.Lock()
+			if c, ok := ts.toolCalls[toolCall.ID]; ok {
+				c.LiveOutput += chunk
+				// Keep live output under 64KB to avoid memory issues
+				if len(c.LiveOutput) > 64*1024 {
+					c.LiveOutput = c.LiveOutput[len(c.LiveOutput)-64*1024:]
+				}
+			}
+			ts.mutex.Unlock()
+
+			// Forward to output handler
+			ts.outputHandler(toolCall.ID, chunk)
+
+			// Emit streaming event
+			if ts.eventHandler != nil {
+				ev := event.NewStreamEvent(event.EventTypeWorkerUpdate, "tool_scheduler")
+				ev.WorkerID = toolCall.ID
+				ev = ev.WithContent(chunk).WithMetadata("stream", stream)
+				ts.eventHandler(ev)
+			}
+		}
+		callCtx = system.WithOutputCallback(callCtx, cb)
+	}
+
 	ts.mutex.Unlock()
 	defer func() {
 		cancel()
@@ -1343,6 +1497,11 @@ func (ts *ToolScheduler) UpdateLiveOutput(callID string, output string) {
 		for _, call := range ts.toolCalls {
 			// Create a shallow copy to avoid data races
 			callCopy := *call
+			// Deep copy pointer fields to avoid data race
+			if call.Result != nil {
+				resultCopy := *call.Result
+				callCopy.Result = &resultCopy
+			}
 			updateCalls = append(updateCalls, &callCopy)
 		}
 	}
@@ -1410,17 +1569,11 @@ func (ts *ToolScheduler) HandleConfirmationResponse(callID string, approved bool
 		}
 
 		// Transition to terminal state with result set so ExecuteParallel can collect it
-		if ts.stateStore != nil {
-			ts.stateStore.ClearPendingApproval(callID)
-		}
 		ts.setStatus(callID, StatusCancelled, tr, fmt.Errorf("cancelled by user"))
 		return nil
 	}
 
 	// Schedule the tool call for execution
-	if ts.stateStore != nil {
-		ts.stateStore.ClearPendingApproval(callID)
-	}
 	ts.setStatus(callID, StatusScheduled, nil, nil)
 
 	// Attempt to execute scheduled calls

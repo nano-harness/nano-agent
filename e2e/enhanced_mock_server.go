@@ -1,3 +1,5 @@
+//go:build e2e
+
 package e2e
 
 import (
@@ -141,6 +143,19 @@ func (m *EnhancedMockServer) Reset() {
 	m.failureIndex = 0
 }
 
+// matchTitleRequest checks if the messages contain the title generation prompt
+func matchTitleRequest(messages []map[string]interface{}) bool {
+	const titleKeyword = "请根据以下对话内容，生成一个简短的标题"
+	for _, msg := range messages {
+		if content, ok := msg["content"].(string); ok {
+			if strings.Contains(content, titleKeyword) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (m *EnhancedMockServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var reqBody map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
@@ -225,6 +240,11 @@ func (m *EnhancedMockServer) nextFailureDecisionLocked() (shouldFail bool, index
 // selectResponseLocked 在规则和队列之间选择一个响应。
 // 必须在持有 m.mu 的情况下调用。
 func (m *EnhancedMockServer) selectResponseLocked(messages []map[string]interface{}) MockResponse {
+	// 0. Built-in title bypass (highest priority) - prevents consuming queue responses
+	if matchTitleRequest(messages) {
+		return MockResponse{Content: "Mock Title"}
+	}
+
 	// 1. 规则优先
 	for _, rule := range m.rules {
 		if rule.Matcher == nil {
@@ -297,24 +317,16 @@ func (m *EnhancedMockServer) streamResponse(w http.ResponseWriter, resp MockResp
 		return
 	}
 
-	// 如果有 Reasoning，可以先发送一段“思考中”的内容，方便测试认知事件
+	// 如果有 Reasoning，可以先发送一段"思考中"的内容，方便测试认知事件
 	if strings.TrimSpace(resp.Reasoning) != "" {
 		_ = sendChunk(map[string]interface{}{"content": resp.Reasoning}, nil)
 	}
 
-	// 将内容按空格分词逐 chunk 发送
+	// 发送完整内容（不再按空格切分，避免破坏 JSON 结构）
 	if resp.Content != "" {
-		words := strings.Split(resp.Content, " ")
-		for i, word := range words {
-			content := word
-			if i > 0 {
-				content = " " + word
-			}
-			if !sendChunk(map[string]interface{}{"content": content}, nil) {
-				// 流式中断：不再发送 DONE 或 [DONE]
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
+		if !sendChunk(map[string]interface{}{"content": resp.Content}, nil) {
+			// 流式中断：不再发送 DONE 或 [DONE]
+			return
 		}
 	}
 
@@ -394,4 +406,58 @@ func (m *EnhancedMockServer) jsonResponse(w http.ResponseWriter, resp MockRespon
 	}
 
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+// ========== Convenience Matcher Functions ==========
+
+// NewMockServerWithDefaults creates a new EnhancedMockServer with common default responses pre-configured.
+func NewMockServerWithDefaults() *EnhancedMockServer {
+	m := NewEnhancedMockServer()
+	m.SetDefaultResponse(MockResponse{
+		Content: "Default mock response.",
+	})
+	return m
+}
+
+// MatchUserMessageContains returns a matcher that checks if the last user message contains the specified substring.
+// This is useful for routing based on task content in parallel sub-agent tests.
+func MatchUserMessageContains(substr string) func([]map[string]interface{}) bool {
+	return func(messages []map[string]interface{}) bool {
+		// Find the last user message
+		for i := len(messages) - 1; i >= 0; i-- {
+			msg := messages[i]
+			if role, ok := msg["role"].(string); ok && role == "user" {
+				if content, ok := msg["content"].(string); ok {
+					if strings.Contains(content, substr) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+}
+
+// MatchSystemPromptContains returns a matcher that checks if any system message contains the specified substring.
+// This is useful for routing based on expert names in system prompts during parallel expert execution.
+func MatchSystemPromptContains(substr string) func([]map[string]interface{}) bool {
+	return func(messages []map[string]interface{}) bool {
+		for _, msg := range messages {
+			if role, ok := msg["role"].(string); ok && role == "system" {
+				if content, ok := msg["content"].(string); ok {
+					if strings.Contains(content, substr) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+}
+
+// MatchTaskFieldContains returns a matcher that checks if the user message contains a task-related substring.
+// This is specifically designed for ForkBatch parallel tests where each fork has a distinct Task field.
+// It's equivalent to MatchUserMessageContains but with clearer naming for fork-related tests.
+func MatchTaskFieldContains(substr string) func([]map[string]interface{}) bool {
+	return MatchUserMessageContains(substr)
 }

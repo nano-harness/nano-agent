@@ -4,6 +4,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,8 +44,9 @@ type Agent struct {
 	eventHandler      func(event.StreamEvent) //nolint:unused
 	tokenStats        *llm.TokenStats         //nolint:unused
 	loopDetector      *LoopDetector
-	cancelFn          context.CancelFunc  //nolint:unused
-	shutdownOnce      sync.Once           //nolint:unused
+	ctx               context.Context
+	cancelFn          context.CancelFunc
+	shutdownOnce      sync.Once
 	isSubAgent        bool                // 标识是否为subagent
 	isForkChild       bool                // marks this agent as a forked child
 	agentType         AgentType           // built-in agent type for fork children
@@ -62,9 +64,9 @@ type Agent struct {
 	// tuiScheduler is set when the TUI is active and handles /loop commands.
 	tuiScheduler *TUIScheduler
 
-	// manageScheduleTool holds a reference to the registered manage_schedule tool
+	// manageRoutineTool holds a reference to the registered manage_routine tool
 	// so SetTUIScheduler can wire the live scheduler into it.
-	manageScheduleTool *builtin.ManageScheduleTool
+	manageRoutineTool *builtin.ManageRoutineTool
 
 	// approvalConfirmFnOverride optionally overrides the default auto-confirm logic.
 	approvalConfirmFnOverride func(string) bool
@@ -72,6 +74,15 @@ type Agent struct {
 	// activeSessionID is the session ID to use for ProcessStreamWithMultimodal
 	// Default is "default" for backward compatibility
 	activeSessionID string
+
+	// expertRegistry holds all available experts (builtin + custom)
+	expertRegistry *ExpertRegistry
+
+	// expertRunner executes expert tasks via fork system
+	expertRunner *ExpertRunner
+
+	// forkManager manages forked child agents for parallel execution
+	forkManager *ForkManager
 }
 
 // LoopDetector helps detect and prevent infinite loops of tool calls
@@ -262,12 +273,24 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 		toolbox.List(),
 	)
 
+	// Create agent context for goroutine lifecycle management
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+
 	// Start goroutine to listen for tools update events
 	go func() {
-		for event := range toolbox.GetToolsUpdateChannel() {
-			logger.Debugf("Received tools update event: %s", event.Type)
-			llmClient.UpdateTools(event.Tools)
-			logger.Infof("Updated LLM client with %d tools after MCP registration", len(event.Tools))
+		ch := toolbox.GetToolsUpdateChannel()
+		for {
+			select {
+			case event, ok := <-ch:
+				if !ok {
+					return // channel closed
+				}
+				logger.Debugf("Received tools update event: %s", event.Type)
+				llmClient.UpdateTools(event.Tools)
+				logger.Infof("Updated LLM client with %d tools after MCP registration", len(event.Tools))
+			case <-agentCtx.Done():
+				return
+			}
 		}
 	}()
 
@@ -327,6 +350,8 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 		RecoveryStrategy: recovery,
 		ApprovalHandler:  approvalHandler,
 	})
+	// Set agent config for daemon confirm policy
+	toolScheduler.SetAgentConfig(cfg)
 
 	// Initialize session manager options
 	smOpts := []SessionManagerOption{
@@ -389,6 +414,8 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 	smOpts = append(smOpts, WithSessionStorage(sessionStorage))
 
 	agent := &Agent{
+		ctx:             agentCtx,
+		cancelFn:        agentCancel,
 		config:          cfg,
 		toolbox:         toolbox,
 		llmClient:       llmClient,
@@ -414,10 +441,6 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 		}
 		agent.permissionManager = permission.NewManager(mode, rules)
 		toolScheduler.SetPermissionManager(agent.permissionManager)
-		if stateStore != nil {
-			stateStore.ClearAllPendingApprovals()
-			toolScheduler.SetStateStore(stateStore)
-		}
 	}
 
 	// Apply functional options
@@ -455,14 +478,37 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 		}
 	}
 
-	// Register ForkTool on top-level (non-sub-agent) agents to enable fork-based orchestration.
+	// Initialize Expert system on top-level (non-sub-agent) agents.
+	// Experts replace the old fork tool with explicit @expert-name triggering.
 	if !cfg.IsSubAgent {
-		forkTool := NewForkTool(NewForkManager(agent))
-		if err := toolbox.Register(forkTool); err != nil {
-			logger.Warnf("Failed to register fork tool: %v", err)
+		// Create expert registry
+		expertRegistry := NewExpertRegistry()
+
+		// Register builtin experts (investigator, help, generalist)
+		if err := RegisterBuiltinExperts(expertRegistry); err != nil {
+			logger.Warnf("Failed to register builtin experts: %v", err)
 		} else {
-			logger.Info("ForkTool registered successfully")
+			logger.Info("Builtin experts registered successfully")
 		}
+
+		// Load markdown experts from ~/.config/nano/agents/ and .nano/agents/
+		if err := LoadMarkdownExperts(expertRegistry, workingDir); err != nil {
+			logger.Warnf("Failed to load markdown experts: %v", err)
+		}
+
+		// Load YAML sub_agents as experts
+		if err := LoadConfigSubAgents(expertRegistry, cfg); err != nil {
+			logger.Warnf("Failed to load YAML sub-agents as experts: %v", err)
+		}
+
+		agent.expertRegistry = expertRegistry
+
+		// Create expert runner (uses fork manager internally)
+		forkManager := NewForkManager(agent)
+		agent.forkManager = forkManager
+		agent.expertRunner = NewExpertRunner(expertRegistry, forkManager, agent.cachedSystemPromptBuilder)
+
+		logger.Infof("Expert system initialized: %d experts available", expertRegistry.Count())
 
 		// Register conversational configuration management tools.
 		agent.registerBuiltinManagementTools(toolbox, cfg, workingDir)
@@ -522,6 +568,16 @@ func (a *Agent) GetToolbox() *tools.Toolbox {
 	return a.toolbox
 }
 
+// GetForkManager returns the fork manager for parallel sub-agent execution
+func (a *Agent) GetForkManager() *ForkManager {
+	return a.forkManager
+}
+
+// GetExpertRegistry returns the expert registry for accessing available experts
+func (a *Agent) GetExpertRegistry() *ExpertRegistry {
+	return a.expertRegistry
+}
+
 // RegisterTool registers an additional tool into the agent's toolbox and
 // updates the LLM client's tool list. This is a convenience wrapper around
 // toolbox.Register used by the Engine to wire in dynamically created tools.
@@ -537,6 +593,11 @@ func (a *Agent) RegisterTool(t interfaces.Tool) error {
 // GetToolScheduler returns the tool scheduler for advanced usage
 func (a *Agent) GetToolScheduler() *ToolScheduler {
 	return a.toolScheduler
+}
+
+// GetEventHandler returns the current event handler (may be nil)
+func (a *Agent) GetEventHandler() func(event.StreamEvent) {
+	return a.eventHandler
 }
 
 // GetPermissionManager returns the permission manager for the agent.
@@ -656,6 +717,46 @@ func (a *Agent) ProcessStreamWithMultimodalAndSession(ctx context.Context, sessi
 // processStreamWithSessionInternal processes a request using a specific session's conversation history.
 func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *Session, userInput string, images []llm.MultimodalImage, onEvent func(event.StreamEvent)) error {
 	logger.Infof("Processing streaming request with session %s: %s", session.ID, userInput)
+
+	// Check for expert trigger (@expert-name) before anything else
+	if a.expertRegistry != nil && a.expertRunner != nil {
+		if trigger := ParseExpertTrigger(userInput, a.expertRegistry); trigger != nil {
+			logger.Infof("Expert trigger detected: @%s", trigger.ExpertName)
+
+			// Run the expert
+			expertResult, err := a.expertRunner.Run(ctx, trigger.ExpertName, trigger.Inputs, onEvent)
+			if err != nil {
+				errMsg := fmt.Sprintf("Expert @%s failed: %v", trigger.ExpertName, err)
+				logger.Errorf(errMsg)
+				if onEvent != nil {
+					onEvent(event.StreamEvent{
+						Type:    event.EventTypeError,
+						Error:   errMsg,
+						Timestamp: time.Now().Unix(),
+					})
+				}
+				return fmt.Errorf("expert execution failed: %w", err)
+			}
+
+			// Send the expert's output as content
+			if onEvent != nil && expertResult.Output != "" {
+				onEvent(event.StreamEvent{
+					Type:    event.EventTypeContent,
+					Content: expertResult.Output,
+					Timestamp: time.Now().Unix(),
+				})
+				onEvent(event.StreamEvent{
+					Type: event.EventTypeDone,
+					Done: true,
+					Timestamp: time.Now().Unix(),
+				})
+			}
+
+			logger.Infof("Expert @%s completed in %v", trigger.ExpertName, expertResult.Duration)
+			return nil
+		}
+	}
+
 	var turnAllowedTools []interfaces.Tool
 	{
 		wd := a.toolbox.GetWorkingDirectory()
@@ -787,6 +888,7 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 		AgentConfig:               a.config,
 		SkillManager:              a.skillManager,
 		CachedSystemPromptBuilder: a.cachedSystemPromptBuilder,
+		SessionID:                 session.ID, // Pass session ID for background task isolation (Phase 2)
 	}
 
 	// Create enhanced turn that uses StreamRenderer
@@ -825,6 +927,7 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 	}
 
 	// Set the event handler for both the turn and the tool scheduler
+	a.eventHandler = sanitizedOnEvent // Store in agent for GetEventHandler()
 	turn.eventHandler = sanitizedOnEvent
 	if a.toolScheduler != nil {
 		a.toolScheduler.SetEventHandler(sanitizedOnEvent)
@@ -865,7 +968,12 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 
 		if shouldGenerate && !a.isSubAgent {
 			historyCopy := append([]llm.Message(nil), history...)
+			ctx, cancel := context.WithCancel(context.Background())
+			a.sessionManager.RegisterBackgroundCancel(session.ID, cancel)
+
 			go func(s *Session, h []llm.Message) {
+				defer cancel()
+
 				// Try to use first user message as title if short enough
 				var firstUserMsg string
 				for _, msg := range h {
@@ -880,10 +988,11 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 					// Clean up newlines for title
 					title := strings.ReplaceAll(firstUserMsg, "\n", " ")
 					s.SetMetadata("title", title)
-					if err := a.sessionManager.SaveSession(s.ID); err != nil {
-						logger.Warnf("Failed to save session %s to storage after setting short title: %v", s.ID, err)
+					if err := a.sessionManager.SaveSessionIfActive(ctx, s.ID); err != nil {
+						logger.Debugf("Could not save session %s after setting short title: %v", s.ID, err)
+					} else {
+						logger.Infof("Used short user message as title for session %s: %s", s.ID, title)
 					}
-					logger.Infof("Used short user message as title for session %s: %s", s.ID, title)
 					return
 				}
 
@@ -892,11 +1001,11 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 				if err == nil && generatedTitle != "" {
 					s.SetMetadata("title", generatedTitle)
 
-					if err := a.sessionManager.SaveSession(s.ID); err != nil {
-						logger.Warnf("Failed to save session %s to storage after title generation: %v", s.ID, err)
+					if err := a.sessionManager.SaveSessionIfActive(ctx, s.ID); err != nil {
+						logger.Debugf("Could not save session %s after title generation: %v", s.ID, err)
+					} else {
+						logger.Infof("Generated title for session %s: %s", s.ID, generatedTitle)
 					}
-
-					logger.Infof("Generated title for session %s: %s", s.ID, generatedTitle)
 
 					// Send session info event to notify listeners (e.g. CLI, UI)
 					if onEvent != nil {
@@ -909,7 +1018,7 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 						})
 					}
 				} else if err != nil {
-					logger.Warnf("Failed to generate title for session %s: %v", s.ID, err)
+					logger.Debugf("Failed to generate title for session %s: %v", s.ID, err)
 				}
 			}(session, historyCopy)
 		}
@@ -922,7 +1031,7 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 
 	if err != nil {
 		// Don't log error if task was cancelled by user
-		if err == context.Canceled {
+		if errors.Is(err, context.Canceled) {
 			logger.Debugf("Task cancelled by user")
 			return err
 		}
@@ -959,6 +1068,16 @@ func (a *Agent) GetActiveSessionID() string {
 	return a.activeSessionID
 }
 
+// StartNewSession creates a brand-new session with a fresh ID, sets it as the
+// active session, and returns the new session ID. The previous session remains
+// in the SessionManager (subject to TTL-based cleanup) so it can still be
+// resumed via --session <old_id>.
+func (a *Agent) StartNewSession() string {
+	newSession := a.sessionManager.GetOrCreateSession("") // empty -> auto generate
+	a.SetActiveSessionID(newSession.ID)
+	return newSession.ID
+}
+
 // GetSessionManager returns the session manager for external access.
 func (a *Agent) GetSessionManager() *SessionManager {
 	return a.sessionManager
@@ -974,28 +1093,36 @@ type ProcessResult struct {
 
 // Shutdown gracefully shuts down the agent and its resources
 func (a *Agent) Shutdown() error {
-	logger.Info("Shutting down agent")
+	var err error
+	a.shutdownOnce.Do(func() {
+		logger.Info("Shutting down agent")
 
-	// Stop session manager if running
-	if a.sessionManager != nil {
-		a.sessionManager.Shutdown()
-	}
-
-	// Stop MCP client if running
-	if a.toolbox.IsMCPEnabled() {
-		err := a.toolbox.StopMCP()
-		if err != nil {
-			logger.Errorf("Failed to stop MCP client: %v", err)
-		} else {
-			logger.Info("MCP client stopped successfully")
+		// Cancel agent context to stop all goroutines
+		if a.cancelFn != nil {
+			a.cancelFn()
 		}
-	}
 
-	// Close toolbox and its channels
-	a.toolbox.Close()
+		// Stop session manager if running
+		if a.sessionManager != nil {
+			a.sessionManager.Shutdown()
+		}
 
-	logger.Info("Agent shutdown completed")
-	return nil
+		// Stop MCP client if running
+		if a.toolbox.IsMCPEnabled() {
+			if e := a.toolbox.StopMCP(); e != nil {
+				logger.Errorf("Failed to stop MCP client: %v", e)
+				err = e
+			} else {
+				logger.Info("MCP client stopped successfully")
+			}
+		}
+
+		// Close toolbox and its channels
+		a.toolbox.Close()
+
+		logger.Info("Agent shutdown completed")
+	})
+	return err
 }
 
 // convertMCPConfig converts consolidated config.MCPConfig to mcp.MCPConfig
@@ -1065,14 +1192,14 @@ func (a *Agent) registerBuiltinManagementTools(tb *tools.Toolbox, cfg *config.Co
 		logger.Debugf("manage_mcp_server already registered: %v", err)
 	}
 
-	// manage_schedule: scheduler is nil until TUI starts; it is wired in
-	// SetTUIScheduler via ManageScheduleTool.SetScheduler.
-	manageScheduleTool := builtin.NewManageScheduleTool(nil, a.stateStore, a.approvalConfirmFn)
-	if err := tb.Register(manageScheduleTool); err != nil {
-		logger.Debugf("manage_schedule already registered: %v", err)
+	// manage_routine: scheduler is nil until TUI starts; it is wired in
+	// SetTUIScheduler via ManageRoutineTool.SetScheduler.
+	manageRoutineTool := builtin.NewManageRoutineTool(nil, a.stateStore, a.approvalConfirmFn)
+	if err := tb.Register(manageRoutineTool); err != nil {
+		logger.Debugf("manage_routine already registered: %v", err)
 	}
 	// Store a reference so SetTUIScheduler can wire the live scheduler later.
-	a.manageScheduleTool = manageScheduleTool
+	a.manageRoutineTool = manageRoutineTool
 
 	// discover_tools: search + full-schema lookup (returns full JSON schema)
 	discoverToolsTool := builtin.NewDiscoverToolsTool(func(toolName string) (string, bool) {
@@ -1143,22 +1270,22 @@ func (a *Agent) GetConfig() *config.Config {
 	return a.config
 }
 
-// SetScheduler wires a live cron.Scheduler directly into the manage_schedule
+// SetScheduler wires a live cron.Scheduler directly into the manage_routine
 // tool so tasks created via conversation are scheduled immediately.
 // This is the preferred method when using the Engine; SetTUIScheduler is kept
 // for backward compatibility with the classic TUI path.
 func (a *Agent) SetScheduler(s *cron.Scheduler) {
-	if s != nil && a.manageScheduleTool != nil {
-		a.manageScheduleTool.SetScheduler(s)
+	if s != nil && a.manageRoutineTool != nil {
+		a.manageRoutineTool.SetScheduler(s)
 	}
 }
 
-// SetTUIScheduler wires a TUIScheduler so that /loop commands work in turns.
-// It also updates the manage_schedule tool with the live cron scheduler so
+// SetTUIScheduler wires a TUIScheduler so that /routines commands work in turns.
+// It also updates the manage_routine tool with the live cron scheduler so
 // tasks created via conversation are scheduled immediately.
 func (a *Agent) SetTUIScheduler(ts *TUIScheduler) {
 	a.tuiScheduler = ts
-	if ts != nil && a.manageScheduleTool != nil {
-		a.manageScheduleTool.SetScheduler(ts.Scheduler())
+	if ts != nil && a.manageRoutineTool != nil {
+		a.manageRoutineTool.SetScheduler(ts.Scheduler())
 	}
 }

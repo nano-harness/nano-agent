@@ -181,9 +181,38 @@ func (ed *EventDispatcher) DispatchWithDelay(id, source string, callback Callbac
 	case <-ed.ctx.Done():
 		return false
 	default:
+		// Check if this is a critical event type
+		if metadata != nil {
+			if evType, ok := metadata["event_type"].(EventType); ok && isCriticalEventType(evType) {
+				// For critical events, use blocking write with timeout
+				select {
+				case ed.taskQueue <- task:
+					ed.mu.Lock()
+					ed.totalTasks++
+					ed.mu.Unlock()
+					logger.Debug("Critical event dispatched after queue was full: %s (type: %v)", id, evType)
+					return true
+				case <-time.After(5 * time.Second):
+					logger.Error("Critical event dropped after timeout: %s (type: %v)", id, evType)
+					return false
+				case <-ed.ctx.Done():
+					return false
+				}
+			}
+		}
 		logger.Warn("事件派发器队列已满，丢弃回调任务: %s", id)
 		return false
 	}
+}
+
+// isCriticalEventType returns true if the event type is critical and should not be dropped
+func isCriticalEventType(evType EventType) bool {
+	criticalTypes := map[EventType]bool{
+		EventTypeToolResult: true,
+		EventTypeError:      true,
+		EventTypeDone:       true,
+	}
+	return criticalTypes[evType]
 }
 
 // DispatchWithData 派发带数据的回调任务

@@ -17,6 +17,25 @@ type TaskLogEntry struct {
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 	Success    bool      `json:"success"`
 	Error      string    `json:"error,omitempty"`
+
+	// M2 extended fields (all omitempty for backward compatibility)
+	SessionID     string `json:"session_id,omitempty"`      // Session ID for this execution
+	Source        string `json:"source,omitempty"`          // Source: cli/tui/agent/daemon
+	EventsPath    string `json:"events_path,omitempty"`     // Path to detailed event log file
+	DurationMs    int64  `json:"duration_ms,omitempty"`     // Duration in milliseconds
+	ToolCallCount int    `json:"tool_call_count,omitempty"` // Number of tool calls made
+	TokenUsage    int64  `json:"token_usage,omitempty"`     // Total tokens used
+	SchemaVersion int    `json:"schema_version,omitempty"`  // Schema version (2 for M2+)
+
+	// M3 extended fields
+	FailureStage   string `json:"failure_stage,omitempty"`    // Failure stage classification
+	FailedToolName string `json:"failed_tool_name,omitempty"` // Name of tool that failed
+	FailureMessage string `json:"failure_message,omitempty"`  // Structured failure message
+}
+
+// MarshalJSON implements json.Marshaler for TaskLogEntry.
+func (e *TaskLogEntry) MarshalJSON() ([]byte, error) {
+	return json.Marshal(*e)
 }
 
 // TaskLog persists task execution history to a JSONL file.

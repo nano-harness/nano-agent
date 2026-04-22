@@ -82,12 +82,12 @@ func (t *ManageMCPTool) Schema() *interfaces.ToolSchema {
 			},
 			"url": {
 				Type:        "string",
-				Description: "HTTP URL for SSE/WebSocket transport",
+				Description: "HTTP URL for streamable transport",
 			},
 			"transport": {
 				Type:        "string",
-				Description: "Transport type: stdio, sse, websocket (default: stdio)",
-				Enum:        []string{"stdio", "sse", "websocket"},
+				Description: "Transport type: stdio (default), streamable (HTTP)",
+				Enum:        []string{"stdio", "streamable"},
 			},
 			"description": {
 				Type:        "string",
@@ -180,6 +180,15 @@ func (t *ManageMCPTool) addServer(args map[string]interface{}) (*interfaces.Tool
 				entry.Command = append(entry.Command, s)
 			}
 		}
+	}
+
+	// Validate streamable transport requires URL
+	if entry.Transport == "streamable" && entry.URL == "" {
+		return &interfaces.ToolResult{
+			Success:     false,
+			LLMContent:  "URL is required for streamable transport",
+			UserContent: "URL is required for streamable transport",
+		}, nil
 	}
 
 	// Build confirmation summary

@@ -3,6 +3,7 @@ package filesystem
 import (
 	"context"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -315,7 +316,9 @@ func (t *ReadFileTool) Execute(ctx context.Context, params map[string]interface{
 		userContent += fmt.Sprintf("\n📝 Note: File has %d more lines. Use start_line and end_line parameters to view more.", totalLines-endLine)
 	}
 
-	llmContent := fmt.Sprintf("Viewed file %s (lines %d-%d of %d):\n%s", absPath, startLine, endLine, totalLines, displayContent)
+	// Wrap LLM content with isolation tags to protect against prompt injection
+	llmContentRaw := fmt.Sprintf("Viewed file %s (lines %d-%d of %d):\n%s", absPath, startLine, endLine, totalLines, displayContent)
+	llmContent := wrapFileContentForLLM(llmContentRaw, absPath)
 
 	return &interfaces.ToolResult{
 		Success:     true,
@@ -401,9 +404,10 @@ func (t *ReadFileTool) parseCodeSkeletonForLargeFile(ctx context.Context, filePa
 	result.WriteString("\n   • Example: read_file with start_line=100, end_line=150")
 	result.WriteString("\n   • The skeleton above shows line numbers for easy navigation")
 
-	// Create enhanced LLM content
-	llmContent := fmt.Sprintf("Large file %s (%d chars, %d lines) auto-parsed with code skeleton:\n\n%s",
+	// Create enhanced LLM content with isolation wrapping
+	llmContentRaw := fmt.Sprintf("Large file %s (%d chars, %d lines) auto-parsed with code skeleton:\n\n%s",
 		filePath, fileSize, totalLines, skeletonResult.LLMContent)
+	llmContent := wrapFileContentForLLM(llmContentRaw, filePath)
 
 	// Prepare enhanced metadata
 	metadata := map[string]interface{}{
@@ -528,4 +532,12 @@ func (t *ReadFileTool) shouldUseCodeSkeleton(content, filePath string, params ma
 
 func (t *ReadFileTool) validatePath(path string) (string, error) {
 	return validatePathCommon(t.workingDir, path)
+}
+
+// wrapFileContentForLLM wraps file content with isolation tags
+func wrapFileContentForLLM(content, filePath string) string {
+	// Escape file path for safe XML attribute usage
+	escapedPath := html.EscapeString(filePath)
+	// Use consistent "file:" prefix format like web tools use "search:" prefix
+	return fmt.Sprintf("<external_data source=\"file:%s\" type=\"file\">\n%s\n</external_data>", escapedPath, content)
 }

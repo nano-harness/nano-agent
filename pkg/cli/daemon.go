@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/daemon"
 	"github.com/nano-harness/nano-agent/pkg/engine"
@@ -601,6 +602,17 @@ func runDaemonForeground() {
 
 	// Mark as daemon mode to use LocalSessionStorage instead of ProjectSessionStorage
 	cfg.IsDaemon = true
+
+	// Load persistent allowlist for current workdir and merge into cfg.
+	allowlistPath, _ := permission.DefaultPersistentAllowlistPath()
+	allowlistStore := permission.NewPersistentAllowlistStore(allowlistPath)
+	if err := allowlistStore.Load(); err != nil {
+		logger.Warnf("Failed to load persistent allowlist: %v", err)
+	}
+	cwd, _ := os.Getwd()
+	for _, raw := range allowlistStore.RulesForWorkdir(cwd) {
+		cfg.AllowedRules = append(cfg.AllowedRules, raw)
+	}
 
 	// Create engine instance
 	eng, err := engine.New(cfg, nil)

@@ -202,6 +202,24 @@ func NewClient(apiKey, baseURL, model string, tools []interfaces.Tool) *Client {
 
 	tokenCounter, _ := NewTokenCounter(model)
 
+	// Configure circuit breaker with config overrides if available
+	cbCfg := DefaultCircuitBreakerConfig()
+	if cfg != nil && cfg.Advanced != nil && cfg.Advanced.CircuitBreaker != nil {
+		cbAdv := cfg.Advanced.CircuitBreaker
+		if cbAdv.MaxRetries > 0 {
+			cbCfg.MaxRetries = cbAdv.MaxRetries
+		}
+		if cbAdv.BaseDelayMs > 0 {
+			cbCfg.BaseDelay = time.Duration(cbAdv.BaseDelayMs) * time.Millisecond
+		}
+		if cbAdv.MaxDelayMs > 0 {
+			cbCfg.MaxDelay = time.Duration(cbAdv.MaxDelayMs) * time.Millisecond
+		}
+		if cbAdv.OpenTimeoutMs > 0 {
+			cbCfg.OpenTimeout = time.Duration(cbAdv.OpenTimeoutMs) * time.Millisecond
+		}
+	}
+
 	client := &Client{
 		client:         openai.NewClient(opts...),
 		model:          model,
@@ -209,7 +227,7 @@ func NewClient(apiKey, baseURL, model string, tools []interfaces.Tool) *Client {
 		tools:          tools,
 		tokenCounter:   tokenCounter,
 		config:         cfg, // Store config for reasoning support
-		circuitBreaker: NewCircuitBreaker(DefaultCircuitBreakerConfig()),
+		circuitBreaker: NewCircuitBreaker(cbCfg),
 	}
 
 	return client

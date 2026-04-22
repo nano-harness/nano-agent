@@ -15,7 +15,6 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/openspec"
 	"github.com/nano-harness/nano-agent/pkg/skill"
 	"github.com/nano-harness/nano-agent/pkg/tools"
-	"github.com/nano-harness/nano-agent/pkg/tools/builtin"
 )
 
 // ToolToExecute represents a tool call to be executed
@@ -86,6 +85,7 @@ type ExecutionStep struct {
 type Turn struct {
 	// Core turn fields
 	ID            string
+	SessionID     string // Session ID for task isolation
 	UserInput     string
 	WorkingDir    string
 	Toolbox       *tools.Toolbox
@@ -132,6 +132,12 @@ type Turn struct {
 	// Sub-agent identification
 	IsSubAgent bool
 
+	// Agent configuration
+	agentConfig *config.Config
+
+	// Context for execution
+	ctx context.Context
+
 	// Memory tracking to avoid duplicate saves
 	lastMemorySaveIndex int
 
@@ -159,6 +165,7 @@ type TurnConfig struct {
 	SkillManager              *skill.Manager
 	TUIScheduler              *TUIScheduler        // optional: enables /loop and /schedule commands
 	CachedSystemPromptBuilder *SystemPromptBuilder // optional: reuse preloaded user info
+	SessionID                 string               // optional: session ID for task isolation (Phase 2)
 }
 
 // NewTurn creates a new Turn instance
@@ -246,6 +253,7 @@ func NewTurnWithMultimodal(userInput string, images []llm.MultimodalImage, confi
 
 	return &Turn{
 		ID:                  fmt.Sprintf("turn_%d", time.Now().Unix()),
+		SessionID:           configInput.SessionID, // Session ID for background task isolation
 		UserInput:           userInput,
 		WorkingDir:          configInput.WorkingDir,
 		Toolbox:             configInput.Toolbox,
@@ -259,6 +267,7 @@ func NewTurnWithMultimodal(userInput string, images []llm.MultimodalImage, confi
 		ToolScheduler:       configInput.ToolScheduler,
 		TUIScheduler:        configInput.TUIScheduler,
 		IsSubAgent:          configInput.IsSubAgent,
+		agentConfig:         cfg,
 		images:              images,
 
 		Goals:       make([]TaskGoal, 0),
@@ -519,6 +528,8 @@ func (t *Turn) UpdateCompletionStatus(success bool, errorMsg string) {
 func (t *Turn) MarkTaskCompleted(reason string) {
 	if t.CompletionCriteria != nil {
 		t.CompletionCriteria.TaskCompleted = true
+		// Reset ConsecutiveErrors since the task completed successfully
+		t.CompletionCriteria.ConsecutiveErrors = 0
 	}
 	t.Status.IsComplete = true
 	logger.Infof("Task marked as completed: %s", reason)
@@ -552,6 +563,47 @@ func (t *Turn) MarkTaskCompleted(reason string) {
 			})
 		}
 		t.eventHandler(evt)
+	}
+}
+
+// updateConsecutiveErrorsFromToolResults adjusts CompletionCriteria.ConsecutiveErrors
+// based on the outcomes of a tool batch:
+//   - if at least one tool succeeded, resets ConsecutiveErrors to 0
+//   - if all tools failed (and at least one failure occurred), increments
+//     ConsecutiveErrors once per iteration so that hasDiminishingReturns() skips
+//     detection during error recovery (preventing tool failures from being
+//     misclassified as "diminishing returns")
+//   - otherwise (e.g. empty batch), leaves ConsecutiveErrors unchanged
+func (t *Turn) updateConsecutiveErrorsFromToolResults(toolResults map[string]*interfaces.ToolResult) {
+	if t.CompletionCriteria == nil {
+		return
+	}
+	hasSuccess := false
+	hasFailure := false
+	for _, result := range toolResults {
+		if result == nil {
+			continue
+		}
+		if result.Success {
+			hasSuccess = true
+		} else {
+			hasFailure = true
+		}
+	}
+	if hasSuccess {
+		// Error recovery: clear diminishing-returns history to prevent pollution.
+		// Otherwise, low-gain samples accumulated during error recovery will
+		// trigger hasDiminishingReturns() immediately after ConsecutiveErrors
+		// is reset to 0, causing premature task termination.
+		// Design reference: Claude Code query.ts checkTokenBudget only counts
+		// "healthy" iterations (continuationCount).
+		if t.CompletionCriteria.ConsecutiveErrors > 0 {
+			t.CompletionCriteria.diminishingReturnsHistory = nil
+			// prevTokens is preserved so next iteration's delta is calculated correctly
+		}
+		t.CompletionCriteria.ConsecutiveErrors = 0
+	} else if hasFailure {
+		t.CompletionCriteria.ConsecutiveErrors++
 	}
 }
 
@@ -594,6 +646,16 @@ func (t *Turn) Execute(ctx context.Context) error {
 	logger.Infof("Starting turn execution: %s", t.ID)
 	t.StartTime = time.Now()
 
+	// Add task maximum runtime timeout
+	if t.agentConfig != nil && t.agentConfig.Turn != nil && t.agentConfig.Turn.MaxDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.agentConfig.Turn.MaxDuration)
+		defer cancel()
+	}
+
+	// Store context for shouldTerminate() to check
+	t.ctx = ctx
+
 	// Reset the read-file cache so every new turn must re-read files before editing.
 	// This prevents the model from editing files based on memory from a previous turn
 	// in which the file may have changed.
@@ -610,11 +672,8 @@ func (t *Turn) Execute(ctx context.Context) error {
 	// Preprocess /skill: commands and auto-match skills
 	t.preprocessSkillCommand(ctx, cfg)
 
-	// Preprocess /loop and /schedule commands
-	t.preprocessLoopCommand()
-
-	// Preprocess /watcher commands
-	t.preprocessWatcherCommand()
+	// Preprocess /routines commands
+	t.preprocessRoutinesCommand()
 	if t.eventHandler != nil {
 		planEvt := event.NewStreamEvent(event.EventTypePlannerPlanSnapshot, "agent_turn")
 		planEvt = planEvt.WithContent("planner plan snapshot")
@@ -659,6 +718,12 @@ func (t *Turn) Execute(ctx context.Context) error {
 				break
 			}
 
+			// Check for permanent errors - never retry these
+			if errType := ClassifyLLMError(err); errType == LLMErrorPermanent {
+				logger.Errorf("LLM API request failed with permanent error (no retry): %v", err)
+				return WrapLLMError(err, errType)
+			}
+
 			// Attempt LLM recovery paths before giving up
 			if recovered := t.attemptLLMRecovery(ctx, err, attempt); recovered {
 				continue // Recovery succeeded, retry immediately
@@ -680,14 +745,20 @@ func (t *Turn) Execute(ctx context.Context) error {
 				if t.CompletionCriteria.ConsecutiveErrors >= t.CompletionCriteria.ErrorThreshold {
 					return fmt.Errorf("LLM API request failed after exhausting all recovery paths: %w", err)
 				}
-				// Exponential backoff: 5s, 10s, 20s... capped at 60s
+				// Exponential backoff: 5s, 10s, 20s... capped at maxBackoff
+				maxBackoff := 60 * time.Second
+				if cfg := config.Get(); cfg != nil && cfg.Advanced != nil &&
+					cfg.Advanced.CircuitBreaker != nil &&
+					cfg.Advanced.CircuitBreaker.MaxDelayMs > 0 {
+					maxBackoff = time.Duration(cfg.Advanced.CircuitBreaker.MaxDelayMs) * time.Millisecond
+				}
 				shift := t.CompletionCriteria.ConsecutiveErrors - 1
 				if shift < 0 {
 					shift = 0
 				}
 				backoffDelay := time.Duration(5<<shift) * time.Second
-				if backoffDelay > 60*time.Second {
-					backoffDelay = 60 * time.Second
+				if backoffDelay > maxBackoff {
+					backoffDelay = maxBackoff
 				}
 				logger.Warnf("Waiting %v before retrying turn loop after LLM failure (consecutive errors: %d/%d)",
 					backoffDelay, t.CompletionCriteria.ConsecutiveErrors, t.CompletionCriteria.ErrorThreshold)
@@ -796,18 +867,7 @@ func (t *Turn) Execute(ctx context.Context) error {
 			t.CompletionCriteria.ErrorCount++
 			t.CompletionCriteria.ConsecutiveErrors++
 		} else {
-			// Only reset consecutive errors if at least one tool actually succeeded
-			// (not just "results successfully added to context")
-			hasSuccess := false
-			for _, result := range toolResults {
-				if result != nil && result.Success {
-					hasSuccess = true
-					break
-				}
-			}
-			if hasSuccess {
-				t.CompletionCriteria.ConsecutiveErrors = 0
-			}
+			t.updateConsecutiveErrorsFromToolResults(toolResults)
 		}
 
 		// Record token gain for diminishing-returns detection after each full round-trip.
@@ -886,7 +946,17 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 	})
 
 	if err != nil {
-		return "", nil, fmt.Errorf("streaming completion failed: %w", err)
+		// Classify the LLM error for better retry logic
+		errType := ClassifyLLMError(err)
+		logger.Debugf("LLM error classified as %s: %v", errType.String(), err)
+
+		// Permanent errors should not be retried
+		if errType == LLMErrorPermanent {
+			return "", nil, WrapLLMError(err, errType)
+		}
+
+		// For transient and rate limit errors, wrap with classification
+		return "", nil, WrapLLMError(err, errType)
 	}
 
 	// Add assistant response to messages
@@ -968,6 +1038,12 @@ func (t *Turn) buildUnifiedSystemPrompt() string {
 
 // shouldTerminate checks if the turn should terminate based on completion criteria
 func (t *Turn) shouldTerminate() bool {
+	// Check context is cancelled or timed out
+	if t.ctx != nil && t.ctx.Err() != nil {
+		logger.Infof("Turn context cancelled/timed out: %v", t.ctx.Err())
+		return true
+	}
+
 	if t.CompletionCriteria == nil {
 		return false
 	}
@@ -1077,6 +1153,18 @@ func (t *Turn) recordTokenGain() {
 	}
 
 	currentTokens := t.compressionStrategy.EstimateTokenCount(t.Messages)
+
+	// Skip recording samples during error recovery: tool failures produce
+	// short error messages, causing naturally low token gain that pollutes
+	// diminishing-returns history. Still update prevTokens so the delta
+	// after recovery is calculated from the current point.
+	// Design reference: Claude Code query.ts continuationCount only counts
+	// non-error-recovery "healthy" iterations.
+	if cc.ConsecutiveErrors > 0 {
+		cc.diminishingReturnsPrevTokens = currentTokens
+		return
+	}
+
 	delta := currentTokens - cc.diminishingReturnsPrevTokens
 	if delta < 0 {
 		delta = 0 // after compression the count may drop; treat as zero gain
@@ -1094,8 +1182,15 @@ func (t *Turn) recordTokenGain() {
 	}
 }
 
-// hasDiminishingReturns returns true when the last DiminishingReturnsWindow
-// iterations all produced a token gain below DiminishingReturnsMinGain.
+// hasDiminishingReturns returns true when both dimensions of token gain are
+// below the threshold:
+//   - Dimension 1 (single-point): the most recent iteration's gain < MinGain
+//   - Dimension 2 (cumulative): sum of all gains in the window < MinGain
+//
+// This dual-delta check (inspired by Claude Code query.ts checkTokenBudget)
+// prevents misclassifying steady near-threshold progress as "stuck".
+// For example, [450, 480, 490] has every single point below 500, but the
+// cumulative gain of 1420 indicates meaningful progress.
 func (t *Turn) hasDiminishingReturns() bool {
 	cc := t.CompletionCriteria
 
@@ -1118,12 +1213,22 @@ func (t *Turn) hasDiminishingReturns() bool {
 		return false // not enough samples yet
 	}
 
-	for _, gain := range cc.diminishingReturnsHistory {
-		if gain >= minGain {
-			return false // at least one recent iteration had meaningful progress
-		}
+	// Dimension 1: Check most recent single-point delta
+	lastDelta := cc.diminishingReturnsHistory[len(cc.diminishingReturnsHistory)-1]
+	if lastDelta >= minGain {
+		return false // Recent iteration shows meaningful progress
 	}
-	return true
+
+	// Dimension 2: Check cumulative delta across the window
+	var cumulative int
+	for _, gain := range cc.diminishingReturnsHistory {
+		cumulative += gain
+	}
+	if cumulative >= minGain {
+		return false // Window shows meaningful cumulative progress
+	}
+
+	return true // Both dimensions below threshold → truly stuck
 }
 
 // buildFallbackResults creates synthetic failure ToolResults for every tool in the
@@ -1522,136 +1627,95 @@ func (t *Turn) handleSkillSlashCommand(ctx context.Context, sm *skill.Manager, i
 	}
 }
 
-// preprocessLoopCommand detects /loop and /schedule slash commands.
-func (t *Turn) preprocessLoopCommand() {
+// preprocessRoutinesCommand detects /routines slash commands and converts them
+// into LLM prompts that invoke the manage_routine tool.
+func (t *Turn) preprocessRoutinesCommand() {
 	input := strings.TrimSpace(t.UserInput)
-	if !strings.HasPrefix(input, "/loop") && !strings.HasPrefix(input, "/schedule") {
+	if !strings.HasPrefix(input, "/routines") {
 		return
 	}
 
-	if t.TUIScheduler == nil {
-		t.UserInput = "Scheduling is not available in the current mode. Start the TUI to use /loop and /schedule commands."
-		return
-	}
+	rest := strings.TrimSpace(strings.TrimPrefix(input, "/routines"))
+	sub, args := splitFirstWord(rest)
 
-	var cmdStr string
-	if strings.HasPrefix(input, "/loop") {
-		cmdStr = input
-	} else {
-		// /schedule — treat remainder as natural language schedule + command
-		// e.g. "/schedule every 5 minutes check build status"
-		// Rewrite as "/loop every 5 minutes check build status"
-		rest := strings.TrimPrefix(input, "/schedule")
-		rest = strings.TrimSpace(rest)
-		if rest == "" {
-			t.UserInput = "Usage: /schedule <interval> <command>  e.g. '/schedule every 5 minutes check build status'"
-			return
-		}
-		// Extract natural-language schedule + command
-		t.handleScheduleCommand(rest)
-		return
-	}
-
-	lc, err := builtin.ParseLoopCommand(cmdStr)
-	if err != nil {
-		t.UserInput = fmt.Sprintf("Invalid /loop command: %v\nUsage: /loop <interval> <command>  e.g. '/loop 5m check build'\n       /loop stop <task-id>\n       /loop list", err)
-		return
-	}
-
-	switch lc.Action {
-	case "list":
-		tasks := t.TUIScheduler.ListTasks()
-		if len(tasks) == 0 {
-			t.UserInput = "No active scheduled tasks. Use '/loop <interval> <command>' to create one."
-			return
-		}
-		var sb strings.Builder
-		sb.WriteString("Active scheduled tasks:\n")
-		for _, task := range tasks {
-			fmt.Fprintf(&sb, "- [%s] %s | cron: %s\n", task.ID[:8], task.Command, task.CronExpr)
-		}
-		sb.WriteString("\nTo stop a task: /loop stop <task-id>")
-		t.UserInput = sb.String()
-
-	case "stop":
-		if err := t.TUIScheduler.CancelTask(lc.TaskID); err != nil {
-			t.UserInput = fmt.Sprintf("Failed to stop task %q: %v", lc.TaskID, err)
-			return
-		}
-		t.UserInput = fmt.Sprintf("Task %q stopped.", lc.TaskID)
-
-	case "start":
-		task, err := t.TUIScheduler.ScheduleCron(lc.CronExpr, lc.Command)
-		if err != nil {
-			t.UserInput = fmt.Sprintf("Failed to schedule task: %v", err)
-			return
-		}
-		t.UserInput = fmt.Sprintf("Task scheduled.\n  ID: %s\n  Interval: %s (cron: %s)\n  Command: %s\nUse '/loop stop %s' to cancel.",
-			task.ID, lc.Interval, lc.CronExpr, lc.Command, task.ID)
-	}
-}
-
-// handleScheduleCommand processes "/schedule <natural-language>" commands.
-func (t *Turn) handleScheduleCommand(rest string) {
-	// Try to extract a schedule expression from the beginning of the string.
-	// The LLM can also handle this naturally, so we just pass enriched context.
-	t.UserInput = fmt.Sprintf(
-		"The user wants to schedule a recurring task: %q\n"+
-			"Parse the schedule from the natural language and create the task using the manage_schedule tool.\n"+
-			"Examples of schedule formats: 'every 5 minutes', 'daily at 9am', 'every monday at 9am'.",
-		rest,
-	)
-}
-
-// preprocessWatcherCommand detects and transforms /watcher slash commands.
-// Structured sub-commands (list, status, delete) are handled directly;
-// all other input is passed to the LLM to be interpreted as natural language
-// and converted into a manage_watcher tool call.
-func (t *Turn) preprocessWatcherCommand() {
-	input := strings.TrimSpace(t.UserInput)
-	if !strings.HasPrefix(input, "/watcher") {
-		return
-	}
-
-	rest := strings.TrimSpace(strings.TrimPrefix(input, "/watcher"))
-
-	switch {
-	case rest == "" || rest == "list":
-		// Direct: list all watcher rules via manage_watcher tool.
-		t.UserInput = "Please list all active watcher rules using the manage_watcher tool with action='list'."
-		return
-	case rest == "status":
-		t.UserInput = "Please show the status of all active watcher rules using the manage_watcher tool with action='status'."
-		return
-	case strings.HasPrefix(rest, "delete "):
-		ruleID := strings.TrimSpace(strings.TrimPrefix(rest, "delete "))
-		if ruleID == "" {
-			t.UserInput = "Usage: /watcher delete <rule-id>"
+	switch sub {
+	case "", "list":
+		t.UserInput = "Please list all routine tasks by calling manage_routine with action='list'."
+	case "add":
+		if args == "" {
+			t.UserInput = "Usage: /routines add <description>  e.g. '/routines add 每5分钟运行 go test'"
 			return
 		}
 		t.UserInput = fmt.Sprintf(
-			"Please delete the watcher rule with ID %q using the manage_watcher tool with action='delete' and rule_id=%q.",
-			ruleID, ruleID,
+			"The user wants to add a recurring routine: %q\n"+
+				"Parse the schedule (cron expression or natural language like 'every 5 minutes', "+
+				"'daily at 9am') and the command, then call manage_routine with action='create'. "+
+				"After confirmation, report the resulting task ID and schedule.",
+			args,
 		)
-		return
+	case "remove":
+		if args == "" {
+			t.UserInput = "Usage: /routines remove <id>"
+			return
+		}
+		t.UserInput = fmt.Sprintf(
+			"Please remove the routine task with ID %q by calling manage_routine with action='delete' and task_id=%q.",
+			args, args,
+		)
+	case "status":
+		if args == "" {
+			t.UserInput = "Please call manage_routine with action='list' and report all tasks with their schedules and last-run information."
+		} else {
+			t.UserInput = fmt.Sprintf(
+				"Please show the status of routine %q by calling manage_routine action='list' and finding the matching task ID.",
+				args,
+			)
+		}
+	case "pause":
+		if args == "" {
+			t.UserInput = "Usage: /routines pause <id>"
+			return
+		}
+		t.UserInput = fmt.Sprintf(
+			"Please pause routine task %q by calling manage_routine with action='pause' and task_id=%q.",
+			args, args,
+		)
+	case "resume":
+		if args == "" {
+			t.UserInput = "Usage: /routines resume <id>"
+			return
+		}
+		t.UserInput = fmt.Sprintf(
+			"Please resume routine task %q by calling manage_routine with action='resume' and task_id=%q.",
+			args, args,
+		)
+	case "run":
+		if args == "" {
+			t.UserInput = "Usage: /routines run <id>"
+			return
+		}
+		t.UserInput = fmt.Sprintf(
+			"Please immediately run routine task %q by calling manage_routine with action='run' and task_id=%q.",
+			args, args,
+		)
+	default:
+		t.UserInput = fmt.Sprintf(
+			"Unknown /routines subcommand: %q\nValid: list, add, remove, status, pause, resume, run",
+			sub,
+		)
 	}
-
-	// For all other input, delegate to the LLM so it can interpret natural
-	// language and create a watcher rule via the manage_watcher tool.
-	t.handleWatcherCommand(rest)
 }
 
-// handleWatcherCommand processes natural-language /watcher input by enriching
-// it into a prompt that instructs the LLM to call manage_watcher.
-func (t *Turn) handleWatcherCommand(rest string) {
-	t.UserInput = fmt.Sprintf(
-		"The user wants to configure an event watcher: %q\n"+
-			"Parse the user's intent and create a watcher rule using the manage_watcher tool.\n"+
-			"Supported sources: 'aone' (for Aone MR/CI events), 'shell' (for custom commands).\n"+
-			"Examples:\n"+
-			"- '监听 aone/a1 的新 MR，自动评审' → source='aone', event='new_mr', filter='repo:aone/a1 state:opened'\n"+
-			"- '每10分钟检查 CI 是否失败' → source='aone', event='ci_failure', interval='10m'\n"+
-			"- '每小时运行 my-script.sh 检查状态' → source='shell', shell_command='my-script.sh'\n",
-		rest,
-	)
+// splitFirstWord splits "list abc def" into ("list", "abc def").
+func splitFirstWord(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	idx := strings.IndexAny(s, " \t")
+	if idx < 0 {
+		return s, ""
+	}
+	return s[:idx], strings.TrimSpace(s[idx+1:])
 }
+

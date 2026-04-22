@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	xansi "github.com/charmbracelet/x/ansi"
 )
 
@@ -58,7 +58,7 @@ func TestTruncateLines_TruncatesLongLine(t *testing.T) {
 
 func TestBuildHelpText_WideTerminal(t *testing.T) {
 	m := newTestModel(200)
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
 	if got := m.buildHelpText(); got != full {
 		t.Errorf("expected full text for wide terminal, got %q", got)
 	}
@@ -66,7 +66,7 @@ func TestBuildHelpText_WideTerminal(t *testing.T) {
 
 func TestBuildHelpText_NoTermWidth(t *testing.T) {
 	m := newTestModel(0)
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
 	if got := m.buildHelpText(); got != full {
 		t.Errorf("expected full text when termWidth=0, got %q", got)
 	}
@@ -83,8 +83,8 @@ func TestBuildHelpText_NarrowFallsBack(t *testing.T) {
 }
 
 func TestBuildHelpText_ShortVariant(t *testing.T) {
-	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
+	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
 	// Choose a width that fits short but not full.
 	width := xansi.StringWidth(short)
 	if xansi.StringWidth(full) <= width {
@@ -102,8 +102,8 @@ func TestBuildHelpText_ShortVariant(t *testing.T) {
 }
 
 func TestBuildHelpText_MinimalVariant(t *testing.T) {
-	minimal := "^C退出 | ^Z取消 | ^P命令 | Tab补全"
-	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
+	minimal := "^C退出 | ^Z取消 | ^R新会话 | ^P命令 | Tab补全"
+	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
 	// Choose a width that fits minimal but not short.
 	width := xansi.StringWidth(minimal)
 	if xansi.StringWidth(short) <= width {

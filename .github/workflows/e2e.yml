@@ -1,0 +1,80 @@
+name: E2E Tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run e2e tests
+        run: make e2e
+        env:
+          NANO_VERBOSE: "false"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: |
+            e2e-coverage.out
+          retention-days: 30
+
+  e2e-coverage:
+    name: E2E Coverage Report
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Run e2e tests with coverage
+        run: make e2e-coverage
+
+      - name: Generate coverage report
+        run: go tool cover -html=e2e-coverage.out -o e2e-coverage.html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-coverage-report
+          path: e2e-coverage.html
+          retention-days: 30
+
+      - name: Comment coverage summary on PR
+        if: always()
+        run: |
+          echo "E2E Test Coverage:" > coverage-comment.txt
+          go tool cover -func=e2e-coverage.out | tail -1 >> coverage-comment.txt

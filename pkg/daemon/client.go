@@ -14,10 +14,12 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/gorilla/websocket"
 )
 
@@ -182,6 +184,21 @@ func (c *Client) SubscribeSessionWithResume(ctx context.Context, opts SubscribeO
 				continue
 			}
 		}
+		connWatcherDone := make(chan struct{})
+		var connWatcherOnce sync.Once
+		stopConnWatcher := func() {
+			connWatcherOnce.Do(func() {
+				close(connWatcherDone)
+			})
+		}
+		go func(wsConn *websocket.Conn) {
+			select {
+			case <-ctx.Done():
+				// Force any in-flight ReadMessage call to unblock promptly.
+				_ = wsConn.Close()
+			case <-connWatcherDone:
+			}
+		}(conn)
 		subscribePayload := map[string]interface{}{
 			"type":       "subscribe",
 			"session_id": opts.SessionID,
@@ -195,6 +212,7 @@ func (c *Client) SubscribeSessionWithResume(ctx context.Context, opts SubscribeO
 		}
 		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if err := conn.WriteJSON(subscribePayload); err != nil {
+			stopConnWatcher()
 			_ = conn.Close()
 			if err := ctx.Err(); err != nil {
 				return nil, sinceSeq, err
@@ -216,11 +234,13 @@ func (c *Client) SubscribeSessionWithResume(ctx context.Context, opts SubscribeO
 		chunkTotals := make(map[string]int)
 		for {
 			if err := ctx.Err(); err != nil {
+				stopConnWatcher()
 				_ = conn.Close()
 				return nil, sinceSeq, err
 			}
 			_, message, err := conn.ReadMessage()
 			if err != nil {
+				stopConnWatcher()
 				_ = conn.Close()
 				if err := ctx.Err(); err != nil {
 					return nil, sinceSeq, err
@@ -274,14 +294,26 @@ func (c *Client) SubscribeSessionWithResume(ctx context.Context, opts SubscribeO
 			}
 			msgType := parseMessageType(msg)
 			if msgType == "completion" {
+				stopConnWatcher()
 				_ = conn.Close()
 				return msg, sinceSeq, nil
 			}
 			if msgType == "error" {
 				errText, _ := msg["error"].(string)
 				if errText != "" && strings.Contains(strings.ToLower(errText), "run_id mismatch") {
+					stopConnWatcher()
 					_ = conn.Close()
 					return msg, sinceSeq, errors.New(errText)
+				}
+				if errText != "" && strings.Contains(strings.ToLower(errText), "no task found for session") {
+					stopConnWatcher()
+					_ = conn.Close()
+					select {
+					case <-ctx.Done():
+						return nil, sinceSeq, ctx.Err()
+					case <-time.After(reconnectDelay):
+						goto reconnect
+					}
 				}
 			}
 		}
@@ -328,6 +360,136 @@ func (c *Client) ExecuteInSession(command string, sessionID string, timeout int,
 		response.SessionID = sessionID
 	}
 	return &response, err
+}
+
+// SessionConfig holds configuration for creating a session
+type SessionConfig struct {
+	WorkingDir string `json:"working_dir,omitempty"`
+}
+
+// SessionResponse represents a session creation response
+type SessionResponse struct {
+	SessionID string `json:"session_id"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message,omitempty"`
+}
+
+// CreateSession creates a new session with optional configuration
+// Note: The daemon creates sessions implicitly on first execute, but this provides
+// an explicit way to create and configure a session for testing purposes
+func (c *Client) CreateSession(ctx context.Context, sessionID string, config *SessionConfig) (*SessionResponse, error) {
+	// If no session ID provided, generate one
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = generateClientSessionID()
+	}
+
+	// Currently the daemon doesn't have a dedicated session creation endpoint
+	// Sessions are created implicitly when you execute a command
+	// For now, we'll return a response indicating the session ID to use
+	return &SessionResponse{
+		SessionID: sessionID,
+		Success:   true,
+		Message:   "Session ID generated (will be created on first execute)",
+	}, nil
+}
+
+// SendMessage sends a message to an existing session
+// This is an alias for ExecuteInSession for better API clarity
+func (c *Client) SendMessage(ctx context.Context, sessionID string, message string) (*ExecuteResponse, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	return c.ExecuteInSession(message, sessionID, 0, false, false)
+}
+
+// StreamEvents streams events from a session via WebSocket
+func (c *Client) StreamEvents(ctx context.Context, sessionID string, callback func(event.StreamEvent) error) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("session_id is required")
+	}
+
+	opts := SubscribeOptions{
+		SessionID: sessionID,
+		SinceSeq:  0,
+	}
+
+	_, _, err := c.SubscribeSessionWithResume(ctx, opts, func(msg map[string]interface{}) {
+		// Convert the message to a StreamEvent
+		ev := messageToStreamEvent(msg)
+		if callback != nil {
+			_ = callback(ev)
+		}
+	})
+
+	return err
+}
+
+// messageToStreamEvent converts a WebSocket message to a StreamEvent
+func messageToStreamEvent(msg map[string]interface{}) event.StreamEvent {
+	ev := event.StreamEvent{}
+
+	// Extract type
+	if typeStr, ok := msg["type"].(string); ok {
+		ev.Type = event.EventType(typeStr)
+	}
+
+	// Extract timestamp
+	if ts, ok := msg["timestamp"].(float64); ok {
+		ev.Timestamp = int64(ts)
+	}
+
+	// Extract content
+	if content, ok := msg["content"].(string); ok {
+		ev.Content = content
+	}
+
+	// Extract error
+	if errStr, ok := msg["error"].(string); ok {
+		ev.Error = errStr
+	}
+
+	// Extract source
+	if source, ok := msg["source"].(string); ok {
+		ev.Source = source
+	}
+
+	// Extract worker_id
+	if workerID, ok := msg["worker_id"].(string); ok {
+		ev.WorkerID = workerID
+	}
+
+	// Extract session_id
+	if sessionID, ok := msg["session_id"].(string); ok {
+		ev.SessionID = sessionID
+	}
+
+	// Extract metadata
+	if metadata, ok := msg["metadata"].(map[string]interface{}); ok {
+		ev.Metadata = metadata
+	}
+
+	// Extract tool_calls
+	if toolCalls, ok := msg["tool_calls"].([]interface{}); ok {
+		var calls []*tools.ToolCall
+		for _, tc := range toolCalls {
+			if tcMap, ok := tc.(map[string]interface{}); ok {
+				call := &tools.ToolCall{}
+				if id, ok := tcMap["id"].(string); ok {
+					call.ID = id
+				}
+				if name, ok := tcMap["name"].(string); ok {
+					call.Name = name
+				}
+				if args, ok := tcMap["arguments"].(map[string]interface{}); ok {
+					call.Arguments = args
+				}
+				calls = append(calls, call)
+			}
+		}
+		ev.ToolCalls = calls
+	}
+
+	return ev
 }
 
 // ListSessions lists sessions

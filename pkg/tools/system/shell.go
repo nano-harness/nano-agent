@@ -1,14 +1,16 @@
 package system //nolint:revive
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +19,28 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
 )
+
+// MaxShellOutputBytes is the maximum size of command output to capture (16MB, aligned with Gemini CLI)
+const MaxShellOutputBytes = 16 * 1024 * 1024
+
+// OutputCallback is a function that receives streaming output from a command
+type OutputCallback func(stream string, chunk string) // stream: "stdout" or "stderr"
+
+// outputCallbackKey is the context key for OutputCallback
+type outputCallbackKey struct{}
+
+// WithOutputCallback returns a new context with the OutputCallback attached
+func WithOutputCallback(ctx context.Context, cb OutputCallback) context.Context {
+	return context.WithValue(ctx, outputCallbackKey{}, cb)
+}
+
+// outputCallbackFromContext retrieves the OutputCallback from context, if present
+func outputCallbackFromContext(ctx context.Context) OutputCallback {
+	if cb, ok := ctx.Value(outputCallbackKey{}).(OutputCallback); ok {
+		return cb
+	}
+	return nil
+}
 
 // ShellTool implements shell command execution with safety controls.
 // Command security is enforced via the four-layer CommandGuard in pkg/middleware.
@@ -28,6 +52,7 @@ type ShellTool struct {
 	strict         bool
 	sandbox        sandbox.Sandbox
 	guard          *middleware.CommandGuard
+	bgManager      *BackgroundTaskManager // Optional: for background task support
 }
 
 // NewShellTool creates a new ShellTool instance.
@@ -65,6 +90,13 @@ func NewShellTool(workingDir string, cfg map[string]interface{}, sandboxCfg *con
 	}
 	tool.guard = middleware.NewCommandGuard(allowRules, denyRules, nil)
 
+	return tool
+}
+
+// NewShellToolWithBgManager creates a new ShellTool with background task support
+func NewShellToolWithBgManager(workingDir string, cfg map[string]interface{}, sandboxCfg *config.SandboxConfig, bgManager *BackgroundTaskManager) *ShellTool {
+	tool := NewShellTool(workingDir, cfg, sandboxCfg)
+	tool.bgManager = bgManager
 	return tool
 }
 
@@ -181,9 +213,9 @@ func (t *ShellTool) Schema() *interfaces.ToolSchema { //nolint:revive
 	dirProp.Examples = []string{"./src", "/Users/user/project", "."}
 	dirProp.Usage = "Must be within workspace. Relative paths are resolved against working directory."
 
-	timeoutProp := interfaces.NewNumberProperty("Command timeout in seconds (default: 30)")
-	timeoutProp.Examples = []string{"5", "30", "60", "120"}
-	timeoutProp.Usage = "Commands exceeding timeout are terminated. Successful termination has success=true."
+	timeoutProp := interfaces.NewNumberProperty("Command timeout in seconds (default: 120, max: 600)")
+	timeoutProp.Examples = []string{"5", "30", "60", "120", "300"}
+	timeoutProp.Usage = "Commands exceeding timeout are automatically converted to background tasks. Use bash_output to monitor them."
 
 	captureProp := interfaces.NewBooleanProperty("Capture and return command output")
 	captureProp.Examples = []string{"true", "false"}
@@ -192,6 +224,10 @@ func (t *ShellTool) Schema() *interfaces.ToolSchema { //nolint:revive
 	envProp := interfaces.NewStringProperty("Additional environment variables (KEY=value format, separated by ;)")
 	envProp.Examples = []string{"NODE_ENV=production", "DEBUG=true;LOG_LEVEL=info", "PATH=/usr/local/bin:$PATH"}
 	envProp.Usage = "Format: KEY=value;KEY2=value2. Variables are filtered by policy; blocked keys are dropped. In strict mode, only allowed keys are accepted."
+
+	isBackgroundProp := interfaces.NewBooleanProperty("Run command in background and return task_id immediately")
+	isBackgroundProp.Examples = []string{"true", "false"}
+	isBackgroundProp.Usage = "Best for dev servers, watchers, and long-running commands. Use bash_output/kill_bash to manage background tasks."
 
 	return interfaces.CreateSchema(
 		"Execute shell commands with safety controls",
@@ -202,21 +238,23 @@ func (t *ShellTool) Schema() *interfaces.ToolSchema { //nolint:revive
 			"timeout_seconds": timeoutProp,
 			"capture_output":  captureProp,
 			"environment":     envProp,
+			"is_background":   isBackgroundProp,
 		},
 		[]string{"command"},
 	)
 }
 
 type CommandResult struct { //nolint:revive
-	Command   string        `json:"command"`
-	ExitCode  int           `json:"exit_code"`
-	Stdout    string        `json:"stdout"`
-	Stderr    string        `json:"stderr"`
-	Duration  time.Duration `json:"duration"`
-	Directory string        `json:"directory"`
-	Success   bool          `json:"success"`
-	TimedOut  bool          `json:"timed_out"`
-	PID       int           `json:"pid"`
+	Command   string                 `json:"command"`
+	ExitCode  int                    `json:"exit_code"`
+	Stdout    string                 `json:"stdout"`
+	Stderr    string                 `json:"stderr"`
+	Duration  time.Duration          `json:"duration"`
+	Directory string                 `json:"directory"`
+	Success   bool                   `json:"success"`
+	TimedOut  bool                   `json:"timed_out"`
+	PID       int                    `json:"pid"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
 func (t *ShellTool) Execute(ctx context.Context, params map[string]interface{}) (*interfaces.ToolResult, error) { //nolint:revive
@@ -242,10 +280,14 @@ func (t *ShellTool) Execute(ctx context.Context, params map[string]interface{}) 
 		directory = dirParam
 	}
 
-	timeout := 30 * time.Second
+	timeout := 120 * time.Second // Default 120s (Phase 2)
+	maxTimeout := 600 * time.Second
 	if timeoutParam, ok := params["timeout_seconds"]; ok {
 		if timeoutFloat, ok := timeoutParam.(float64); ok {
 			timeout = time.Duration(timeoutFloat) * time.Second
+			if timeout > maxTimeout {
+				timeout = maxTimeout
+			}
 		}
 	}
 
@@ -257,6 +299,11 @@ func (t *ShellTool) Execute(ctx context.Context, params map[string]interface{}) 
 	environment := ""
 	if envParam, ok := params["environment"].(string); ok {
 		environment = envParam
+	}
+
+	isBackground := false
+	if bgParam, ok := params["is_background"].(bool); ok {
+		isBackground = bgParam
 	}
 
 	// Validate directory
@@ -301,38 +348,140 @@ func (t *ShellTool) Execute(ctx context.Context, params map[string]interface{}) 
 		}
 	}
 
-	// Execute command
-	result, err := t.executeCommand(ctx, command, absDir, timeout, captureOutput, environment)
-	if err != nil {
+	// Handle background execution if requested
+	if isBackground {
+		return t.spawnBackground(ctx, command, absDir, description, false)
+	}
+
+	// Execute command with timeout (auto-background on timeout)
+	return t.executeWithAutoBackground(ctx, command, absDir, timeout, captureOutput, environment, description)
+}
+
+// spawnBackground spawns a command as a background task
+func (t *ShellTool) spawnBackground(ctx context.Context, command, directory, description string, autoBackgrounded bool) (*interfaces.ToolResult, error) {
+	if t.bgManager == nil {
 		return &interfaces.ToolResult{
 			Success:     false,
-			Error:       fmt.Sprintf("Command execution failed: %v", err),
-			UserContent: "❌ Failed to run command: Command execution failed: " + err.Error(),
-			LLMContent:  "run_shell_command failed: Command execution failed: " + err.Error(),
+			Error:       "background task manager not available",
+			UserContent: "❌ Background tasks not supported in this configuration",
+			LLMContent:  "Background tasks require background task manager to be initialized",
 		}, nil
 	}
 
-	// Prepare metadata
-	metadata := map[string]interface{}{
-		"command":        command,
-		"description":    description,
-		"directory":      absDir,
-		"timeout":        timeout.Seconds(),
-		"capture_output": captureOutput,
-		"environment":    environment,
+	// Get session ID from Turn context (added in Phase 2)
+	sessionID := "default"
+	// Try to get from agent Turn struct via context if available
+	// For now, use default - will be enhanced when context propagation is complete
+
+	task, err := t.bgManager.Spawn(ctx, sessionID, command, directory)
+	if err != nil {
+		return &interfaces.ToolResult{
+			Success:     false,
+			Error:       fmt.Sprintf("Failed to spawn background task: %v", err),
+			UserContent: fmt.Sprintf("❌ Failed to start background task: %v", err),
+			LLMContent:  fmt.Sprintf("Failed to spawn background task: %v", err),
+		}, nil
 	}
 
-	// Format content for display
-	userContent := t.formatForUser(result, metadata)
-	llmContent := t.formatForLLM(result, metadata)
+	var content string
+	if autoBackgrounded {
+		content = fmt.Sprintf("⏰ Command exceeded timeout and was converted to background task\n"+
+			"Task ID: %s\n"+
+			"PID: %d\n"+
+			"Command: %s\n"+
+			"Directory: %s\n"+
+			"\n"+
+			"⚠️ Note: Command was restarted in background. Use bash_output tool to monitor output.\n"+
+			"Example: bash_output(task_id=\"%s\")",
+			task.ID, task.Pid, command, directory, task.ID)
+	} else {
+		content = fmt.Sprintf("✅ Background task started\n"+
+			"Task ID: %s\n"+
+			"PID: %d\n"+
+			"Command: %s\n"+
+			"Directory: %s\n"+
+			"\n"+
+			"Use bash_output tool to monitor output.\n"+
+			"Example: bash_output(task_id=\"%s\")",
+			task.ID, task.Pid, command, directory, task.ID)
+	}
 
 	return &interfaces.ToolResult{
-		Success:     result.Success,
-		Data:        result,
-		Metadata:    metadata,
-		LLMContent:  llmContent,
-		UserContent: userContent,
+		Success:     true,
+		UserContent: content,
+		LLMContent:  content,
+		Metadata: map[string]interface{}{
+			"task_id":           task.ID,
+			"pid":               task.Pid,
+			"command":           command,
+			"directory":         directory,
+			"auto_backgrounded": autoBackgrounded,
+		},
 	}, nil
+}
+
+// executeWithAutoBackground executes a command with automatic background conversion on timeout
+func (t *ShellTool) executeWithAutoBackground(ctx context.Context, command, directory string, timeout time.Duration, captureOutput bool, environment, description string) (*interfaces.ToolResult, error) {
+	syncCtx, syncCancel := context.WithTimeout(ctx, timeout)
+	defer syncCancel()
+
+	resultCh := make(chan *interfaces.ToolResult, 1)
+	go func() {
+		result, err := t.executeCommand(syncCtx, command, directory, timeout, captureOutput, environment)
+		if err != nil {
+			resultCh <- &interfaces.ToolResult{
+				Success:     false,
+				Error:       fmt.Sprintf("Command execution failed: %v", err),
+				UserContent: "❌ Failed to run command: Command execution failed: " + err.Error(),
+				LLMContent:  "run_shell_command failed: Command execution failed: " + err.Error(),
+			}
+			return
+		}
+
+		// Prepare metadata
+		metadata := map[string]interface{}{
+			"command":        command,
+			"description":    description,
+			"directory":      directory,
+			"timeout":        timeout.Seconds(),
+			"capture_output": captureOutput,
+			"environment":    environment,
+		}
+
+		// Add truncation information from result metadata if present
+		if result.Metadata != nil {
+			if truncated, ok := result.Metadata["output_truncated"].(bool); ok && truncated {
+				metadata["output_truncated"] = true
+				metadata["max_output_bytes"] = MaxShellOutputBytes
+			}
+		}
+
+		// Format content for display
+		userContent := t.formatForUser(result, metadata)
+		llmContent := t.formatForLLM(result, metadata)
+
+		resultCh <- &interfaces.ToolResult{
+			Success:     result.Success,
+			Data:        result,
+			Metadata:    metadata,
+			LLMContent:  llmContent,
+			UserContent: userContent,
+		}
+	}()
+
+	select {
+	case r := <-resultCh:
+		return r, nil
+	case <-syncCtx.Done():
+		if syncCtx.Err() == context.DeadlineExceeded && t.bgManager != nil {
+			// Timeout - convert to background task
+			return t.spawnBackground(ctx, command, directory, description, true)
+		}
+		// No background manager - wait for the command to finish timing out naturally
+		// The command will complete shortly with a timeout result
+		r := <-resultCh
+		return r, nil
+	}
 }
 
 func (t *ShellTool) validateDirectory(directory string) (string, error) {
@@ -479,15 +628,28 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 
 		result.PID = cmd.Process.Pid
 
-		// Ensure process group is killed on timeout (Unix only)
+		// Enhanced process cleanup with graceful shutdown (Unix only)
+		// waitedCh signals when cmd.Wait() returns
+		waitedCh := make(chan struct{})
+
 		if runtime.GOOS != "windows" {
 			go func() {
 				<-cmdCtx.Done()
-				// Kill process group if context is done (timeout or cancel)
-				// We check cmd.Process to avoid nil pointer, though Start() succeeded
-				if cmd.Process != nil && cmdCtx.Err() == context.DeadlineExceeded {
-					// Ignore error as process might be already dead
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				if cmd.Process == nil {
+					return
+				}
+				pgid := -cmd.Process.Pid
+				// Try graceful SIGTERM first
+				_ = syscall.Kill(pgid, syscall.SIGTERM)
+				// Give it 200ms grace period
+				timer := time.NewTimer(200 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					// Grace period expired, force kill
+					_ = syscall.Kill(pgid, syscall.SIGKILL)
+				case <-waitedCh:
+					// Process already exited gracefully
 				}
 			}()
 		}
@@ -495,23 +657,22 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 		// Read stdout and stderr concurrently
 		stdoutDone := make(chan string, 1)
 		stderrDone := make(chan string, 1)
+		truncatedOut := false
+		truncatedErr := false
+
+		// Get output callback from context
+		outputCb := outputCallbackFromContext(cmdCtx)
 
 		go func() {
-			var output strings.Builder
-			scanner := bufio.NewScanner(stdout)
-			for scanner.Scan() {
-				output.WriteString(scanner.Text() + "\n")
-			}
-			stdoutDone <- output.String()
+			var accum bytes.Buffer
+			t.streamPipe(stdout, "stdout", outputCb, &accum, &truncatedOut)
+			stdoutDone <- accum.String()
 		}()
 
 		go func() {
-			var output strings.Builder
-			scanner := bufio.NewScanner(stderr)
-			for scanner.Scan() {
-				output.WriteString(scanner.Text() + "\n")
-			}
-			stderrDone <- output.String()
+			var accum bytes.Buffer
+			t.streamPipe(stderr, "stderr", outputCb, &accum, &truncatedErr)
+			stderrDone <- accum.String()
 		}()
 
 		// Get outputs (must happen before Wait as Wait closes the pipes)
@@ -520,7 +681,17 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 
 		// Wait for command to complete
 		err = cmd.Wait()
+		close(waitedCh) // Signal that process has exited
 		result.Duration = time.Since(start)
+
+		// Record truncation in metadata if it occurred
+		if truncatedOut || truncatedErr {
+			if result.Metadata == nil {
+				result.Metadata = make(map[string]interface{})
+			}
+			result.Metadata["output_truncated"] = true
+			result.Metadata["max_output_bytes"] = MaxShellOutputBytes
+		}
 
 		// Check for timeout
 		if cmdCtx.Err() == context.DeadlineExceeded {
@@ -597,6 +768,16 @@ func (t *ShellTool) formatForUser(result *CommandResult, metadata map[string]int
 		output.WriteString("\n")
 	}
 
+	// Add truncation warning if output was truncated
+	if truncated, ok := metadata["output_truncated"].(bool); ok && truncated {
+		output.WriteString("⚠️  Output was truncated to ")
+		if maxBytes, ok := metadata["max_output_bytes"].(int); ok {
+			fmt.Fprintf(&output, "%d bytes\n", maxBytes)
+		} else {
+			output.WriteString("maximum size\n")
+		}
+	}
+
 	return output.String()
 }
 
@@ -634,7 +815,66 @@ func (t *ShellTool) formatForLLM(result *CommandResult, metadata map[string]inte
 		output.WriteString("\n")
 	}
 
+	// Add truncation warning if output was truncated
+	if truncated, ok := metadata["output_truncated"].(bool); ok && truncated {
+		output.WriteString("Note: Output was truncated to ")
+		if maxBytes, ok := metadata["max_output_bytes"].(int); ok {
+			fmt.Fprintf(&output, "%d bytes\n", maxBytes)
+		} else {
+			output.WriteString("maximum size\n")
+		}
+	}
+
 	return output.String()
+}
+
+// streamPipe reads from a pipe with streaming callbacks and output size limits
+func (t *ShellTool) streamPipe(pipe io.Reader, stream string, cb OutputCallback, accum *bytes.Buffer, truncated *bool) {
+	buf := make([]byte, 4096)
+	var mu sync.Mutex
+	var totalStreamed int
+
+	for {
+		n, err := pipe.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			mu.Lock()
+			// Check if adding this chunk would exceed the limit
+			if accum.Len()+n > MaxShellOutputBytes {
+				*truncated = true
+				// Calculate how much to drop from the beginning
+				drop := accum.Len() + n - MaxShellOutputBytes
+				if drop >= accum.Len() {
+					// Drop everything accumulated so far
+					accum.Reset()
+				} else {
+					// Drop 'drop' bytes from the beginning
+					kept := accum.Bytes()[drop:]
+					accum.Reset()
+					accum.Write(kept)
+				}
+			}
+			accum.Write(chunk)
+
+			// Call the streaming callback if provided, but only if we haven't exceeded the limit
+			willExceedLimit := totalStreamed+n > MaxShellOutputBytes
+			if cb != nil && !willExceedLimit {
+				cb(stream, string(chunk))
+				totalStreamed += n
+			} else if cb != nil && totalStreamed <= MaxShellOutputBytes {
+				// Send partial chunk to reach the limit exactly
+				remaining := MaxShellOutputBytes - totalStreamed
+				if remaining > 0 {
+					cb(stream, string(chunk[:remaining]))
+					totalStreamed = MaxShellOutputBytes
+				}
+			}
+			mu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // containsInsensitive checks if a slice contains a string, case-insensitive

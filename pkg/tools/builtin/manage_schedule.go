@@ -12,9 +12,10 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 )
 
-// ManageScheduleTool lets the agent create, delete, list, pause, or resume
-// scheduled tasks through conversation.  Task creation requires user confirmation.
-type ManageScheduleTool struct {
+// ManageRoutineTool lets the agent create, delete, list, pause, or resume
+// routine tasks (cron-based recurring scheduled tasks) through conversation.
+// Task creation requires user confirmation.
+type ManageRoutineTool struct {
 	scheduler  *cron.Scheduler
 	stateStore *config.StateStore
 	confirmFn  func(summary string) bool
@@ -22,11 +23,11 @@ type ManageScheduleTool struct {
 	mu sync.Mutex
 }
 
-// NewManageScheduleTool creates a ManageScheduleTool.
+// NewManageRoutineTool creates a ManageRoutineTool.
 // scheduler and stateStore may be nil in which case the tool operates in
 // read-only / no-op mode.
-func NewManageScheduleTool(scheduler *cron.Scheduler, ss *config.StateStore, confirmFn func(string) bool) *ManageScheduleTool {
-	return &ManageScheduleTool{
+func NewManageRoutineTool(scheduler *cron.Scheduler, ss *config.StateStore, confirmFn func(string) bool) *ManageRoutineTool {
+	return &ManageRoutineTool{
 		scheduler:  scheduler,
 		stateStore: ss,
 		confirmFn:  confirmFn,
@@ -35,38 +36,40 @@ func NewManageScheduleTool(scheduler *cron.Scheduler, ss *config.StateStore, con
 
 // SetScheduler wires in a live cron.Scheduler so tasks are scheduled immediately.
 // This is called after the TUI scheduler is started (typically from SetTUIScheduler).
-func (t *ManageScheduleTool) SetScheduler(s *cron.Scheduler) {
+func (t *ManageRoutineTool) SetScheduler(s *cron.Scheduler) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.scheduler = s
 }
 
 // Name returns the tool name.
-func (t *ManageScheduleTool) Name() string { return "manage_schedule" }
+func (t *ManageRoutineTool) Name() string { return "manage_routine" }
 
 // Description returns the tool description.
-func (t *ManageScheduleTool) Description() string {
-	return "Manage scheduled tasks: create (cron or natural language schedule), delete, list, pause, or resume. Create requires user confirmation."
+func (t *ManageRoutineTool) Description() string {
+	return "Manage routine tasks (recurring scheduled commands): create, delete, list, status, pause, or resume. " +
+		"Schedule supports cron expressions (e.g. '0 9 * * 1-5') or natural language (e.g. 'every 5 minutes', 'daily at 9am'). " +
+		"Create requires user confirmation."
 }
 
 // Category returns the tool category.
-func (t *ManageScheduleTool) Category() interfaces.ToolCategory { return interfaces.CategoryAgent }
+func (t *ManageRoutineTool) Category() interfaces.ToolCategory { return interfaces.CategoryAgent }
 
 // RequiresConfirmation returns false — handled internally.
-func (t *ManageScheduleTool) RequiresConfirmation() bool { return false }
+func (t *ManageRoutineTool) RequiresConfirmation() bool { return false }
 
 // ConcurrencySafe returns false.
-func (t *ManageScheduleTool) ConcurrencySafe() bool { return false }
+func (t *ManageRoutineTool) ConcurrencySafe() bool { return false }
 
 // Schema returns the JSON schema.
-func (t *ManageScheduleTool) Schema() *interfaces.ToolSchema {
+func (t *ManageRoutineTool) Schema() *interfaces.ToolSchema {
 	return interfaces.CreateSchema(
-		"Manage scheduled tasks",
+		"Manage routine tasks (recurring scheduled commands)",
 		map[string]*interfaces.PropertySchema{
 			"action": {
 				Type:        "string",
-				Description: "Action to perform",
-				Enum:        []string{"create", "delete", "list", "pause", "resume"},
+				Description: "Action to perform: create, delete, list, pause, resume, or run a task immediately by ID",
+				Enum:        []string{"create", "delete", "list", "pause", "resume", "run"},
 			},
 			"command": {
 				Type:        "string",
@@ -78,7 +81,7 @@ func (t *ManageScheduleTool) Schema() *interfaces.ToolSchema {
 			},
 			"task_id": {
 				Type:        "string",
-				Description: "Task ID for delete/pause/resume actions",
+				Description: "Task ID for delete/pause/resume/run actions",
 			},
 			"max_runs": {
 				Type:        "integer",
@@ -89,8 +92,8 @@ func (t *ManageScheduleTool) Schema() *interfaces.ToolSchema {
 	)
 }
 
-// Execute runs the schedule management action.
-func (t *ManageScheduleTool) Execute(_ context.Context, args map[string]interface{}) (*interfaces.ToolResult, error) {
+// Execute runs the routine management action.
+func (t *ManageRoutineTool) Execute(_ context.Context, args map[string]interface{}) (*interfaces.ToolResult, error) {
 	action, ok := args["action"].(string)
 	if !ok || action == "" {
 		return nil, fmt.Errorf("action is required")
@@ -105,19 +108,21 @@ func (t *ManageScheduleTool) Execute(_ context.Context, args map[string]interfac
 		return t.deleteTask(args)
 	case "pause", "resume":
 		return t.pauseResumeTask(args, action)
+	case "run":
+		return t.runTaskNow(args)
 	default:
-		return nil, fmt.Errorf("unknown action %q; valid: create, delete, list, pause, resume", action)
+		return nil, fmt.Errorf("unknown action %q; valid: create, delete, list, pause, resume, run", action)
 	}
 }
 
 // getScheduler returns the current scheduler under the lock.
-func (t *ManageScheduleTool) getScheduler() *cron.Scheduler {
+func (t *ManageRoutineTool) getScheduler() *cron.Scheduler {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.scheduler
 }
 
-func (t *ManageScheduleTool) listTasks() (*interfaces.ToolResult, error) {
+func (t *ManageRoutineTool) listTasks() (*interfaces.ToolResult, error) {
 	var lines []string
 
 	sched := t.getScheduler()
@@ -144,7 +149,7 @@ func (t *ManageScheduleTool) listTasks() (*interfaces.ToolResult, error) {
 	return &interfaces.ToolResult{Success: true, LLMContent: content, UserContent: content}, nil
 }
 
-func (t *ManageScheduleTool) createTask(args map[string]interface{}) (*interfaces.ToolResult, error) {
+func (t *ManageRoutineTool) createTask(args map[string]interface{}) (*interfaces.ToolResult, error) {
 	command, _ := args["command"].(string)
 	if command == "" {
 		return nil, fmt.Errorf("command is required for create action")
@@ -225,7 +230,7 @@ func (t *ManageScheduleTool) createTask(args map[string]interface{}) (*interface
 	}, nil
 }
 
-func (t *ManageScheduleTool) deleteTask(args map[string]interface{}) (*interfaces.ToolResult, error) {
+func (t *ManageRoutineTool) deleteTask(args map[string]interface{}) (*interfaces.ToolResult, error) {
 	taskID, _ := args["task_id"].(string)
 	if taskID == "" {
 		return nil, fmt.Errorf("task_id is required for delete action")
@@ -255,7 +260,7 @@ func (t *ManageScheduleTool) deleteTask(args map[string]interface{}) (*interface
 	return &interfaces.ToolResult{Success: true, LLMContent: msg, UserContent: msg}, nil
 }
 
-func (t *ManageScheduleTool) pauseResumeTask(args map[string]interface{}, action string) (*interfaces.ToolResult, error) {
+func (t *ManageRoutineTool) pauseResumeTask(args map[string]interface{}, action string) (*interfaces.ToolResult, error) {
 	taskID, _ := args["task_id"].(string)
 	if taskID == "" {
 		return nil, fmt.Errorf("task_id is required for %s action", action)
@@ -264,6 +269,44 @@ func (t *ManageScheduleTool) pauseResumeTask(args map[string]interface{}, action
 	// We acknowledge the intent and advise that pause/resume is achieved via delete+recreate.
 	msg := fmt.Sprintf("Task %s is not yet supported in the live scheduler. To pause a task, delete it and recreate it when needed.", action)
 	return &interfaces.ToolResult{Success: false, LLMContent: msg, UserContent: msg}, nil
+}
+
+func (t *ManageRoutineTool) runTaskNow(args map[string]interface{}) (*interfaces.ToolResult, error) {
+	taskID, _ := args["task_id"].(string)
+	if taskID == "" {
+		return nil, fmt.Errorf("task_id is required for run action")
+	}
+
+	sched := t.getScheduler()
+	if sched == nil {
+		msg := "Cannot run task: no live scheduler available"
+		return &interfaces.ToolResult{Success: false, LLMContent: msg, UserContent: msg}, nil
+	}
+
+	// Pre-check existence to provide better error messages
+	tasks := sched.ListTasks()
+	var found bool
+	for _, task := range tasks {
+		if task.ID == taskID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		msg := fmt.Sprintf("Task %q not found", taskID)
+		return &interfaces.ToolResult{Success: false, LLMContent: msg, UserContent: msg}, nil
+	}
+
+	// Trigger async to avoid blocking the tool call
+	go sched.RunTaskNow(taskID) //nolint:errcheck
+
+	msg := fmt.Sprintf("Task %q triggered for immediate execution", taskID)
+	return &interfaces.ToolResult{
+		Success:     true,
+		LLMContent:  msg,
+		UserContent: msg,
+		Data:        map[string]interface{}{"trigger": "manual", "task_id": taskID},
+	}, nil
 }
 
 // generateTaskID generates a simple unique ID using timestamp.

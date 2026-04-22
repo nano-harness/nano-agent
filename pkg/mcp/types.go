@@ -39,6 +39,7 @@ type MCPServerConfig struct { //nolint:revive
 	Headers     map[string]string `json:"headers"`
 	Enabled     bool              `json:"enabled"`
 	Timeout     time.Duration     `json:"timeout"`
+	OAuth       *OAuthConfig      `json:"oauth,omitempty" yaml:"oauth,omitempty"`
 }
 
 // TLSConfig holds TLS configuration
@@ -138,8 +139,6 @@ type TransportType string
 
 const (
 	TransportSTDIO      TransportType = "stdio" //nolint:revive
-	TransportHTTP       TransportType = "http"
-	TransportWebSocket  TransportType = "websocket"
 	TransportStreamable TransportType = "streamable"
 	TransportInMemory   TransportType = "inmemory"
 )

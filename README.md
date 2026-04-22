@@ -9,7 +9,8 @@ A lightweight AI-powered code assistant built in Go, featuring a modular tool ar
 - **Dual Operating Modes**: TUI interactive mode and Daemon background service mode
 - **Turn-Based Architecture**: Eliminates over-planning for simple queries with intelligent workflow selection
 - **Dynamic Planning System**: Real-time todo list generation and adaptive execution
-- **Fork Sub-Agents**: Fork child agents with typed roles (explore, plan, verify, execute) for parallel sub-task delegation with depth-limited recursion
+- **Expert System**: Specialized agents triggered via `@expert-name` syntax - built-in experts for codebase investigation, CLI help, and general tasks with support for custom expert definitions
+- **Background Task Management**: Run long-running shell commands in background with real-time output streaming, task monitoring, and graceful shutdown support
 - **Modular Tool System**: Comprehensive file operations, search, web capabilities, and memory management
 - **Advanced Reasoning Support**: Native support for reasoning models (e.g., o1, DeepSeek-R1) with configurable reasoning effort, token limits, and graceful fallback mechanisms
 - **Skill System**: Load, parse, and match skills from personal (`~/.nano/skills/`) and project (`.nano/skills/`) directories with auto-invoke and priority-based matching
@@ -329,6 +330,135 @@ The built-in `image_generate` tool creates images or edits existing ones via pro
 - Notes:
   - `image_urls` is the only input for images; single-image edit is done by passing a one-element array.
   - URLs are transferred to temporary OSS storage for convenient sharing.
+
+## 👥 Expert System
+
+nano-agent features a specialized expert system that allows you to delegate tasks to purpose-built agents using the `@expert-name` syntax.
+
+### Built-in Experts
+
+Three experts are available out of the box:
+
+- **`@investigator`** - Read-only codebase exploration and analysis
+  - Systematically investigates code structure and finds implementations
+  - Returns structured reports with file references and exploration traces
+  - Limited to read-only tools for safe exploration
+
+- **`@help`** - CLI usage assistant
+  - Answers questions about nano-agent CLI by consulting official documentation
+  - Searches and cites relevant documentation files
+  - Perfect for learning nano-agent features
+
+- **`@generalist`** - General-purpose agent
+  - Full tool access with the main agent's system prompt
+  - Handles general tasks without restrictions
+  - Useful for delegating complex multi-step work
+
+### Using Experts
+
+Simply prefix your request with `@expert-name`:
+
+```bash
+# Investigate code structure
+@investigator find all authentication code
+
+# Get CLI help
+@help how do I configure MCP servers?
+
+# Delegate a general task
+@generalist refactor this module for better error handling
+```
+
+### Custom Experts
+
+Define your own experts using markdown files with YAML frontmatter:
+
+**Location**: `~/.config/nano/agents/` (user-level) or `.nano/agents/` (project-level)
+
+**Example** (`~/.config/nano/agents/security-auditor.md`):
+
+```markdown
+---
+name: security-auditor
+description: Security-focused code reviewer
+model: gpt-4o
+temperature: 0.1
+max_turns: 15
+max_time_minutes: 10
+allowed_tools:
+  - read_file
+  - list_directory
+  - glob
+  - search_file_content
+---
+
+You are a security auditor specialized in finding vulnerabilities in code.
+Focus on OWASP Top 10 issues, authentication flaws, and injection vulnerabilities.
+Provide specific file locations and line numbers for any issues found.
+```
+
+Then invoke with: `@security-auditor review this authentication module`
+
+### Expert Commands
+
+List and inspect available experts:
+
+```bash
+# List all experts
+/agents
+
+# Show expert details
+/agents:show investigator
+```
+
+### Key Differences from Previous Fork System
+
+> **⚠️ BREAKING CHANGE**: The expert system replaces the previous `fork` tool:
+>
+> 1. **Explicit triggering only**: LLM cannot autonomously call experts. Only users can trigger them with `@expert-name`.
+> 2. **Better observability**: You always know when an expert is invoked and what it costs.
+> 3. **Kebab-case names**: Use `@investigator` not `@codebase_investigator`. Names are auto-converted from YAML config.
+> 4. **Removed implicit fork**: The old `fork` tool has been completely removed - all sub-agent invocations must be explicitly triggered by users.
+
+## 🔄 Background Task Management
+
+nano-agent supports running long-running shell commands in the background with comprehensive task management capabilities.
+
+### Features
+
+- **Non-blocking Execution**: Run commands that exceed timeout limits automatically in background mode
+- **Real-time Output Streaming**: Stream command output with configurable callbacks and 16MB buffer limits
+- **Task Monitoring**: List, monitor, and retrieve output from background tasks
+- **Graceful Shutdown**: Automatic cleanup with SIGTERM → grace period → SIGKILL for proper process termination
+- **Session Isolation**: Tasks are isolated per session with 100 task limit per session
+- **Log Management**: 100MB log file size limits per task to prevent disk exhaustion
+
+### Background Task Tools
+
+- **`execute_shell`** with `is_background: true`: Run commands in background mode explicitly
+- **`bash_output`**: Retrieve task output with incremental reading and offset tracking
+- **`kill_bash`**: Gracefully terminate background tasks
+- **`list_background_tasks`**: List all tasks for current session with status
+
+### Usage Examples
+
+```bash
+# Run a long-running command in background
+execute_shell "npm run build" --is-background true
+
+# Check background task output
+bash_output <task_id>
+
+# List all background tasks
+list_background_tasks
+
+# Terminate a background task
+kill_bash <task_id>
+```
+
+### Automatic Background Mode
+
+Commands that exceed the timeout limit (default 120s, max 600s) are automatically converted to background execution, returning a task ID for monitoring.
 
 ## 🧠 Memory Management
 
@@ -657,17 +787,38 @@ TAVILY_API_KEY="your-tavily-api-key"
 
 ### MCP Configuration
 
-Create a `.nano.yaml` configuration file for Model Context Protocol settings:
+Model Context Protocol (MCP) enables nano-agent to connect to external servers for extended capabilities.
+
+#### Supported Transport Types
+
+- **`stdio`**: Standard input/output process communication (default for local servers)
+- **`streamable`**: HTTP with Server-Sent Events for remote servers
+- **`inmemory`**: In-memory transport for testing
+
+**Note**: Legacy transport types (`http`, `sse`, `websocket`) are no longer supported. Use `streamable` for HTTP-based servers.
+
+#### Quick Start
 
 ```bash
-# Copy example configuration
-cp .nano.yaml.example .nano.yaml
+# Interactive configuration wizard
+nano mcp wizard
 
-# Or use the interactive configuration
-nano mcp config
+# Add a server non-interactively
+nano mcp add filesystem npx -y @modelcontextprotocol/server-filesystem /tmp
+
+# Add a remote HTTP server
+nano mcp add myserver --transport streamable https://api.example.com/mcp
+
+# List configured servers
+nano mcp list
+
+# Test server connection
+nano mcp test filesystem
 ```
 
-Example MCP configuration:
+#### Configuration File
+
+Create or edit `~/.nano/config.yaml`:
 
 ```yaml
 enable_mcp: true
@@ -677,11 +828,55 @@ mcp:
   timeout: 30s
   max_retries: 3
   servers:
+    # Local stdio server
     - name: "filesystem"
       description: "File system operations"
       transport: "stdio"
       command: ["npx", "@modelcontextprotocol/server-filesystem", "./workspace"]
       enabled: true
+
+    # Remote HTTP server with OAuth
+    - name: "api-server"
+      description: "Remote API server"
+      transport: "streamable"
+      url: "https://api.example.com/mcp"
+      enabled: true
+      oauth:
+        authorization_url: "https://auth.example.com/oauth/authorize"
+        token_url: "https://auth.example.com/oauth/token"
+        client_id: "your-client-id"
+        scopes: "read write"
+```
+
+#### OAuth 2.0 Authentication
+
+For servers requiring OAuth authentication:
+
+```bash
+# Authorize with OAuth (opens browser)
+nano mcp auth api-server
+
+# View stored tokens
+nano mcp auth --list
+
+# Revoke a token
+nano mcp auth api-server --revoke
+```
+
+Tokens are automatically injected into requests and refreshed when needed. See [docs/MCP_OAUTH.md](docs/MCP_OAUTH.md) for detailed OAuth configuration.
+
+#### Migration from Legacy Transports
+
+If you have servers configured with `transport: http`, `transport: sse`, or `transport: websocket`, update them to use `transport: streamable`:
+
+```yaml
+# Before (not supported)
+transport: http
+url: https://api.example.com/mcp
+
+# After (correct)
+transport: streamable
+url: https://api.example.com/mcp
 ```
 
 ### Configuration Management

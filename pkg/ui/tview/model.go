@@ -318,6 +318,8 @@ type Model struct {
 	// Agent integration
 	inputHandler  func(string)
 	cancelHandler func() bool
+	// newSessionHandler is invoked when the user requests a new session via Ctrl+R.
+	newSessionHandler func()
 
 	// Event channel
 	eventChan chan func()
@@ -773,6 +775,14 @@ func (m *Model) setupKeyBindings() {
 			return nil
 		}
 
+		// Ctrl+R: start a new session (clear context)
+		if event.Key() == tcell.KeyCtrlR {
+			if m.newSessionHandler != nil {
+				m.newSessionHandler()
+			}
+			return nil
+		}
+
 		// T/t: toggle the latest thinking block (expand/collapse reasoning)
 		if event.Key() == tcell.KeyRune && (event.Rune() == 't' || event.Rune() == 'T') {
 			m.toggleLatestThinking()
@@ -823,6 +833,11 @@ func (m *Model) SetInputHandler(handler func(string)) {
 // SetCancelHandler sets the handler invoked when user presses Ctrl+Z to cancel.
 func (m *Model) SetCancelHandler(handler func() bool) {
 	m.cancelHandler = handler
+}
+
+// SetNewSessionHandler sets the handler invoked when user presses Ctrl+R to start a new session.
+func (m *Model) SetNewSessionHandler(handler func()) {
+	m.newSessionHandler = handler
 }
 
 // ShowConfirmation displays a confirmation UI with tool information and options.
@@ -1854,6 +1869,9 @@ func (m *Model) updateChatView() {
 
 func (m *Model) updateStatusBar() {
 	var status strings.Builder
+	// Keyboard shortcuts hint
+	fmt.Fprintf(&status, "%sCtrl+R 新会话 | Ctrl+P 命令 | Ctrl+Z 取消 | Tab 切换 | q 退出%s | ",
+		m.styles.GetColorTag("muted"), m.styles.GetResetTag())
 	// Current view (omit default "chat")
 	if m.activeView != "" && m.activeView != "chat" {
 		fmt.Fprintf(&status, "%s%s%s | ", m.styles.GetColorTag("primary"), m.activeView, m.styles.GetResetTag())
@@ -1867,7 +1885,8 @@ func (m *Model) updateStatusBar() {
 
 func (m *Model) updateStatusBarDirect() {
 	if m.stateManager != nil {
-		m.setStatusBarText(m.stateManager.FormatStatusText())
+		hint := m.styles.GetColorTag("muted") + "Ctrl+R 新会话 | Ctrl+P 命令 | Ctrl+Z 取消 | Tab 切换 | q 退出" + m.styles.GetResetTag()
+		m.setStatusBarText(hint + " | " + m.stateManager.FormatStatusText())
 	}
 }
 

@@ -360,15 +360,34 @@ func (trs *ToolRecoveryStrategy) categorizeError(err error) ErrorCategory {
 		return categorizeToolResultFailureCode(trfe.Code)
 	}
 	msg := strings.ToLower(err.Error())
+
+	// Check for non-retryable errors first
+	nonRetryablePatterns := []string{
+		"invalid argument", "invalid parameter",
+		"not found", "permission denied",
+		"unsupported", "validation failed",
+		"invalid input", "bad request",
+		"unauthorized", "forbidden",
+		"not implemented", "method not allowed",
+	}
+	for _, pattern := range nonRetryablePatterns {
+		if strings.Contains(msg, pattern) {
+			return ErrorCategoryUnrecoverable
+		}
+	}
+
+	// Then check for recoverable errors
 	for _, recoverable := range trs.recoverableErrors {
 		if strings.Contains(msg, recoverable) {
 			return ErrorCategoryRecoverable
 		}
 	}
+
 	// Heuristic categorization: retryable for rate limits/timeouts
 	if strings.Contains(msg, "timeout") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "temporar") {
 		return ErrorCategoryRetryable
 	}
+
 	return ErrorCategoryUnrecoverable
 }
 

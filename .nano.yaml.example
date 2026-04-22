@@ -48,14 +48,33 @@ memory:
 # Safety Settings
 confirm_destructive: false
 
+# Turn Execution Control
+turn:
+  max_duration: 30m  # Maximum duration for a single turn (default: 30m)
 
 
-# Sub-agents Configuration
-# Define specialized sub-agents
+
+# Sub-agents Configuration (Expert System)
+# Define specialized sub-agents that can be invoked with @agent-name syntax
+#
+# IMPORTANT: Expert Trigger Syntax
+#   - Use @kebab-case-name to invoke an expert (e.g., "@coder help me debug")
+#   - Names are automatically converted to kebab-case (coder -> coder, myAgent -> my-agent)
+#   - LLM cannot directly call experts; only users can trigger them with @ syntax
+#
+# Built-in Experts (always available):
+#   @investigator - Read-only codebase exploration and analysis
+#   @help         - Answers questions about nano-agent CLI from documentation
+#   @generalist   - General-purpose agent with full tool access
+#
+# Custom experts can be defined in:
+#   - Project:  .nano/agents/*.md (highest priority)
+#   - User:     ~/.config/nano/agents/*.md
+#
 # Usage examples:
 #   - "@coder help me debug this function"
-#   - "使用[writer]来帮助我写文档"
-#   - "Please help me with:analyst for data analysis"
+#   - "@investigator find all error handling code"
+#   - "@help how do I configure MCP servers?"
 sub_agents:
   - agent_name: "coder"
     system_prompt: "You are a senior software engineer and programming expert, proficient in multiple programming languages and development frameworks. You excel at code design, architecture planning, debugging, and performance optimization. You can write high-quality, maintainable code following best practices and design patterns. You are familiar with modern development tools, version control, test-driven development, and continuous integration."
@@ -172,6 +191,17 @@ daemon:
   api_key: ""  # Optional API key for daemon authentication
   tls_cert_file: ""
   tls_key_file: ""
+  # Policy for handling ActionConfirm decisions when no approval handler is present
+  # Options: "allow" (auto-approve), "block" (reject), "allowlist" (check allowlisted_tools)
+  # Default: "allow" for backward compatibility
+  confirm_policy: "allow"
+  # List of tools to auto-approve when confirm_policy is "allowlist"
+  allowlisted_tools: []
+  # Examples:
+  # allowlisted_tools:
+  #   - "read_file"
+  #   - "list_directory"
+  #   - "web_search"
 
 # Watcher Configuration
 # Event-driven monitoring rules that poll external sources at regular intervals

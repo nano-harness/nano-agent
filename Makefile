@@ -1,7 +1,16 @@
 # Makefile for nano
 # A lightweight AI-powered code generation and modification agent
 
-.PHONY: build clean test lint fmt install help dev run deps check release docker tui-test
+.PHONY: build clean test lint fmt install help dev run deps check release docker tui-test \
+        test-coverage test-coverage-html test-race benchmark \
+        e2e e2e-daemon e2e-client e2e-tui e2e-binary e2e-expert e2e-coverage \
+        lint-check fmt-check vet check-all \
+        deps-update deps-check \
+        install-local uninstall \
+        docker-build docker-run \
+        clean-deps tools watch dev-setup quick-test gen info version \
+        config-example config-check \
+        run-debug run-tui run-daemon
 .DEFAULT_GOAL := run
 
 # ==================== Variables ====================
@@ -57,27 +66,51 @@ run-daemon: dev ## Build and run in daemon mode
 
 # ==================== Testing ====================
 
-test: ## Run all tests
-	@echo "Running tests..."
-	@go test -v ./...
+test: ## Run unit tests (excludes e2e tests)
+	@echo "Running unit tests..."
+	@go test -v $(shell go list ./... | grep -v /e2e)
 
-test-coverage: ## Run tests with coverage report
-	@echo "Running tests with coverage..."
-	@go test -v -cover ./...
+test-coverage: ## Run unit tests with coverage report
+	@echo "Running unit tests with coverage..."
+	@go test -v -cover $(shell go list ./... | grep -v /e2e)
 
-test-coverage-html: ## Run tests with HTML coverage report
+test-coverage-html: ## Run unit tests with HTML coverage report
 	@echo "Generating HTML coverage report..."
-	@go test -coverprofile=coverage.out ./...
+	@go test -coverprofile=coverage.out $(shell go list ./... | grep -v /e2e)
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated: coverage.html"
 
-test-race: ## Run tests with race condition detection
-	@echo "Running tests with race detection..."
-	@go test -v -race ./...
+test-race: ## Run unit tests with race condition detection
+	@echo "Running unit tests with race detection..."
+	@go test -v -race $(shell go list ./... | grep -v /e2e)
 
 benchmark: ## Run benchmarks
 	@echo "Running benchmarks..."
 	@go test -bench=. -benchmem ./...
+
+# ==================== E2E Testing ====================
+
+e2e: ## Run all end-to-end integration tests
+	@echo "Running e2e tests..."
+	@go test -v -tags=e2e -timeout 10m ./e2e/...
+
+e2e-daemon: ## Run only daemon e2e tests
+	@go test -v -tags=e2e -timeout 5m -run "TestDaemon" ./e2e/...
+
+e2e-client: ## Run only client e2e tests
+	@go test -v -tags=e2e -timeout 5m -run "TestClient" ./e2e/...
+
+e2e-tui: ## Run only TUI e2e tests
+	@go test -v -tags=e2e -timeout 5m -run "TestBubbleTea" ./e2e/...
+
+e2e-binary: ## Run only binary mode e2e tests
+	@go test -v -tags=e2e -timeout 5m -run "TestBinaryMode" ./e2e/...
+
+e2e-expert: ## Run only sub-agent / expert e2e tests
+	@go test -v -tags=e2e -timeout 10m -run "TestExpert|TestForkBatch|TestParallel|TestTrigger|TestExecution|TestLoading" ./e2e/...
+
+e2e-coverage: ## Run e2e tests with coverage
+	@go test -v -tags=e2e -timeout 10m -coverprofile=e2e-coverage.out -coverpkg=./pkg/... ./e2e/...
 
 # ==================== Code Quality ====================
 
@@ -117,7 +150,9 @@ vet: ## Run go vet
 	@echo "Running go vet..."
 	@go vet ./...
 
-check: fmt-check vet lint test ## Run all checks (format, vet, lint, test)
+check: fmt-check vet lint test ## Run all checks (format, vet, lint, unit tests)
+
+check-all: check e2e ## Run all checks including e2e tests
 
 # ==================== Dependencies ====================
 

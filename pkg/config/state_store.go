@@ -20,21 +20,8 @@ type PersistentState struct {
 	// Scheduled tasks (TUI + Daemon shared)
 	ScheduledTasks []PersistedTask `json:"scheduled_tasks,omitempty"`
 
-	// Watcher rules created at runtime (via manage_watcher tool or /watcher command).
-	WatcherRules []PersistedWatchRule `json:"watcher_rules,omitempty"`
-
 	// Last known MCP server health status
 	MCPServerStatus map[string]string `json:"mcp_server_status,omitempty"`
-
-	// Tool calls awaiting user approval at last process termination.
-	PendingApprovals []PendingApproval `json:"pending_approvals,omitempty"`
-}
-
-// PendingApproval records a tool call that was awaiting user approval when the
-// process last terminated.
-type PendingApproval struct {
-	CallID   string `json:"call_id"`
-	ToolName string `json:"tool_name"`
 }
 type PersistedTask struct {
 	ID        string `json:"id"`
@@ -43,23 +30,6 @@ type PersistedTask struct {
 	Source    string `json:"source"`     // "tui", "daemon", "conversation"
 	CreatedAt string `json:"created_at"` // RFC3339
 	MaxRuns   int    `json:"max_runs,omitempty"`
-}
-
-// PersistedWatchRule holds a watcher rule created at runtime (via tool call or
-// slash command) that must survive process restarts.
-type PersistedWatchRule struct {
-	ID           string `json:"id"`
-	Source       string `json:"source"`
-	Event        string `json:"event"`
-	Filter       string `json:"filter,omitempty"`
-	Command      string `json:"command"`
-	Interval     string `json:"interval,omitempty"` // duration string
-	Timeout      string `json:"timeout,omitempty"`  // duration string
-	ShellCommand string `json:"shell_command,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	// LastPoll is the RFC3339 timestamp of the last successful poll, used to
-	// prevent re-triggering events after a restart.
-	LastPoll string `json:"last_poll,omitempty"`
 }
 
 // StateStore manages persistent runtime state separate from configuration.
@@ -259,121 +229,6 @@ func (s *StateStore) IsDirty() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.dirty
-}
-
-// SetPendingApproval records that a tool call is awaiting user approval.
-func (s *StateStore) SetPendingApproval(callID, toolName string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, pa := range s.state.PendingApprovals {
-		if pa.CallID == callID {
-			return // already recorded
-		}
-	}
-	s.state.PendingApprovals = append(s.state.PendingApprovals, PendingApproval{CallID: callID, ToolName: toolName})
-	s.dirty = true
-}
-
-// GetPendingApprovals returns a copy of the pending approval list.
-func (s *StateStore) GetPendingApprovals() []PendingApproval {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.state.PendingApprovals) == 0 {
-		return nil
-	}
-	out := make([]PendingApproval, len(s.state.PendingApprovals))
-	copy(out, s.state.PendingApprovals)
-	return out
-}
-
-// ClearPendingApproval removes a specific pending approval by call ID.
-func (s *StateStore) ClearPendingApproval(callID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	originalLen := len(s.state.PendingApprovals)
-	filtered := s.state.PendingApprovals[:0]
-	for _, pa := range s.state.PendingApprovals {
-		if pa.CallID != callID {
-			filtered = append(filtered, pa)
-		}
-	}
-	if len(filtered) == originalLen {
-		return
-	}
-	s.state.PendingApprovals = filtered
-	s.dirty = true
-}
-
-// ClearAllPendingApprovals removes all pending approvals (called on startup to
-// discard stale entries from the previous run).
-func (s *StateStore) ClearAllPendingApprovals() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.state.PendingApprovals) == 0 {
-		return
-	}
-	s.state.PendingApprovals = nil
-	s.dirty = true
-}
-
-// AddWatcherRule appends or updates a watcher rule in the persisted list.
-// If a rule with the same ID already exists it is replaced in-place.
-func (s *StateStore) AddWatcherRule(rule PersistedWatchRule) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if rule.CreatedAt == "" {
-		rule.CreatedAt = time.Now().UTC().Format(time.RFC3339)
-	}
-	for i, r := range s.state.WatcherRules {
-		if r.ID == rule.ID {
-			s.state.WatcherRules[i] = rule
-			s.dirty = true
-			return
-		}
-	}
-	s.state.WatcherRules = append(s.state.WatcherRules, rule)
-	s.dirty = true
-}
-
-// UpdateWatcherRuleCheckpoint persists the last-poll timestamp for the given
-// rule ID so that events are not re-triggered after a restart.
-func (s *StateStore) UpdateWatcherRuleCheckpoint(id string, lastPoll time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ts := lastPoll.UTC().Format(time.RFC3339)
-	for i, r := range s.state.WatcherRules {
-		if r.ID == id {
-			s.state.WatcherRules[i].LastPoll = ts
-			s.dirty = true
-			return
-		}
-	}
-}
-
-// RemoveWatcherRule removes a watcher rule by ID.
-func (s *StateStore) RemoveWatcherRule(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rules := s.state.WatcherRules[:0]
-	for _, r := range s.state.WatcherRules {
-		if r.ID != id {
-			rules = append(rules, r)
-		}
-	}
-	s.state.WatcherRules = rules
-	s.dirty = true
-}
-
-// GetWatcherRules returns a copy of the persisted watcher rule list.
-func (s *StateStore) GetWatcherRules() []PersistedWatchRule {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.state.WatcherRules) == 0 {
-		return nil
-	}
-	out := make([]PersistedWatchRule, len(s.state.WatcherRules))
-	copy(out, s.state.WatcherRules)
-	return out
 }
 
 // copyFile copies src to dst with restricted permissions (0600), overwriting dst if it exists.

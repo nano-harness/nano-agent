@@ -15,9 +15,10 @@ func TestNewRegistry_BuiltinCommands(t *testing.T) {
 
 	// Verify all expected built-in commands are present (including full opsx set).
 	wantNames := []string{
-		"yolo", "permission", "permissions", "allow", "disallow",
+		"yolo", "permission", "permissions", "allow", "disallow", "think", "clear",
 		"skill:list", "skill:use", "skill:off", "skill:info", "skill:install",
-		"loop", "schedule",
+		"agents", "agents:list", "agents:show",
+		"routines list", "routines add", "routines remove", "routines status", "routines pause", "routines resume",
 		"opsx:propose", "opsx:explore", "opsx:new", "opsx:continue", "opsx:ff",
 		"opsx:apply", "opsx:verify", "opsx:sync", "opsx:status",
 		"opsx:archive", "opsx:bulk-archive",
@@ -41,9 +42,10 @@ func TestNewRegistry_CategoryOrder(t *testing.T) {
 	catOrder := map[slash.Category]int{
 		slash.CategoryPermission: 0,
 		slash.CategorySkill:      1,
-		slash.CategorySchedule:   2,
-		slash.CategoryOpenSpec:   3,
-		slash.CategoryCustom:     4,
+		slash.CategoryAgent:      2,
+		slash.CategoryRoutines:   3,
+		slash.CategoryOpenSpec:   4,
+		slash.CategoryCustom:     5,
 	}
 	for _, cmd := range all {
 		idx := catOrder[cmd.Category]
@@ -129,7 +131,8 @@ func TestNewBuiltinRegistry(t *testing.T) {
 	for _, want := range []slash.Category{
 		slash.CategoryPermission,
 		slash.CategorySkill,
-		slash.CategorySchedule,
+		slash.CategoryAgent,
+		slash.CategoryRoutines,
 		slash.CategoryOpenSpec,
 	} {
 		if !cats[want] {

@@ -974,7 +974,7 @@ func runMCPDiagnostics(cmd *cobra.Command, _ []string) {
 func convertMCPServers(servers []config.MCPServerConfig) []mcp.MCPServerConfig {
 	var result []mcp.MCPServerConfig
 	for _, server := range servers {
-		result = append(result, mcp.MCPServerConfig{
+		mcpServer := mcp.MCPServerConfig{
 			Name:        server.Name,
 			Description: server.Description,
 			Command:     server.Command,
@@ -983,7 +983,19 @@ func convertMCPServers(servers []config.MCPServerConfig) []mcp.MCPServerConfig {
 			Headers:     server.Headers,
 			Enabled:     server.Enabled,
 			Timeout:     server.Timeout,
-		})
+		}
+		// Convert OAuth config if present
+		if server.OAuth != nil {
+			mcpServer.OAuth = &mcp.OAuthConfig{
+				AuthorizationURL: server.OAuth.AuthorizationURL,
+				TokenURL:         server.OAuth.TokenURL,
+				ClientID:         server.OAuth.ClientID,
+				ClientSecret:     server.OAuth.ClientSecret,
+				Scopes:           server.OAuth.Scopes,
+				RedirectPort:     server.OAuth.RedirectPort,
+			}
+		}
+		result = append(result, mcpServer)
 	}
 	return result
 }
@@ -1006,8 +1018,8 @@ Examples:
   # stdio server
   nano mcp add filesystem npx -y @modelcontextprotocol/server-filesystem /tmp
 
-  # HTTP/SSE server
-  nano mcp add myserver --transport http https://example.com/mcp
+  # HTTP/Streamable server
+  nano mcp add myserver --transport streamable https://example.com/mcp
 
   # With custom headers
   nano mcp add secure-server --header "Authorization=Bearer TOKEN" https://api.example.com/mcp`,
@@ -1028,7 +1040,7 @@ Examples:
 			// Detect transport
 			if transport == "" {
 				if len(rest) == 1 && (strings.HasPrefix(rest[0], "http://") || strings.HasPrefix(rest[0], "https://")) {
-					transport = "http"
+					transport = "streamable"
 				} else {
 					transport = "stdio"
 				}
@@ -1073,7 +1085,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&transport, "transport", "", "Transport type: stdio, http, websocket (auto-detected if omitted)")
+	cmd.Flags().StringVar(&transport, "transport", "", "Transport type: stdio, streamable (auto-detected if omitted)")
 	cmd.Flags().StringVar(&description, "description", "", "Human-readable description")
 	cmd.Flags().StringArrayVar(&headerKV, "header", nil, "HTTP header in KEY=VALUE format (repeatable)")
 	cmd.Flags().BoolVar(&disabled, "disabled", false, "Register server but leave it disabled")
@@ -1148,8 +1160,35 @@ Examples:
 				return nil
 			}
 
+			// Try to load OAuth config from server settings if not provided via flags
+			configFile, _ := cmd.Root().PersistentFlags().GetString("config")
+			cfg, err := config.LoadConfig(configFile)
+			if err == nil && cfg.MCP != nil {
+				for _, server := range cfg.MCP.Servers {
+					if server.Name == serverName && server.OAuth != nil {
+						// Use config values as defaults, but allow flags to override
+						if authURL == "" {
+							authURL = server.OAuth.AuthorizationURL
+						}
+						if tokenURL == "" {
+							tokenURL = server.OAuth.TokenURL
+						}
+						if clientID == "" {
+							clientID = server.OAuth.ClientID
+						}
+						if clientSecret == "" {
+							clientSecret = server.OAuth.ClientSecret
+						}
+						if scopes == "" {
+							scopes = server.OAuth.Scopes
+						}
+						break
+					}
+				}
+			}
+
 			if authURL == "" || tokenURL == "" || clientID == "" {
-				return fmt.Errorf("--auth-url, --token-url, and --client-id are required")
+				return fmt.Errorf("--auth-url, --token-url, and --client-id are required (or configure OAuth in server settings)")
 			}
 
 			oauthCfg := &mcp.OAuthConfig{
@@ -1176,6 +1215,32 @@ Examples:
 				exp = entry.ExpiresAt.Format("2006-01-02 15:04:05")
 			}
 			fmt.Printf("Authorization successful! Token stored (expires: %s)\n", exp)
+
+			// Persist OAuth config back to server settings if it wasn't already there
+			if cfg != nil && cfg.MCP != nil {
+				updated := false
+				for i := range cfg.MCP.Servers {
+					if cfg.MCP.Servers[i].Name == serverName && cfg.MCP.Servers[i].OAuth == nil {
+						cfg.MCP.Servers[i].OAuth = &config.MCPOAuthConfig{
+							AuthorizationURL: authURL,
+							TokenURL:         tokenURL,
+							ClientID:         clientID,
+							ClientSecret:     clientSecret,
+							Scopes:           scopes,
+						}
+						updated = true
+						break
+					}
+				}
+				if updated {
+					if err := persistConfig(cfg, configFile); err != nil {
+						fmt.Printf("Warning: failed to save OAuth config to server settings: %v\n", err)
+					} else {
+						fmt.Printf("OAuth configuration saved to server %q settings.\n", serverName)
+					}
+				}
+			}
+
 			return nil
 		},
 	}

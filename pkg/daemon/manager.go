@@ -14,6 +14,7 @@ import (
 
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	pkgruntime "github.com/nano-harness/nano-agent/pkg/runtime"
 )
 
 // Manager handles daemon process management
@@ -117,6 +118,17 @@ func (m *Manager) SaveConfig() error {
 
 // Start starts the daemon process
 func (m *Manager) Start(background bool) error {
+	// Check if TUI mode is running
+	lock, err := pkgruntime.NewLockFile(pkgruntime.ModeDaemon)
+	if err != nil {
+		return fmt.Errorf("failed to create daemon lock: %w", err)
+	}
+	if err := lock.Acquire(); err != nil {
+		return fmt.Errorf("cannot start daemon: %w", err)
+	}
+	// Note: Lock is NOT released here because daemon continues running as background process.
+	// The lock will be released when daemon stops via the Stop() method or process termination.
+
 	// Check if already running
 	if m.IsRunning() {
 		return fmt.Errorf("daemon is already running")
@@ -228,6 +240,11 @@ func (m *Manager) Stop() error {
 	for time.Now().Before(waitDeadline) {
 		if !m.IsRunning() {
 			logger.Info("Daemon stopped gracefully")
+			// Release daemon lock
+			lock, err := pkgruntime.NewLockFile(pkgruntime.ModeDaemon)
+			if err == nil {
+				_ = lock.Release()
+			}
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -237,6 +254,12 @@ func (m *Manager) Stop() error {
 	logger.Warn("Daemon did not stop gracefully, sending SIGKILL")
 	if err := process.Signal(syscall.SIGKILL); err != nil {
 		return fmt.Errorf("failed to send SIGKILL to process %d: %w", pid, err)
+	}
+
+	// Release daemon lock even if force killed
+	lock, err := pkgruntime.NewLockFile(pkgruntime.ModeDaemon)
+	if err == nil {
+		_ = lock.Release()
 	}
 
 	// Wait briefly after SIGKILL

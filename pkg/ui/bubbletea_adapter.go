@@ -158,3 +158,11 @@ func (a *BubbleTeaAdapter) SetAllowlistHandler(h func(toolName string, params ma
 		a.model.SetAllowlistHandler(h)
 	}
 }
+
+// SetNewSessionHandler wires the callback used by Ctrl+R / /clear to create
+// a new agent session.
+func (a *BubbleTeaAdapter) SetNewSessionHandler(h func() string) {
+	if a.model != nil {
+		a.model.SetNewSessionHandler(h)
+	}
+}

@@ -50,17 +50,16 @@ func TestToolboxIntegration(t *testing.T) {
 		"search_file_content",
 		"glob",
 		"run_shell_command",
-		"todo_write", // Added new todo write tool
+		"todo_write",            // Added new todo write tool
 		"web_fetch",
 		"web_search",
-		"image_generate", // New image generation tool
-		"code_skeleton",  // Added new code skeleton tool
+		"image_generate",        // New image generation tool
+		"code_skeleton",         // Added new code skeleton tool
+		"bash_output",           // Added background task management tool
+		"kill_bash",             // Added background task management tool
+		"list_background_tasks", // Added background task management tool
 		// workspace tools
-		"workspace_manager",
-		"git_manager",
 		"oss_manager",
-		"engineering_tools",
-		"schedule_task",
 	}
 
 	if len(tools) != len(expectedTools) {

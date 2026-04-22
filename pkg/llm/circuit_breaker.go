@@ -143,7 +143,7 @@ func (cb *CircuitBreaker) AllowRequest() error {
 		if time.Since(cb.lastFailureTime) >= cb.config.OpenTimeout {
 			cb.setState(CircuitHalfOpen)
 			cb.halfOpenProbeUsed = true // this request is the first probe
-			cb.halfOpenFails = 0       // reset half-open failure counter for fresh probing
+			cb.halfOpenFails = 0        // reset half-open failure counter for fresh probing
 			logger.Infof("Circuit breaker transitioning to half-open state after %v cooldown", cb.config.OpenTimeout)
 			return nil
 		}

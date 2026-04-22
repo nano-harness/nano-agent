@@ -51,6 +51,11 @@ const (
 	// (repeated identical tool calls or highly-similar LLM output) and decides to
 	// terminate early. Metadata fields: "reason", "loop_type", "iteration".
 	EventTypeLoopDetected EventType = "loop_detected"
+
+	// Expert system events
+	EventTypeExpertStarted  EventType = "expert_started"  // Expert execution started
+	EventTypeExpertProgress EventType = "expert_progress" // Expert execution progress
+	EventTypeExpertFinished EventType = "expert_finished" // Expert execution finished
 )
 
 // ToolUse represents the usage of a tool
@@ -69,11 +74,11 @@ type StreamEvent struct {
 	Reasoning      string            `json:"reasoning,omitempty"`
 	ReasoningDelta string            `json:"reasoning_delta,omitempty"` // Incremental reasoning content fragment
 	ToolCalls      []*tools.ToolCall `json:"tool_calls,omitempty"`
-	ToolResult *tools.ToolResult `json:"tool_result,omitempty"`
-	ToolUse    *ToolUse          `json:"tool_use,omitempty"`
-	Error      string            `json:"error,omitempty"`
-	Done       bool              `json:"done,omitempty"`
-	TokenStats *TokenStats       `json:"token_stats,omitempty"`
+	ToolResult     *tools.ToolResult `json:"tool_result,omitempty"`
+	ToolUse        *ToolUse          `json:"tool_use,omitempty"`
+	Error          string            `json:"error,omitempty"`
+	Done           bool              `json:"done,omitempty"`
+	TokenStats     *TokenStats       `json:"token_stats,omitempty"`
 
 	// Task management fields
 	TaskList interface{} `json:"task_list,omitempty"` // Will hold *agent.TaskList

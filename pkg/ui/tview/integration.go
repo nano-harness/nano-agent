@@ -51,9 +51,18 @@ type Integration struct {
 	// inspect and modify the permission mode and session allowlist.
 	permissionManager *permission.Manager
 
+	// persistentAllowlist is the persistent allowlist store for /disallow cleanup.
+	persistentAllowlist *permission.PersistentAllowlistStore
+	// workdir is the current working directory for persistent allowlist.
+	workdir string
+
 	// engine is set after engine creation so slash commands can control
 	// thinking mode and other engine-level settings.
 	engine *engine.Engine
+
+	// newSessionCallback is invoked when Ctrl+R / /clear is triggered.
+	// It is wired by the cli layer to call agent.StartNewSession().
+	newSessionCallback func() string
 }
 
 // NewIntegration creates a new TUI integration
@@ -80,6 +89,10 @@ func NewIntegration() *Integration {
 	integration.model.SetCancelHandler(func() bool {
 		integration.cancelCurrentTask()
 		return true
+	})
+
+	integration.model.SetNewSessionHandler(func() {
+		integration.StartNewSession()
 	})
 
 	return integration
@@ -330,10 +343,47 @@ func (i *Integration) SetPermissionManager(mgr *permission.Manager) {
 	i.permissionManager = mgr
 }
 
+// SetPersistentAllowlist wires the persistent allowlist store and workdir
+// so /disallow can remove rules from persistent storage.
+func (i *Integration) SetPersistentAllowlist(store *permission.PersistentAllowlistStore, workdir string) {
+	i.persistentAllowlist = store
+	i.workdir = workdir
+}
+
 // SetEngine wires an Engine so that slash commands (/think) can control
 // thinking mode and other engine-level settings at runtime.
 func (i *Integration) SetEngine(eng *engine.Engine) {
 	i.engine = eng
+}
+
+// SetNewSessionCallback wires the callback used by Ctrl+R / /clear to create
+// a new agent session.
+func (i *Integration) SetNewSessionCallback(cb func() string) {
+	i.newSessionCallback = cb
+}
+
+// StartNewSession creates a new session, clearing conversation history and UI state.
+func (i *Integration) StartNewSession() {
+	i.eventChan <- func() {
+		i.conversation = make([]*ConversationMessage, 0)
+		i.inputQueue = nil
+		if i.activeTask != nil {
+			i.activeTask.cancel()
+			i.activeTask = nil
+		}
+		// Clear messages in the model
+		i.model.messages = make([]MessageInterface, 0)
+		i.model.updateChatView()
+		newID := ""
+		if i.newSessionCallback != nil {
+			newID = i.newSessionCallback()
+		}
+		msg := "已开启新会话"
+		if newID != "" {
+			msg = fmt.Sprintf("已开启新会话 (id: %s)", newID)
+		}
+		i.model.AddMessage("system", msg)
+	}
 }
 
 // HandleResize handles terminal resize events
@@ -453,6 +503,12 @@ func (i *Integration) handleLocalSlashCommand(input string) bool {
 			return true
 		}
 		pm.GetSessionAllowlist().RemoveRule(raw)
+		// Also remove from persistent storage
+		if i.persistentAllowlist != nil && i.workdir != "" {
+			if _, err := i.persistentAllowlist.RemoveRuleForWorkdir(i.workdir, raw); err != nil {
+				logger.Warnf("Failed to remove persistent allowlist rule %q: %v", raw, err)
+			}
+		}
 		i.model.AddMessage("system", fmt.Sprintf("🗑️ 已移除白名单规则：%s", raw))
 		return true
 
@@ -466,6 +522,11 @@ func (i *Integration) handleLocalSlashCommand(input string) bool {
 		args := strings.TrimSpace(input[len("/think"):])
 		result := i.engine.HandleThinkCommand(args)
 		i.model.AddMessage("system", result)
+		return true
+
+	case lower == "/clear", lower == "/new":
+		// /clear or /new: Start a new session (clear context) - equivalent to Ctrl+R
+		i.StartNewSession()
 		return true
 	}
 

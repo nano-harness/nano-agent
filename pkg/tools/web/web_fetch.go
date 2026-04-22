@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -255,7 +256,10 @@ func (t *WebFetchTool) Execute(ctx context.Context, params map[string]interface{
 
 	// Format content for display
 	userContent := t.formatForUser(result, metadata)
-	llmContent := t.formatForLLM(result, metadata)
+	llmContentRaw := t.formatForLLM(result, metadata)
+
+	// Wrap LLM content with isolation tags to protect against prompt injection
+	llmContent := wrapWebContentForLLM(llmContentRaw, urlStr)
 
 	return &interfaces.ToolResult{
 		Success:     result.Success,
@@ -519,4 +523,11 @@ func (t *WebFetchTool) formatForLLM(result *WebFetchResult, metadata map[string]
 	}
 
 	return output.String()
+}
+
+// wrapWebContentForLLM wraps web content with isolation tags to protect against injection
+func wrapWebContentForLLM(content, urlStr string) string {
+	// Escape URL for safe XML attribute usage
+	escapedURL := html.EscapeString(urlStr)
+	return fmt.Sprintf("<external_data source=%q type=\"web\">\n%s\n</external_data>", escapedURL, content)
 }

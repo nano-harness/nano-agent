@@ -1,3 +1,5 @@
+//go:build e2e
+
 package e2e
 
 import (
@@ -12,6 +14,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/llm"
+	agentTools "github.com/nano-harness/nano-agent/pkg/tools/agent"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -91,6 +94,17 @@ func (s *AgentTestSuite) SetupTest() {
 		cfg.Skills.Enabled = false
 	}
 
+	// 注入短退避 CircuitBreaker 配置，避免测试被长重试拖死
+	if cfg.Advanced == nil {
+		cfg.Advanced = &config.AdvancedConfig{}
+	}
+	cfg.Advanced.CircuitBreaker = &config.CircuitBreakerAdvConfig{
+		MaxRetries:    2,
+		BaseDelayMs:   50,
+		MaxDelayMs:    200,
+		OpenTimeoutMs: 500,
+	}
+
 	// 更新全局配置，确保 llm/client 和其他组件使用一致的配置
 	config.SetGlobalConfig(cfg)
 
@@ -101,6 +115,9 @@ func (s *AgentTestSuite) SetupTest() {
 
 	agentInstance, err := agent.New(cfg, approvalHandler)
 	require.NoError(t, err, "failed to initialize agent")
+
+	// E2E 测试不走 Engine，必须手动注册 agent tools (task 等)
+	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg, agentInstance)
 
 	s.Agent = agentInstance
 	s.Config = cfg

@@ -781,4 +781,3 @@ func TestDecision_ConfidenceField(t *testing.T) {
 		t.Errorf("expected compound command confidence 0.5, got %f", decision.Confidence)
 	}
 }
-

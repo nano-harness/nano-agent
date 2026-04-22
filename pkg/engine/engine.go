@@ -1,62 +1,188 @@
 // Package engine provides a unified lifecycle manager for the agent, scheduler,
-// watcher, and state store. All execution modes (TUI, BubbleTea, Daemon) should
+// and state store. All execution modes (TUI, BubbleTea, Daemon) should
 // use Engine instead of wiring these components manually.
 package engine
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/cron"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/logger"
-	"github.com/nano-harness/nano-agent/pkg/tools/builtin"
-	"github.com/nano-harness/nano-agent/pkg/watcher"
+	agentTools "github.com/nano-harness/nano-agent/pkg/tools/agent"
 )
 
-// Engine encapsulates the lifecycle of an agent, its scheduler, optional
-// watcher, and the shared state store. Use New to construct a ready-to-run
-// Engine; call Start to activate the scheduler and watcher; call Shutdown to
-// gracefully stop everything.
+// Engine encapsulates the lifecycle of an agent, its scheduler, and the shared
+// state store. Use New to construct a ready-to-run Engine; call Start to
+// activate the scheduler; call Shutdown to gracefully stop everything.
 type Engine struct {
 	// Agent is the core AI agent instance.
 	Agent *agent.Agent
 	// Scheduler is the cron-based recurring task scheduler.
 	Scheduler *cron.Scheduler
-	// Watcher is the event-monitoring component (may be nil if not configured).
-	Watcher *watcher.Watcher
 	// StateStore is the shared persistent state store.
 	StateStore *config.StateStore
+}
 
-	manageWatcherTool *builtin.ManageWatcherTool
+// buildCronApprovalHandler creates an approval handler based on the cron permission policy.
+func buildCronApprovalHandler(policy string) func(*agent.ToolCallInfo) bool {
+	switch policy {
+	case "auto_approve":
+		return func(*agent.ToolCallInfo) bool {
+			return true // Auto-approve all tools
+		}
+	case "auto_reject":
+		return func(info *agent.ToolCallInfo) bool {
+			logger.Warnf("cron: auto-rejecting tool %s due to auto_reject policy", info.Name)
+			return false // Reject all tools requiring confirmation
+		}
+	case "inherit":
+		return nil // Use the global approval handler
+	default:
+		logger.Warnf("cron: unknown permission_policy %q, defaulting to auto_approve", policy)
+		return func(*agent.ToolCallInfo) bool {
+			return true
+		}
+	}
 }
 
 // New builds an Engine from the provided config and optional approval handler.
 // The approvalHandler may be nil (all tool calls are auto-approved).
 func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*Engine, error) {
-	if cfg == nil {
-		return nil, fmt.Errorf("engine: config is required")
-	}
-
 	agentInstance, err := agent.New(cfg, approvalHandler)
 	if err != nil {
 		return nil, fmt.Errorf("engine: create agent: %w", err)
 	}
+
+	// Register agent tools (task, etc.) - must be done at Engine level to avoid circular dependency
+	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg, agentInstance)
 
 	e := &Engine{
 		Agent:      agentInstance,
 		StateStore: agentInstance.GetStateStore(),
 	}
 
-	// Build the executor that the scheduler and watcher use to run commands.
+	// Determine cron configuration defaults
+	cronCfg := cfg.Cron
+	if cronCfg == nil {
+		cronCfg = &config.CronConfig{
+			PermissionPolicy:   "auto_approve",
+			TurnTimeout:        10 * time.Minute,
+			LogRetentionDays:   30,
+			LogCleanupInterval: 24 * time.Hour,
+		}
+	}
+
+	// Build the rich executor that the scheduler uses to run commands.
+	executeTaskWithMeta := func(command, taskID string) (cron.TaskExecutionMetadata, error) {
+		meta := cron.TaskExecutionMetadata{}
+
+		// Generate session ID
+		meta.SessionID = fmt.Sprintf("cron-%s-%d", taskID, time.Now().Unix())
+
+		// Create events directory if configured
+		eventsDir := cronCfg.EventsDir
+		if eventsDir == "" {
+			home, err := os.UserHomeDir()
+			if err == nil {
+				eventsDir = filepath.Join(home, ".nano", "cron-events")
+			}
+		}
+
+		var eventsFile *os.File
+		if eventsDir != "" {
+			taskEventsDir := filepath.Join(eventsDir, taskID)
+			if err := os.MkdirAll(taskEventsDir, 0o755); err == nil {
+				eventsPath := filepath.Join(taskEventsDir, fmt.Sprintf("%d.jsonl", time.Now().Unix()))
+				meta.EventsPath = eventsPath
+				eventsFile, _ = os.OpenFile(eventsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+				if eventsFile != nil {
+					defer func() { _ = eventsFile.Close() }()
+				}
+			}
+		}
+
+		// Track metrics from events
+		var toolCallCount int
+		var tokenUsage int64
+		var lastToolName string
+
+		callback := func(se event.StreamEvent) {
+			// Write event to audit file
+			if eventsFile != nil {
+				data, _ := json.Marshal(se)
+				_, _ = eventsFile.Write(append(data, '\n'))
+			}
+
+			// Track metrics
+			if se.Type == event.EventTypeToolCall {
+				toolCallCount++
+				if len(se.ToolCalls) > 0 && se.ToolCalls[0] != nil {
+					lastToolName = se.ToolCalls[0].Name
+				}
+			}
+			if se.Type == event.EventTypeTokenStats && se.TokenStats != nil {
+				tokenUsage += int64(se.TokenStats.TotalTokens)
+			}
+
+			// Log events
+			logger.Debugf("engine: cron task %s event [%s]: %s", taskID, se.Type, se.Content)
+		}
+
+		// Apply cron-specific approval handler
+		origHandler := agentInstance.GetToolScheduler().GetApprovalHandler()
+		cronHandler := buildCronApprovalHandler(cronCfg.PermissionPolicy)
+		if cronHandler != nil {
+			agentInstance.SetApprovalHandler(cronHandler)
+			defer agentInstance.SetApprovalHandler(origHandler)
+		}
+
+		// Apply turn timeout
+		timeout := cronCfg.TurnTimeout
+		if timeout == 0 {
+			timeout = 10 * time.Minute
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		// Execute the task
+		err := agentInstance.ProcessStream(ctx, command, callback)
+
+		meta.ToolCallCount = toolCallCount
+		meta.TokenUsage = tokenUsage
+
+		// Infer failure stage if there was an error
+		if err != nil {
+			meta.FailedTool = lastToolName
+			if errors.Is(err, context.DeadlineExceeded) {
+				meta.FailureStage = "timeout"
+			} else if strings.Contains(err.Error(), "tool execution failed") {
+				meta.FailureStage = "tool_exec"
+			} else if strings.Contains(err.Error(), "llm") || strings.Contains(err.Error(), "LLM") {
+				meta.FailureStage = "llm_call"
+			} else if errors.Is(err, context.Canceled) {
+				meta.FailureStage = "context_cancel"
+			} else {
+				meta.FailureStage = "unknown"
+			}
+		}
+
+		return meta, err
+	}
+
+	// Provide legacy wrapper for backward compatibility
 	executeTask := func(command string) error {
-		ctx := context.Background()
-		return agentInstance.ProcessStream(ctx, command, func(se event.StreamEvent) {
-			logger.Debugf("engine: task event [%s]: %s", se.Type, se.Content)
-		})
+		_, err := executeTaskWithMeta(command, "legacy")
+		return err
 	}
 
 	// Create scheduler and wire into the manage_schedule tool.
@@ -64,39 +190,31 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*E
 	if e.StateStore != nil {
 		e.Scheduler.SetStateStore(e.StateStore)
 	}
-	agentInstance.SetScheduler(e.Scheduler)
 
-	// Create watcher if enabled in config.
-	if cfg.Watcher != nil && cfg.Watcher.Enabled {
-		e.Watcher = watcher.New(executeTask, e.StateStore)
-
-		// Load static rules from config using the non-persisting path so that
-		// config-sourced rules do not accumulate in the state store on every restart.
-		for _, r := range cfg.Watcher.Rules {
-			e.Watcher.AddRuleNoStore(watcher.Rule{
-				ID:           r.ID,
-				Source:       r.Source,
-				Event:        r.Event,
-				Filter:       r.Filter,
-				Command:      r.Command,
-				Interval:     r.Interval,
-				Timeout:      r.Timeout,
-				ShellCommand: r.ShellCommand,
-			})
+	// Initialize TaskLog
+	logPath := cronCfg.LogPath
+	if logPath == "" {
+		var err error
+		logPath, err = cron.DefaultTaskLogPath()
+		if err != nil {
+			logger.Warnf("engine: could not determine default task log path: %v", err)
 		}
 	}
-
-	// Register manage_watcher tool and wire the live watcher into it.
-	mwt := builtin.NewManageWatcherTool(e.Watcher, agentInstance.GetApprovalConfirmFn())
-	e.manageWatcherTool = mwt
-	if err := agentInstance.RegisterTool(mwt); err != nil {
-		logger.Warnf("engine: failed to register manage_watcher tool: %v", err)
+	if logPath != "" {
+		taskLog := cron.NewTaskLog(logPath)
+		e.Scheduler.SetTaskLog(taskLog)
+		e.Scheduler.SetLogRetention(cronCfg.LogRetentionDays, cronCfg.LogCleanupInterval)
 	}
+
+	// Set the rich executor for cron tasks
+	e.Scheduler.SetExecuteTaskRich(executeTaskWithMeta)
+
+	agentInstance.SetScheduler(e.Scheduler)
 
 	return e, nil
 }
 
-// Start activates the scheduler (loading any persisted tasks) and the watcher.
+// Start activates the scheduler (loading any persisted tasks).
 // Call this after setting up any UI-specific event bridges.
 func (e *Engine) Start() error {
 	if e.Scheduler != nil {
@@ -106,19 +224,11 @@ func (e *Engine) Start() error {
 		}
 	}
 
-	if e.Watcher != nil {
-		e.Watcher.Start()
-	}
-
 	return nil
 }
 
-// Shutdown stops the watcher, scheduler, and agent gracefully.
+// Shutdown stops the scheduler and agent gracefully.
 func (e *Engine) Shutdown() error {
-	if e.Watcher != nil {
-		e.Watcher.Stop()
-	}
-
 	if e.Scheduler != nil {
 		e.Scheduler.Stop()
 	}
@@ -128,16 +238,6 @@ func (e *Engine) Shutdown() error {
 	}
 
 	return nil
-}
-
-// SetWatcher replaces the watcher used by the engine and updates the
-// manage_watcher tool reference. Useful when the watcher is created after
-// initial Engine construction (e.g. in tests).
-func (e *Engine) SetWatcher(w *watcher.Watcher) {
-	e.Watcher = w
-	if e.manageWatcherTool != nil {
-		e.manageWatcherTool.SetWatcher(w)
-	}
 }
 
 // ThinkingStatus represents the current thinking mode status

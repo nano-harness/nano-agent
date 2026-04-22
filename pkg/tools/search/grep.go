@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -246,7 +247,10 @@ func (t *GrepTool) Execute(ctx context.Context, params map[string]interface{}) (
 
 	// Format content for display
 	userContent := t.formatForUser(results, metadata)
-	llmContent := t.formatForLLM(results, metadata)
+	llmContentRaw := t.formatForLLM(results, metadata)
+
+	// Wrap LLM content with isolation tags for grep results
+	llmContent := wrapGrepContentForLLM(llmContentRaw, pattern)
 
 	return &interfaces.ToolResult{
 		Success:     true,
@@ -771,4 +775,11 @@ func (t *GrepTool) formatForLLM(results []SearchResult, metadata map[string]inte
 	}
 
 	return result.String()
+}
+
+// wrapGrepContentForLLM wraps grep search result content with isolation tags
+func wrapGrepContentForLLM(content, pattern string) string {
+	// Escape pattern for safe XML attribute usage
+	escapedPattern := html.EscapeString(pattern)
+	return fmt.Sprintf("<external_data source=\"grep_search:%s\" type=\"search\">\n%s\n</external_data>", escapedPattern, content)
 }

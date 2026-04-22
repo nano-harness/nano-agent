@@ -187,14 +187,33 @@ type MiddlewareConfig struct {
 	MaxRetries int `mapstructure:"max_retries" yaml:"max_retries"`
 }
 
+// CriticConfig configures the Critic security evaluator (Prompt Injection Protection Layer 3.5)
+type CriticConfig struct {
+	Enabled       bool     `mapstructure:"enabled" yaml:"enabled"`
+	Model         string   `mapstructure:"model" yaml:"model"`                     // Model for evaluation (can use cheaper model)
+	HighRiskTools []string `mapstructure:"high_risk_tools" yaml:"high_risk_tools"` // Tools requiring Critic evaluation
+	MaxLatencyMs  int      `mapstructure:"max_latency_ms" yaml:"max_latency_ms"`   // Timeout for evaluation
+	CacheEnabled  bool     `mapstructure:"cache_enabled" yaml:"cache_enabled"`     // Enable caching of evaluation results
+}
+
 // AdvancedConfig holds advanced configuration options.
 type AdvancedConfig struct {
-	Fork *ForkAdvConfig `yaml:"fork,omitempty"`
+	Fork           *ForkAdvConfig           `yaml:"fork,omitempty"`
+	CircuitBreaker *CircuitBreakerAdvConfig `yaml:"circuit_breaker,omitempty"`
 }
 
 // ForkAdvConfig holds fork-specific advanced configuration.
 type ForkAdvConfig struct {
-	MaxDepth int `yaml:"max_depth"`
+	MaxDepth      int `yaml:"max_depth"`
+	MaxConcurrent int `yaml:"max_concurrent"` // Maximum number of concurrent sub-agents (default: 5)
+}
+
+// CircuitBreakerAdvConfig holds circuit breaker configuration for LLM client retries.
+type CircuitBreakerAdvConfig struct {
+	MaxRetries    int   `yaml:"max_retries,omitempty"`
+	BaseDelayMs   int64 `yaml:"base_delay_ms,omitempty"`
+	MaxDelayMs    int64 `yaml:"max_delay_ms,omitempty"`
+	OpenTimeoutMs int64 `yaml:"open_timeout_ms,omitempty"`
 }
 
 // OSSConfig holds Alibaba Cloud OSS configuration
@@ -504,8 +523,8 @@ type Config struct {
 	// Scheduler configuration for TUI-mode recurring tasks.
 	Scheduler *SchedulerConfig `mapstructure:"scheduler" yaml:"scheduler"`
 
-	// Watcher configuration for event-driven monitoring rules.
-	Watcher *WatcherConfig `mapstructure:"watcher" yaml:"watcher"`
+	// Cron configuration for cron-specific behavior.
+	Cron *CronConfig `mapstructure:"cron" yaml:"cron"`
 
 	// PermissionMode controls how tool-execution confirmations are handled.
 	// Valid values: "default" (confirm all), "acceptEdits" (auto-approve file
@@ -526,6 +545,9 @@ type Config struct {
 	// Security configures the CommandGuard four-layer security system.
 	Security *SecurityConfig `mapstructure:"security" yaml:"security"`
 
+	// Critic configures the Critic security evaluator (Prompt Injection Protection Layer 3.5)
+	Critic *CriticConfig `mapstructure:"critic" yaml:"critic"`
+
 	// Middleware configures the tool execution middleware chain.
 	Middleware *MiddlewareConfig `mapstructure:"middleware" yaml:"middleware"`
 }
@@ -538,41 +560,32 @@ type SchedulerConfig struct {
 	StateFile string `mapstructure:"state_file" yaml:"state_file"`
 }
 
-// WatcherConfig configures the event-driven watcher that monitors external
-// sources (Aone, shell commands) and triggers agent tasks on matching events.
-type WatcherConfig struct {
-	// Enabled controls whether the watcher is active (default: false).
-	Enabled bool `mapstructure:"enabled" yaml:"enabled"`
-	// Rules is the list of static watcher rules loaded from config at startup.
-	// These rules are NOT persisted to the state store; they are re-applied
-	// from config on each startup.
-	Rules []WatchRule `mapstructure:"rules" yaml:"rules"`
-}
-
-// WatchRule describes a single event-monitoring rule.
-type WatchRule struct {
-	// ID is a unique identifier for the rule (auto-generated if empty).
-	ID string `mapstructure:"id" yaml:"id"`
-	// Source is the event source type: "aone" or "shell".
-	Source string `mapstructure:"source" yaml:"source"`
-	// Event is the event type to watch for, e.g. "new_mr", "ci_failure", "custom".
-	Event string `mapstructure:"event" yaml:"event"`
-	// Filter is an optional filter expression passed to the source.
-	Filter string `mapstructure:"filter" yaml:"filter"`
-	// Command is the agent command template executed on each matching event.
-	// Supports Go template syntax: {{.VAR}}.
-	Command string `mapstructure:"command" yaml:"command"`
-	// Interval is how often the source is polled (default: 5m).
-	Interval time.Duration `mapstructure:"interval" yaml:"interval"`
-	// Timeout is the maximum time allowed for each command execution (default: 30m).
-	Timeout time.Duration `mapstructure:"timeout" yaml:"timeout"`
-	// ShellCommand is the shell command used by the "shell" source type.
-	ShellCommand string `mapstructure:"shell_command" yaml:"shell_command"`
+// CronConfig configures cron-specific behavior for scheduled tasks.
+type CronConfig struct {
+	// PermissionPolicy controls how tool confirmation is handled in cron tasks.
+	// Valid values: "auto_approve" (default), "auto_reject", "inherit"
+	PermissionPolicy string `mapstructure:"permission_policy" yaml:"permission_policy"`
+	// TurnTimeout is the maximum duration for a single turn in cron task execution.
+	// Default: 10 minutes
+	TurnTimeout time.Duration `mapstructure:"turn_timeout" yaml:"turn_timeout"`
+	// LogPath is the path to the task execution log file.
+	// Default: ~/.nano/task_log.jsonl
+	LogPath string `mapstructure:"log_path" yaml:"log_path"`
+	// LogRetentionDays is how many days of task logs to retain.
+	// Default: 30
+	LogRetentionDays int `mapstructure:"log_retention_days" yaml:"log_retention_days"`
+	// LogCleanupInterval is how often to run log cleanup.
+	// Default: 24 hours
+	LogCleanupInterval time.Duration `mapstructure:"log_cleanup_interval" yaml:"log_cleanup_interval"`
+	// EventsDir is the directory for storing detailed event audit files.
+	// Default: ~/.nano/cron-events
+	EventsDir string `mapstructure:"events_dir" yaml:"events_dir"`
 }
 
 type TurnExecutionConfig struct { //nolint:revive
 	// Removed: StrictTaskDone and AutoCompleteOnNoTaskDone
 	// Task completion is now implicit based on OpenAI SDK finish_reason
+	MaxDuration time.Duration `mapstructure:"max_duration" yaml:"max_duration"` // Maximum duration for a single turn (default: 30m)
 }
 
 // ContextConfig configures conversation context management
@@ -646,6 +659,17 @@ type MCPServerConfig struct {
 	Headers     map[string]string `mapstructure:"headers" yaml:"headers"`
 	Enabled     bool              `mapstructure:"enabled" yaml:"enabled"`
 	Timeout     time.Duration     `mapstructure:"timeout" yaml:"timeout"`
+	OAuth       *MCPOAuthConfig   `mapstructure:"oauth" yaml:"oauth,omitempty"`
+}
+
+// MCPOAuthConfig holds OAuth 2.0 configuration for an MCP server
+type MCPOAuthConfig struct {
+	AuthorizationURL string `mapstructure:"authorization_url" yaml:"authorization_url"`
+	TokenURL         string `mapstructure:"token_url" yaml:"token_url"`
+	ClientID         string `mapstructure:"client_id" yaml:"client_id"`
+	ClientSecret     string `mapstructure:"client_secret" yaml:"client_secret,omitempty"`
+	Scopes           string `mapstructure:"scopes" yaml:"scopes,omitempty"`
+	RedirectPort     int    `mapstructure:"redirect_port" yaml:"redirect_port,omitempty"`
 }
 
 // MCPTLSConfig holds MCP TLS configuration
@@ -670,6 +694,18 @@ type UserInfoConfig struct {
 }
 
 // DaemonConfig holds consolidated daemon configuration
+// ConfirmPolicy defines how ActionConfirm decisions are handled in daemon mode
+type ConfirmPolicy string
+
+const (
+	// ConfirmPolicyAllow treats ActionConfirm as ActionAllow (auto-approve)
+	ConfirmPolicyAllow ConfirmPolicy = "allow"
+	// ConfirmPolicyBlock treats ActionConfirm as ActionBlock (reject)
+	ConfirmPolicyBlock ConfirmPolicy = "block"
+	// ConfirmPolicyAllowlist auto-approves only tools in the allow list, rejects others
+	ConfirmPolicyAllowlist ConfirmPolicy = "allowlist"
+)
+
 type DaemonConfig struct {
 	Port        int    `mapstructure:"port" yaml:"port"`
 	Host        string `mapstructure:"host" yaml:"host"`
@@ -682,6 +718,13 @@ type DaemonConfig struct {
 
 	// Optional daemon-level override for secret redaction
 	SecretRedaction *SecretRedactionConfig `mapstructure:"secret_redaction" yaml:"secret_redaction"`
+
+	// Policy for handling ActionConfirm decisions when no approval handler is present
+	// Default is "allow" for backward compatibility
+	ConfirmPolicy ConfirmPolicy `mapstructure:"confirm_policy" yaml:"confirm_policy"`
+
+	// List of tool names to auto-approve when ConfirmPolicy is "allowlist"
+	AllowlistedTools []string `mapstructure:"allowlisted_tools" yaml:"allowlisted_tools"`
 }
 
 // SecretRedactionConfig controls sensitive data masking
@@ -763,7 +806,7 @@ func DefaultConfig() *Config {
 			// Web tools
 			"web_search", "web_fetch", "image_generate",
 			// Workspace management tools
-			"workspace_manager", "git_manager", "oss_manager", "engineering_tools",
+			"oss_manager",
 			// OpenSpec tools
 			"opsx_status", "opsx_read_artifact", "opsx_write_artifact", "opsx_update_task", "opsx_list_changes",
 		},
@@ -772,7 +815,7 @@ func DefaultConfig() *Config {
 		EnableMCP: false,
 		MCP: &MCPConfig{
 			EnableClient:     true,
-			DefaultTransport: "http",
+			DefaultTransport: "stdio",
 			Timeout:          30 * time.Second,
 			MaxRetries:       3,
 			EnableAuth:       false,
@@ -794,7 +837,9 @@ func DefaultConfig() *Config {
 		},
 
 		// Turn execution defaults (empty - using implicit completion)
-		Turn: &TurnExecutionConfig{},
+		Turn: &TurnExecutionConfig{
+			MaxDuration: 30 * time.Minute, // Default 30 minutes
+		},
 
 		ToolRecovery: &ToolRecoveryConfig{
 			Default: ToolRetryPolicy{
@@ -872,6 +917,16 @@ func DefaultConfig() *Config {
 			MaxActiveSkills: 5,
 		},
 
+		// Cron defaults
+		Cron: &CronConfig{
+			PermissionPolicy:   "auto_approve",
+			TurnTimeout:        10 * time.Minute,
+			LogPath:            "", // Will be set to ~/.nano/task_log.jsonl if empty
+			LogRetentionDays:   30,
+			LogCleanupInterval: 24 * time.Hour,
+			EventsDir:          "", // Will be set to ~/.nano/cron-events if empty
+		},
+
 		// Top-level pprof defaults: disabled unless configured
 		// Use port 0 as sentinel to indicate "unspecified"
 		EnablePprof: false,
@@ -886,6 +941,15 @@ func DefaultConfig() *Config {
 			ReadOnlyPaths:      []string{},
 			ExtraReadOnlyPaths: []string{},
 			ExtraWritablePaths: []string{},
+		},
+
+		// Default Critic configuration (prompt injection protection)
+		Critic: &CriticConfig{
+			Enabled:       false, // Disabled by default, opt-in
+			Model:         "",    // Empty means use main model
+			HighRiskTools: []string{"run_shell_command", "write_file", "edit_file", "delete_file"},
+			MaxLatencyMs:  5000, // 5 second timeout
+			CacheEnabled:  true,
 		},
 	}
 }
@@ -1077,7 +1141,13 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	// Override Daemon configuration from environment
 	if cfg.Daemon == nil {
-		cfg.Daemon = &DaemonConfig{}
+		cfg.Daemon = &DaemonConfig{
+			ConfirmPolicy: ConfirmPolicyAllow, // Default to allow for backward compatibility
+		}
+	}
+	// Set default confirm policy if not specified
+	if cfg.Daemon.ConfirmPolicy == "" {
+		cfg.Daemon.ConfirmPolicy = ConfirmPolicyAllow
 	}
 	// Numeric and string overrides
 	overrideIntFromEnv(&cfg.Daemon.Port, "NANO_DAEMON_PORT")
@@ -1361,6 +1431,375 @@ type ConfigLocation struct { //nolint:revive
 	Type   string
 	Path   string
 	Exists bool
+}
+
+// DeepCopy creates a deep copy of the Config struct.
+// This is necessary to prevent child agents from modifying parent config during fork operations.
+func (c *Config) DeepCopy() *Config {
+	if c == nil {
+		return nil
+	}
+
+	// Create a new config with all scalar fields copied
+	copied := &Config{
+		APIKey:                c.APIKey,
+		BaseURL:               c.BaseURL,
+		Model:                 c.Model,
+		Verbose:               c.Verbose,
+		WorkingDir:            c.WorkingDir,
+		IsSubAgent:            c.IsSubAgent,
+		IsDaemon:              c.IsDaemon,
+		MaxFileSize:           c.MaxFileSize,
+		ResponseTimeout:       c.ResponseTimeout,
+		HTTPTimeout:           c.HTTPTimeout,
+		ReadFileMaxLines:      c.ReadFileMaxLines,
+		SearchMaxResults:      c.SearchMaxResults,
+		WebRequestTimeout:     c.WebRequestTimeout,
+		WebSearchTimeout:      c.WebSearchTimeout,
+		WebMaxContentSize:     c.WebMaxContentSize,
+		WebSearchMaxResults:   c.WebSearchMaxResults,
+		FileDiffMaxLines:      c.FileDiffMaxLines,
+		GitMaxLogEntries:      c.GitMaxLogEntries,
+		MemoryMaxEntries:      c.MemoryMaxEntries,
+		ListDirectoryMaxDepth: c.ListDirectoryMaxDepth,
+		EnableMCP:             c.EnableMCP,
+		ConfirmDestructive:    c.ConfirmDestructive,
+		Strict:                c.Strict,
+		CustomSystemPrompt:    c.CustomSystemPrompt,
+		PermissionMode:        c.PermissionMode,
+		EnablePprof:           c.EnablePprof,
+		PprofPort:             c.PprofPort,
+	}
+
+	// Deep copy slices
+	copied.EnabledTools = append([]string(nil), c.EnabledTools...)
+	copied.DisabledTools = append([]string(nil), c.DisabledTools...)
+	copied.AllowedCommands = append([]string(nil), c.AllowedCommands...)
+	copied.BlockedCommands = append([]string(nil), c.BlockedCommands...)
+	copied.AllowedEnvVars = append([]string(nil), c.AllowedEnvVars...)
+	copied.BlockedEnvVars = append([]string(nil), c.BlockedEnvVars...)
+	copied.AllowedRules = append([]string(nil), c.AllowedRules...)
+
+	// Deep copy Reasoning
+	if c.Reasoning != nil {
+		copied.Reasoning = &ReasoningConfig{
+			Enabled:            c.Reasoning.Enabled,
+			Effort:             c.Reasoning.Effort,
+			MaxTokens:          c.Reasoning.MaxTokens,
+			Exclude:            c.Reasoning.Exclude,
+			runtimeOverride:    c.Reasoning.runtimeOverride,
+			runtimeOverrideSet: c.Reasoning.runtimeOverrideSet,
+		}
+	}
+
+	// Deep copy ContextConfig
+	copied.ContextConfig = ContextConfig{
+		MaxTokens:           c.ContextConfig.MaxTokens,
+		CompressionRatio:    c.ContextConfig.CompressionRatio,
+		PreserveRecentTurns: c.ContextConfig.PreserveRecentTurns,
+		EnableCompression:   c.ContextConfig.EnableCompression,
+		ModelContextWindow:  c.ContextConfig.ModelContextWindow,
+	}
+
+	// Deep copy Memory
+	if c.Memory != nil {
+		copied.Memory = &MemoryConfig{
+			APIKey:    c.Memory.APIKey,
+			BaseURL:   c.Memory.BaseURL,
+			OrgID:     c.Memory.OrgID,
+			ProjectID: c.Memory.ProjectID,
+			UserID:    c.Memory.UserID,
+			AgentID:   c.Memory.AgentID,
+		}
+	}
+
+	// Deep copy OSS
+	if c.OSS != nil {
+		copied.OSS = &OSSConfig{
+			AccessKeyID:     c.OSS.AccessKeyID,
+			AccessKeySecret: c.OSS.AccessKeySecret,
+			Endpoint:        c.OSS.Endpoint,
+			DefaultBucket:   c.OSS.DefaultBucket,
+			Region:          c.OSS.Region,
+			Timeout:         c.OSS.Timeout,
+			Enabled:         c.OSS.Enabled,
+			CallbackURL:     c.OSS.CallbackURL,
+			CallbackToken:   c.OSS.CallbackToken,
+		}
+	}
+
+	// Deep copy ImageGenerator
+	if c.ImageGenerator != nil {
+		copied.ImageGenerator = &ImageGeneratorConfig{}
+		for _, p := range c.ImageGenerator.Providers {
+			provider := ImageGeneratorProviderConfig{
+				Provider:   p.Provider,
+				Model:      p.Model,
+				EndpointID: p.EndpointID,
+				APIKey:     p.APIKey,
+				BaseURL:    p.BaseURL,
+				Enabled:    p.Enabled,
+			}
+			if p.Config != nil {
+				provider.Config = make(map[string]interface{}, len(p.Config))
+				for k, v := range p.Config {
+					provider.Config[k] = v
+				}
+			}
+			copied.ImageGenerator.Providers = append(copied.ImageGenerator.Providers, provider)
+		}
+	}
+
+	// Deep copy LoopDetection
+	if c.LoopDetection != nil {
+		copied.LoopDetection = &LoopDetectionConfig{
+			Enabled: c.LoopDetection.Enabled,
+		}
+	}
+
+	// Deep copy Turn
+	if c.Turn != nil {
+		copied.Turn = &TurnExecutionConfig{
+			MaxDuration: c.Turn.MaxDuration,
+		}
+	}
+
+	// Deep copy ToolRecovery
+	if c.ToolRecovery != nil {
+		copied.ToolRecovery = &ToolRecoveryConfig{
+			Default: c.ToolRecovery.Default,
+		}
+		if c.ToolRecovery.PerTool != nil {
+			copied.ToolRecovery.PerTool = make(map[string]ToolRetryPolicy, len(c.ToolRecovery.PerTool))
+			for k, v := range c.ToolRecovery.PerTool {
+				copied.ToolRecovery.PerTool[k] = v
+			}
+		}
+	}
+
+	// Deep copy WebSearchAPIKeys
+	copied.WebSearchAPIKeys = WebSearchAPIKeys{
+		Serper:     c.WebSearchAPIKeys.Serper,
+		Tavily:     c.WebSearchAPIKeys.Tavily,
+		DuckDuckGo: c.WebSearchAPIKeys.DuckDuckGo,
+	}
+
+	// Deep copy UserInfo
+	if c.UserInfo != nil {
+		copied.UserInfo = &UserInfoConfig{
+			Timezone:           c.UserInfo.Timezone,
+			OperatingSystem:    c.UserInfo.OperatingSystem,
+			Shell:              c.UserInfo.Shell,
+			Editor:             c.UserInfo.Editor,
+			Language:           c.UserInfo.Language,
+			WorkingDirectory:   c.UserInfo.WorkingDirectory,
+			AutoDetectUserInfo: c.UserInfo.AutoDetectUserInfo,
+		}
+		if c.UserInfo.ProgrammingTools != nil {
+			copied.UserInfo.ProgrammingTools = make(map[string]string, len(c.UserInfo.ProgrammingTools))
+			for k, v := range c.UserInfo.ProgrammingTools {
+				copied.UserInfo.ProgrammingTools[k] = v
+			}
+		}
+	}
+
+	// Deep copy Daemon
+	if c.Daemon != nil {
+		copied.Daemon = &DaemonConfig{
+			Port:          c.Daemon.Port,
+			Host:          c.Daemon.Host,
+			PidFile:       c.Daemon.PidFile,
+			LogFile:       c.Daemon.LogFile,
+			EnableCORS:    c.Daemon.EnableCORS,
+			APIKey:        c.Daemon.APIKey,
+			TLSCertFile:   c.Daemon.TLSCertFile,
+			TLSKeyFile:    c.Daemon.TLSKeyFile,
+			ConfirmPolicy: c.Daemon.ConfirmPolicy,
+		}
+		copied.Daemon.AllowlistedTools = append([]string(nil), c.Daemon.AllowlistedTools...)
+		if c.Daemon.SecretRedaction != nil {
+			copied.Daemon.SecretRedaction = deepCopySecretRedaction(c.Daemon.SecretRedaction)
+		}
+	}
+
+	// Deep copy SecretRedaction
+	if c.SecretRedaction != nil {
+		copied.SecretRedaction = deepCopySecretRedaction(c.SecretRedaction)
+	}
+
+	// Deep copy OpenSpec
+	if c.OpenSpec != nil {
+		copied.OpenSpec = &OpenSpecConfig{
+			Enabled:             c.OpenSpec.Enabled,
+			RootDir:             c.OpenSpec.RootDir,
+			DefaultSchema:       c.OpenSpec.DefaultSchema,
+			AutoDetect:          c.OpenSpec.AutoDetect,
+			ApplyMode:           c.OpenSpec.ApplyMode,
+			VerifyBeforeArchive: c.OpenSpec.VerifyBeforeArchive,
+			InjectContext:       c.OpenSpec.InjectContext,
+			MaxArtifactSize:     c.OpenSpec.MaxArtifactSize,
+		}
+	}
+
+	// Deep copy Skills
+	if c.Skills != nil {
+		copied.Skills = &SkillsConfig{
+			Enabled:         c.Skills.Enabled,
+			PersonalDir:     c.Skills.PersonalDir,
+			ProjectDir:      c.Skills.ProjectDir,
+			MaxSkillSize:    c.Skills.MaxSkillSize,
+			MaxSkills:       c.Skills.MaxSkills,
+			AutoInvoke:      c.Skills.AutoInvoke,
+			MaxActiveSkills: c.Skills.MaxActiveSkills,
+		}
+	}
+
+	// Deep copy Advanced
+	if c.Advanced != nil {
+		copied.Advanced = &AdvancedConfig{}
+		if c.Advanced.Fork != nil {
+			copied.Advanced.Fork = &ForkAdvConfig{
+				MaxDepth: c.Advanced.Fork.MaxDepth,
+			}
+		}
+	}
+
+	// Deep copy Sandbox
+	if c.Sandbox != nil {
+		copied.Sandbox = &SandboxConfig{
+			Enabled:       c.Sandbox.Enabled,
+			NetworkAccess: c.Sandbox.NetworkAccess,
+			BwrapPath:     c.Sandbox.BwrapPath,
+		}
+		copied.Sandbox.AllowedPaths = append([]string(nil), c.Sandbox.AllowedPaths...)
+		copied.Sandbox.BlockedPaths = append([]string(nil), c.Sandbox.BlockedPaths...)
+		copied.Sandbox.ReadOnlyPaths = append([]string(nil), c.Sandbox.ReadOnlyPaths...)
+		copied.Sandbox.ExtraReadOnlyPaths = append([]string(nil), c.Sandbox.ExtraReadOnlyPaths...)
+		copied.Sandbox.ExtraWritablePaths = append([]string(nil), c.Sandbox.ExtraWritablePaths...)
+	}
+
+	// Deep copy Security
+	if c.Security != nil {
+		copied.Security = &SecurityConfig{
+			MaxFileSizeBytes: c.Security.MaxFileSizeBytes,
+		}
+		copied.Security.AllowRules = append([]string(nil), c.Security.AllowRules...)
+		copied.Security.DenyRules = append([]string(nil), c.Security.DenyRules...)
+		if c.Security.Hooks != nil {
+			copied.Security.Hooks = make([]HookConfig, len(c.Security.Hooks))
+			copy(copied.Security.Hooks, c.Security.Hooks)
+		}
+	}
+
+	// Deep copy Critic
+	if c.Critic != nil {
+		copied.Critic = &CriticConfig{
+			Enabled:      c.Critic.Enabled,
+			Model:        c.Critic.Model,
+			MaxLatencyMs: c.Critic.MaxLatencyMs,
+			CacheEnabled: c.Critic.CacheEnabled,
+		}
+		copied.Critic.HighRiskTools = append([]string(nil), c.Critic.HighRiskTools...)
+	}
+
+	// Deep copy Middleware
+	if c.Middleware != nil {
+		copied.Middleware = &MiddlewareConfig{
+			EnableAudit:      c.Middleware.EnableAudit,
+			AuditLogPath:     c.Middleware.AuditLogPath,
+			EnableMetrics:    c.Middleware.EnableMetrics,
+			EnableResilience: c.Middleware.EnableResilience,
+			MaxRetries:       c.Middleware.MaxRetries,
+		}
+	}
+
+	// Deep copy MCP
+	if c.MCP != nil {
+		copied.MCP = &MCPConfig{
+			EnableClient:        c.MCP.EnableClient,
+			DefaultTransport:    c.MCP.DefaultTransport,
+			Timeout:             c.MCP.Timeout,
+			MaxRetries:          c.MCP.MaxRetries,
+			EnableAuth:          c.MCP.EnableAuth,
+			EnableHealthCheck:   c.MCP.EnableHealthCheck,
+			HealthCheckInterval: c.MCP.HealthCheckInterval,
+			HealthCheckTimeout:  c.MCP.HealthCheckTimeout,
+		}
+		if c.MCP.Servers != nil {
+			copied.MCP.Servers = make([]MCPServerConfig, len(c.MCP.Servers))
+			for i, s := range c.MCP.Servers {
+				copied.MCP.Servers[i] = MCPServerConfig{
+					Name:        s.Name,
+					Description: s.Description,
+					URL:         s.URL,
+					Transport:   s.Transport,
+					Enabled:     s.Enabled,
+					Timeout:     s.Timeout,
+				}
+				copied.MCP.Servers[i].Command = append([]string(nil), s.Command...)
+				if s.Headers != nil {
+					copied.MCP.Servers[i].Headers = make(map[string]string, len(s.Headers))
+					for k, v := range s.Headers {
+						copied.MCP.Servers[i].Headers[k] = v
+					}
+				}
+			}
+		}
+		if c.MCP.AuthTokens != nil {
+			copied.MCP.AuthTokens = make(map[string]string, len(c.MCP.AuthTokens))
+			for k, v := range c.MCP.AuthTokens {
+				copied.MCP.AuthTokens[k] = v
+			}
+		}
+		if c.MCP.TLS != nil {
+			copied.MCP.TLS = &MCPTLSConfig{
+				Enabled:    c.MCP.TLS.Enabled,
+				CertFile:   c.MCP.TLS.CertFile,
+				KeyFile:    c.MCP.TLS.KeyFile,
+				CAFile:     c.MCP.TLS.CAFile,
+				SkipVerify: c.MCP.TLS.SkipVerify,
+			}
+		}
+	}
+
+	// Deep copy Scheduler
+	if c.Scheduler != nil {
+		copied.Scheduler = &SchedulerConfig{
+			Enabled:   c.Scheduler.Enabled,
+			StateFile: c.Scheduler.StateFile,
+		}
+	}
+
+	// Deep copy Cron
+	if c.Cron != nil {
+		copied.Cron = &CronConfig{
+			PermissionPolicy:   c.Cron.PermissionPolicy,
+			TurnTimeout:        c.Cron.TurnTimeout,
+			LogPath:            c.Cron.LogPath,
+			LogRetentionDays:   c.Cron.LogRetentionDays,
+			LogCleanupInterval: c.Cron.LogCleanupInterval,
+			EventsDir:          c.Cron.EventsDir,
+		}
+	}
+
+	return copied
+}
+
+// deepCopySecretRedaction is a helper to deep copy SecretRedactionConfig
+func deepCopySecretRedaction(src *SecretRedactionConfig) *SecretRedactionConfig {
+	if src == nil {
+		return nil
+	}
+	copied := &SecretRedactionConfig{
+		Enabled:         src.Enabled,
+		IncludeDefaults: src.IncludeDefaults,
+	}
+	copied.SensitiveKeys = append([]string(nil), src.SensitiveKeys...)
+	if src.Additional != nil {
+		copied.Additional = make([]RedactionPattern, len(src.Additional))
+		copy(copied.Additional, src.Additional)
+	}
+	return copied
 }
 
 // GetConfigLocations returns the potential configuration file locations in priority order,

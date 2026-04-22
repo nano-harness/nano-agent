@@ -911,7 +911,8 @@ func (cs *CompressionStrategy) CompressMessages(ctx context.Context, client llm.
 	// Generate LLM summary
 	summary, err := cs.GenerateSummary(ctx, client, toCompress)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate summary: %w", err)
+		logger.Warnf("LLM summary failed, falling back to simple truncation: %v", err)
+		return cs.fallbackTruncate(messages)
 	}
 
 	// Create compressed messages following Gemini CLI flow:
@@ -990,4 +991,66 @@ func (cs *CompressionStrategy) CompressMessages(ctx context.Context, client llm.
 		currentTokens, compressedTokens, (1.0-compressionInfo.CompressionRatio)*100)
 
 	return compressedMessages, compressionInfo, nil
+}
+
+// fallbackTruncate implements a simple truncation strategy when LLM summarization fails.
+// It preserves system messages and the most recent conversation turns.
+func (cs *CompressionStrategy) fallbackTruncate(messages []llm.Message) ([]llm.Message, *CompressionInfo, error) {
+	if len(messages) == 0 {
+		return messages, nil, nil
+	}
+
+	// Determine how many recent turns to preserve
+	preserveCount := cs.minMessagesToKeep
+	if preserveCount == 0 {
+		preserveCount = 4 // Default to 4 recent turns
+	}
+
+	var result []llm.Message
+
+	// 1. Preserve all system messages
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			result = append(result, msg)
+		}
+	}
+
+	// 2. Preserve the most recent N turns (user + assistant pairs)
+	// Each turn typically consists of 2 messages (user + assistant)
+	recentStart := len(messages) - (preserveCount * 2)
+	if recentStart < len(result) {
+		recentStart = len(result)
+	}
+	if recentStart < 0 {
+		recentStart = 0
+	}
+
+	// Find the first non-system message to append recent turns
+	systemCount := len(result)
+	for i := recentStart; i < len(messages); i++ {
+		if messages[i].Role != "system" || i >= systemCount {
+			result = append(result, messages[i])
+		}
+	}
+
+	// Calculate compression info
+	originalTokens := cs.EstimateTokenCount(messages)
+	finalTokens := cs.EstimateTokenCount(result)
+
+	info := &CompressionInfo{
+		OriginalTokens:   originalTokens,
+		CompressedTokens: finalTokens,
+		TokensSaved:      originalTokens - finalTokens,
+		CompressionRatio: float64(finalTokens) / float64(originalTokens),
+		MessagesBefore:   len(messages),
+		MessagesAfter:    len(result),
+		TriggeredBy:      "llm_failure_fallback",
+		Summary:          "(fallback truncation: preserved system messages and recent turns)",
+	}
+
+	logger.Infof("Fallback truncation: %d → %d tokens (%.2f%% reduction), %d → %d messages",
+		originalTokens, finalTokens, (1.0-info.CompressionRatio)*100,
+		len(messages), len(result))
+
+	return result, info, nil
 }

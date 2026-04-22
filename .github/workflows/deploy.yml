@@ -1,8 +1,6 @@
 name: Deploy Nano Agent
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:

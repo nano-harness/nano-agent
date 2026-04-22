@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -89,6 +90,19 @@ func (s *Session) SetConversationHistory(history []llm.Message) {
 	defer s.mutex.Unlock()
 
 	s.ConversationHistory = history
+	s.LastActiveAt = time.Now()
+}
+
+// ClearMetadata atomically resets metadata to an empty map and zeroes
+// the session-level statistics. Used by ResetSession to fully restore
+// a session to "as-new" state while preserving its ID and CreatedAt.
+func (s *Session) ClearMetadata() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	s.Metadata = make(map[string]interface{})
+	s.TotalTokens = 0
+	s.Duration = 0
 	s.LastActiveAt = time.Now()
 }
 
@@ -185,12 +199,13 @@ func (s *Session) GetMetadata(key string) (interface{}, bool) {
 
 // SessionManager manages multiple sessions with automatic cleanup.
 type SessionManager struct {
-	sessions   map[string]*Session
-	mutex      sync.RWMutex
-	sessionTTL time.Duration
-	cleanupCh  chan struct{}
-	wg         sync.WaitGroup
-	storage    SessionStorage
+	sessions          map[string]*Session
+	mutex             sync.RWMutex
+	sessionTTL        time.Duration
+	cleanupCh         chan struct{}
+	wg                sync.WaitGroup
+	storage           SessionStorage
+	backgroundCancels map[string][]context.CancelFunc // per-session background goroutine cancellation, protected by mutex
 }
 
 // SessionManagerOption is a functional option for SessionManager.
@@ -216,12 +231,20 @@ func (sm *SessionManager) SetStorage(storage SessionStorage) { //nolint:revive
 	sm.storage = storage
 }
 
+// GetStorage returns the current session storage backend.
+func (sm *SessionManager) GetStorage() SessionStorage {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+	return sm.storage
+}
+
 // NewSessionManager creates a new session manager.
 func NewSessionManager(opts ...SessionManagerOption) *SessionManager {
 	sm := &SessionManager{
-		sessions:   make(map[string]*Session),
-		sessionTTL: 30 * time.Minute, // Default TTL
-		cleanupCh:  make(chan struct{}),
+		sessions:          make(map[string]*Session),
+		sessionTTL:        30 * time.Minute, // Default TTL
+		cleanupCh:         make(chan struct{}),
+		backgroundCancels: make(map[string][]context.CancelFunc),
 	}
 
 	for _, opt := range opts {
@@ -341,6 +364,9 @@ func (sm *SessionManager) DeleteSession(sessionID string) (bool, error) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
+	// Cancel all background goroutines for this session first
+	sm.cancelBackgroundsLocked(sessionID)
+
 	deleted := false
 	if _, exists := sm.sessions[sessionID]; exists {
 		delete(sm.sessions, sessionID)
@@ -384,6 +410,55 @@ func (sm *SessionManager) GetSessionCount() int {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
 	return len(sm.sessions)
+}
+
+// RegisterBackgroundCancel registers a background goroutine cancel function for a session.
+// This allows proper cleanup when the session is deleted or the manager shuts down.
+func (sm *SessionManager) RegisterBackgroundCancel(sessionID string, cancel context.CancelFunc) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.backgroundCancels[sessionID] = append(sm.backgroundCancels[sessionID], cancel)
+}
+
+// cancelBackgroundsLocked cancels all registered background goroutines for a session.
+// Must be called while holding the write lock (sm.mutex).
+func (sm *SessionManager) cancelBackgroundsLocked(sessionID string) {
+	cancels := sm.backgroundCancels[sessionID]
+	for _, cancel := range cancels {
+		if cancel != nil {
+			cancel()
+		}
+	}
+	delete(sm.backgroundCancels, sessionID)
+}
+
+// SaveSessionIfActive atomically checks if the session still exists and context is valid,
+// then persists it to storage. This prevents race conditions where background goroutines
+// try to save sessions that have already been deleted.
+func (sm *SessionManager) SaveSessionIfActive(ctx context.Context, sessionID string) error {
+	if sm.storage == nil {
+		return nil
+	}
+
+	// Check context first (fast path)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	sm.mutex.RLock()
+	session, exists := sm.sessions[sessionID]
+	sm.mutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("session %s no longer active", sessionID)
+	}
+
+	// Double-check context before saving
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return sm.storage.SaveSession(session)
 }
 
 // cleanupLoop periodically cleans up expired sessions.
@@ -438,10 +513,16 @@ func (sm *SessionManager) Shutdown() {
 	close(sm.cleanupCh)
 	sm.wg.Wait()
 
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	// Cancel all background goroutines for all sessions
+	for sessionID := range sm.backgroundCancels {
+		sm.cancelBackgroundsLocked(sessionID)
+	}
+
 	// Save all sessions on shutdown
 	if sm.storage != nil {
-		sm.mutex.RLock()
-		defer sm.mutex.RUnlock()
 		for _, session := range sm.sessions {
 			_ = sm.storage.SaveSession(session)
 		}

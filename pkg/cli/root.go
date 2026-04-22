@@ -17,6 +17,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/runtime"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
 	"github.com/nano-harness/nano-agent/pkg/version"
@@ -149,8 +150,8 @@ func init() {
 	rootCmd.AddCommand(NewConfigCommand())
 	rootCmd.AddCommand(NewCommandsCommand())
 	rootCmd.AddCommand(NewUpdateCommand())
-	rootCmd.AddCommand(NewCronCommand())
-	rootCmd.AddCommand(NewWatcherCommand())
+	rootCmd.AddCommand(NewRoutinesCommand())
+	rootCmd.AddCommand(NewSessionCommand())
 
 	// Flags for mode selection
 	rootCmd.PersistentFlags().BoolP("version", "v", false, "version for nano")
@@ -162,6 +163,10 @@ func init() {
 
 	// Experimental: Bubble Tea non-alt-screen TUI
 	rootCmd.Flags().Bool("tea", false, "use experimental Bubble Tea TUI (non alt-screen)")
+
+	// TUI session management flags
+	rootCmd.Flags().Bool("continue", false, "resume the most recent session in the current project (TUI mode)")
+	rootCmd.Flags().String("session", "", "use a specific session id (TUI mode); creates if not exists")
 
 	// SWE-bench compatibility flags
 	rootCmd.Flags().Bool("binary-mode", false, "Enable binary mode for SWE-bench evaluation")
@@ -401,10 +406,10 @@ func runAgent(cmd *cobra.Command, args []string) {
 	logger.SetVerbose(cfg.Verbose)
 
 	if useTea {
-		runBubbleTeaMode(args)
+		runBubbleTeaMode(cmd, args)
 	} else {
 		// Use classic tview-based TUI (default or forced)
-		runTUIMode(args)
+		runTUIMode(cmd, args)
 	}
 }
 
@@ -467,8 +472,47 @@ func runDaemonClientMode(cmd *cobra.Command, args []string) {
 	}
 }
 
+// resolveTUISessionID determines which session ID to use in TUI mode based on flags:
+//   - --session <id>  → use specified id (highest priority)
+//   - --continue      → use latest session id from ProjectSessionStorage; if none, generate new
+//   - default         → generate a new unique session id per launch
+func resolveTUISessionID(cmd *cobra.Command, ag *agent.Agent) string {
+	if cmd != nil {
+		if explicit, _ := cmd.Flags().GetString("session"); strings.TrimSpace(explicit) != "" {
+			return strings.TrimSpace(explicit)
+		}
+		if cont, _ := cmd.Flags().GetBool("continue"); cont {
+			if sm := ag.GetSessionManager(); sm != nil {
+				if ps, ok := sm.GetStorage().(*agent.ProjectSessionStorage); ok {
+					if latest, err := ps.GetLatestSessionID(); err == nil && latest != "" {
+						return latest
+					}
+					logger.Warnf("--continue specified but no previous session found; creating new")
+				}
+			}
+		}
+	}
+	return agent.NewSession().ID // generates a fresh session_<hex>
+}
+
 // runTUIMode starts the TUI dashboard mode
-func runTUIMode(args []string) {
+func runTUIMode(cmd *cobra.Command, args []string) {
+	// Acquire TUI mode lock to prevent simultaneous TUI/Daemon execution
+	lock, lockErr := runtime.NewLockFile(runtime.ModeTUI)
+	if lockErr != nil {
+		color.Red("❌ Failed to create TUI lock: %v", lockErr)
+		os.Exit(1)
+	}
+	if lockErr = lock.Acquire(); lockErr != nil {
+		color.Red("❌ %v", lockErr)
+		os.Exit(1)
+	}
+	defer func() {
+		if lockErr := lock.Release(); lockErr != nil {
+			logger.Warnf("Failed to release TUI lock: %v", lockErr)
+		}
+	}()
+
 	// Check TTY compatibility first
 	if !isatty.IsTerminal(os.Stdout.Fd()) {
 		color.Yellow("⚠️  TTY environment not supported for TUI mode")
@@ -550,6 +594,18 @@ func runTUIMode(args []string) {
 		return false
 	}
 
+	// Load persistent allowlist for current workdir and merge into cfg.
+	allowlistPath, _ := permission.DefaultPersistentAllowlistPath()
+	allowlistStore := permission.NewPersistentAllowlistStore(allowlistPath)
+	if err := allowlistStore.Load(); err != nil {
+		logger.Warnf("Failed to load persistent allowlist: %v", err)
+	}
+	var cwd string
+	cwd, _ = os.Getwd()
+	for _, raw := range allowlistStore.RulesForWorkdir(cwd) {
+		cfg.AllowedRules = append(cfg.AllowedRules, raw)
+	}
+
 	// Build the engine (agent + scheduler + watcher) using the approval handler
 	eng, err := engine.New(cfg, approvalHandler)
 	if err != nil {
@@ -562,6 +618,13 @@ func runTUIMode(args []string) {
 			logger.Errorf("Engine shutdown error: %v", err)
 		}
 	}()
+
+	// Set up session ID for TUI mode
+	sessionID := resolveTUISessionID(cmd, agentInstance)
+	agentInstance.SetActiveSessionID(sessionID)
+	// Touch session in manager so storage / index get initialised
+	agentInstance.GetSessionManager().GetOrCreateSession(sessionID)
+	logger.Infof("TUI session id: %s", sessionID)
 
 	// Wrap the engine's shared scheduler as a TUIScheduler
 	tuiScheduler := agent.NewTUISchedulerFromScheduler(eng.Scheduler, eng.StateStore)
@@ -578,13 +641,23 @@ func runTUIMode(args []string) {
 			rules := permission.BuildAllowlistRules(toolName, params)
 			for _, rule := range rules {
 				pm.GetSessionAllowlist().AddRule(rule)
+				// Persist the rule to disk
+				if _, err := allowlistStore.AddRuleForWorkdir(cwd, rule.RawPattern); err != nil {
+					logger.Warnf("Failed to persist allowlist rule %q: %v", rule.RawPattern, err)
+				}
 			}
 		}
 	})
 	// Wire permission manager so slash commands work.
 	integration.SetPermissionManager(agentInstance.GetPermissionManager())
+	// Wire persistent allowlist store for /disallow cleanup
+	integration.SetPersistentAllowlist(allowlistStore, cwd)
 	// Wire engine so /think command works.
 	integration.SetEngine(eng)
+	// Wire new session callback so Ctrl+R / /clear work.
+	integration.SetNewSessionCallback(func() string {
+		return agentInstance.StartNewSession()
+	})
 
 	// If we have a direct command to execute in TUI mode,
 	// we should pass it to the TUI instead of executing directly
@@ -774,7 +847,23 @@ func runTUIMode(args []string) {
 }
 
 // runBubbleTeaMode starts the Bubble Tea TUI in non-alt-screen mode
-func runBubbleTeaMode(args []string) {
+func runBubbleTeaMode(cmd *cobra.Command, args []string) {
+	// Acquire TUI mode lock to prevent simultaneous TUI/Daemon execution
+	lock, lockErr := runtime.NewLockFile(runtime.ModeTUI)
+	if lockErr != nil {
+		color.Red("❌ Failed to create TUI lock: %v", lockErr)
+		os.Exit(1)
+	}
+	if lockErr = lock.Acquire(); lockErr != nil {
+		color.Red("❌ %v", lockErr)
+		os.Exit(1)
+	}
+	defer func() {
+		if lockErr := lock.Release(); lockErr != nil {
+			logger.Warnf("Failed to release TUI lock: %v", lockErr)
+		}
+	}()
+
 	// Ensure we are in a terminal
 	if !isatty.IsTerminal(os.Stdout.Fd()) {
 		color.Yellow("⚠️  TTY environment not supported for Bubble Tea TUI")
@@ -834,7 +923,8 @@ func runBubbleTeaMode(args []string) {
 	cancelCh := make(chan struct{})
 
 	// Get CWD and API Base URL
-	cwd, _ := os.Getwd()
+	var cwd string
+	cwd, _ = os.Getwd()
 	apiBaseURL := cfg.BaseURL
 
 	// Create Bubble Tea model
@@ -882,6 +972,17 @@ func runBubbleTeaMode(args []string) {
 		}()
 	}
 
+	// Load persistent allowlist for current workdir and merge into cfg.
+	allowlistPath, _ := permission.DefaultPersistentAllowlistPath()
+	allowlistStore := permission.NewPersistentAllowlistStore(allowlistPath)
+	if err := allowlistStore.Load(); err != nil {
+		logger.Warnf("Failed to load persistent allowlist: %v", err)
+	}
+	cwd, _ = os.Getwd()
+	for _, raw := range allowlistStore.RulesForWorkdir(cwd) {
+		cfg.AllowedRules = append(cfg.AllowedRules, raw)
+	}
+
 	// Build the engine (agent + scheduler + watcher) using the approval handler
 	// defined above. agentInstance is assigned here so the closure can resolve it.
 	eng, err := engine.New(cfg, approvalHandler)
@@ -895,6 +996,13 @@ func runBubbleTeaMode(args []string) {
 			logger.Errorf("Engine shutdown error: %v", err)
 		}
 	}()
+
+	// Set up session ID for Bubble Tea TUI mode
+	sessionID := resolveTUISessionID(cmd, agentInstance)
+	agentInstance.SetActiveSessionID(sessionID)
+	// Touch session in manager so storage / index get initialised
+	agentInstance.GetSessionManager().GetOrCreateSession(sessionID)
+	logger.Infof("TUI session id: %s", sessionID)
 
 	// Wrap the engine's shared scheduler as a TUIScheduler so /loop and
 	// /schedule slash commands keep working in BubbleTea mode.
@@ -912,14 +1020,24 @@ func runBubbleTeaMode(args []string) {
 			rules := permission.BuildAllowlistRules(toolName, params)
 			for _, rule := range rules {
 				pm.GetSessionAllowlist().AddRule(rule)
+				// Persist the rule to disk
+				if _, err := allowlistStore.AddRuleForWorkdir(cwd, rule.RawPattern); err != nil {
+					logger.Warnf("Failed to persist allowlist rule %q: %v", rule.RawPattern, err)
+				}
 			}
 		}
 	})
 
 	// Wire permission manager and tool names into the Bubble Tea model
 	m.SetPermissionManager(agentInstance.GetPermissionManager())
+	// Wire persistent allowlist store for /disallow cleanup
+	m.SetPersistentAllowlist(allowlistStore, cwd)
 	// Wire engine so /think command works
 	m.SetEngine(eng)
+	// Wire new session handler so Ctrl+R / /clear work
+	m.SetNewSessionHandler(func() string {
+		return agentInstance.StartNewSession()
+	})
 	allTools := agentInstance.GetToolbox().List()
 	toolNames := make([]string, 0, len(allTools))
 	for _, t := range allTools {

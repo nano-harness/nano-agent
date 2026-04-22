@@ -199,6 +199,71 @@ func (m *Manager) SetKnowledge(key, value, tags string) error {
 	return m.knowledge.Set(key, value, tags)
 }
 
+// SaveWithRollback attempts to save session and knowledge data atomically.
+// Since Session and Knowledge use independent SQLite databases, true cross-database
+// transactions aren't possible. This method provides best-effort rollback:
+// 1. Save session data first
+// 2. If session save fails, return error immediately
+// 3. Save knowledge entries
+// 4. If knowledge save fails, attempt to rollback session changes (best-effort)
+//
+// Returns the original error if rollback fails, wrapped with rollback error details.
+func (m *Manager) SaveWithRollback(ctx context.Context, messages []llm.Message, knowledgeEntries map[string]KnowledgeEntry) error {
+	if !m.enabled {
+		return fmt.Errorf("memory is disabled")
+	}
+
+	sessionID := sessionIDFromContext(ctx)
+
+	// Phase 1: Save session data and track what was inserted
+	var savedSessionIDs []int64
+	if m.sessions != nil && len(messages) > 0 {
+		for _, msg := range messages {
+			// Get current max ID before insert to enable rollback
+			var maxID int64
+			err := m.sessions.db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM sessions").Scan(&maxID)
+			if err != nil {
+				return fmt.Errorf("get max session ID: %w", err)
+			}
+
+			if err := m.sessions.Add(sessionID, msg.Role, msg.Content); err != nil {
+				return fmt.Errorf("save session: %w", err)
+			}
+
+			// Track the ID that was just inserted (maxID + 1)
+			savedSessionIDs = append(savedSessionIDs, maxID+1)
+		}
+	}
+
+	// Phase 2: Save knowledge entries, rollback sessions on failure
+	if m.knowledge != nil && len(knowledgeEntries) > 0 {
+		for key, entry := range knowledgeEntries {
+			if err := m.knowledge.Set(key, entry.Value, entry.Tags); err != nil {
+				// Knowledge save failed, attempt to rollback session saves
+				logger.Warnf("memory: knowledge save failed, attempting session rollback: %v", err)
+
+				var rollbackErr error
+				if m.sessions != nil && len(savedSessionIDs) > 0 {
+					// Delete the session entries we just inserted
+					for _, id := range savedSessionIDs {
+						if _, delErr := m.sessions.db.Exec("DELETE FROM sessions WHERE id = ?", id); delErr != nil {
+							rollbackErr = fmt.Errorf("rollback session ID %d: %w", id, delErr)
+							break
+						}
+					}
+				}
+
+				if rollbackErr != nil {
+					return fmt.Errorf("knowledge save failed: %w (rollback also failed: %v)", err, rollbackErr)
+				}
+				return fmt.Errorf("knowledge save failed (session changes rolled back): %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // ─── SessionView ────────────────────────────────────────────────────────────
 
 // SessionView provides memory operations scoped to a single session.

@@ -27,6 +27,9 @@ type MCPClient struct { //nolint:revive
 	healthChecker *HealthChecker
 	diagnostics   *Diagnostics
 
+	// OAuth token store
+	tokenStore *TokenStore
+
 	// Reconnection channel
 	reconnectChan chan string
 
@@ -74,6 +77,14 @@ func NewMCPClient(config *MCPConfig) *MCPClient {
 		config:        config,
 		connections:   make(map[string]*MCPConnection),
 		reconnectChan: make(chan string, 100), // 缓冲通道避免阻塞
+	}
+
+	// Initialize token store (best effort - log error but don't fail)
+	tokenStore, err := NewTokenStore("")
+	if err != nil {
+		logger.Debugf("Failed to initialize token store: %v", err)
+	} else {
+		client.tokenStore = tokenStore
 	}
 
 	// Initialize enhanced features
@@ -179,7 +190,7 @@ func (c *MCPClient) connectToServer(ctx context.Context, serverConfig MCPServerC
 	logger.Debugf("Using effective timeout %s for server %s", effectiveTimeout, serverConfig.Name)
 
 	// Create transport based on configuration
-	transport, cmd, err := c.createTransport(serverConfig)
+	transport, cmd, err := c.createTransport(ctxWithTimeout, serverConfig)
 	if err != nil {
 		logger.Debugf("Failed to create transport for server %s: %v", serverConfig.Name, err)
 		return fmt.Errorf("failed to create transport: %w", err)
@@ -244,7 +255,7 @@ func (c *MCPClient) connectToServer(ctx context.Context, serverConfig MCPServerC
 }
 
 // createTransport creates the appropriate transport based on configuration
-func (c *MCPClient) createTransport(config MCPServerConfig) (mcp.Transport, *exec.Cmd, error) {
+func (c *MCPClient) createTransport(ctx context.Context, config MCPServerConfig) (mcp.Transport, *exec.Cmd, error) {
 	switch TransportType(config.Transport) {
 	case TransportSTDIO:
 		if len(config.Command) == 0 {
@@ -264,12 +275,34 @@ func (c *MCPClient) createTransport(config MCPServerConfig) (mcp.Transport, *exe
 			return nil, nil, fmt.Errorf("URL is required for streamable transport")
 		}
 
+		// Build headers map
+		headers := make(map[string]string, len(config.Headers)+1)
+		for k, v := range config.Headers {
+			headers[k] = v
+		}
+
+		// Inject OAuth token if configured
+		if config.OAuth != nil && c.tokenStore != nil {
+			oauthClient := NewOAuthClient(config.OAuth, c.tokenStore)
+			entry, err := oauthClient.GetValidToken(ctx, config.Name)
+			if err != nil {
+				return nil, nil, fmt.Errorf("oauth required for server %q: run 'nano mcp auth %s' (%w)", config.Name, config.Name, err)
+			}
+			// Only set Authorization header if user hasn't already provided one
+			if _, exists := headers["Authorization"]; !exists {
+				tokenType := entry.TokenType
+				if tokenType == "" {
+					tokenType = "Bearer"
+				}
+				headers["Authorization"] = tokenType + " " + entry.AccessToken
+			}
+		}
+
 		// Create HTTP client with custom headers
 		httpClient := &http.Client{}
-		if len(config.Headers) > 0 {
-			// Create a custom RoundTripper to add headers
+		if len(headers) > 0 {
 			httpClient.Transport = &headerRoundTripper{
-				headers: config.Headers,
+				headers: headers,
 				base:    http.DefaultTransport,
 			}
 		}
@@ -277,13 +310,20 @@ func (c *MCPClient) createTransport(config MCPServerConfig) (mcp.Transport, *exe
 		return &mcp.StreamableClientTransport{
 			Endpoint:   config.URL,
 			HTTPClient: httpClient,
-			MaxRetries: 5, // Default retry count
+			MaxRetries: 5,
 		}, nil, nil
 
 	case TransportInMemory:
 		// This would typically be used for testing
 		transport1, _ := mcp.NewInMemoryTransports()
 		return transport1, nil, nil
+
+	case TransportType("http"), TransportType("websocket"):
+		return nil, nil, fmt.Errorf(
+			"transport %q is no longer supported; use 'streamable' (HTTP) or 'stdio' instead. "+
+				"Migrate your config: change `transport: %s` to `transport: streamable` and keep the `url` field.",
+			config.Transport, config.Transport,
+		)
 
 	default:
 		return nil, nil, fmt.Errorf("unsupported transport type: %s", config.Transport)
@@ -818,7 +858,7 @@ func (c *MCPClient) ReconnectServer(_ context.Context, serverName string) error 
 	logger.Infof("Attempting safe reconnection to MCP server: %s", serverName)
 
 	// 先尝试建立新连接（不影响旧连接）
-	transport, cmd, err := c.createTransport(*serverConfig)
+	transport, cmd, err := c.createTransport(connectCtx, *serverConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create transport: %w", err)
 	}
