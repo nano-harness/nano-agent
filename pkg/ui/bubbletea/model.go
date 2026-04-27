@@ -10,7 +10,9 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/slash"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
+	uirender "github.com/nano-harness/nano-agent/pkg/ui/render"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	xansi "github.com/charmbracelet/x/ansi"
@@ -58,22 +60,33 @@ const commandsPaletteVisibleRows = 15
 // selection comfortably positioned (avoiding "edge-hugging" behavior).
 const commandsPaletteScrollPadding = 3
 
+const maxInputHeight = 8
+
+const (
+	minMarkdownRenderWidth     = 40
+	defaultMarkdownRenderWidth = 100
+)
+
 // -- Model --
 
 // displayPhase represents the current content display phase
 type displayPhase int
 
 const (
-	phaseIdle     displayPhase = iota
-	phaseThinking              // 正在展示推理内容
-	phaseToolCall              // 正在展示工具调用
-	phaseResponse              // 正在展示最终回复
+	phaseIdle             displayPhase = iota
+	phaseProcessing                    // 已提交，等待首个 thinking/tool/content 事件
+	phaseThinking                      // 正在展示推理内容
+	phaseToolCall                      // 正在展示工具调用
+	phaseAwaitingApproval              // 等待用户确认工具
+	phaseResponse                      // 正在展示最终回复
+	phaseDone                          // 整个 turn 完成
 )
 
 type Model struct { //nolint:revive
 	// Channels
 	SubmitCh chan<- string
 	CancelCh chan<- struct{}
+	outbound func(eventsource.Outbound) error
 
 	// Properties
 	lines      []string
@@ -87,7 +100,7 @@ type Model struct { //nolint:revive
 	sessionStartTime time.Time // Session start timestamp
 
 	// Components
-	input textinput.Model
+	input textarea.Model
 
 	lastRenderHeight int
 
@@ -150,15 +163,23 @@ type Model struct { //nolint:revive
 	currentPhase displayPhase
 
 	// Tool call tracking for deduplication
-	activeToolCalls map[string]string // ID -> last displayed status
+	activeToolCalls  map[string]string // ID -> last displayed status
+	connectionState  string
+	connectionDetail string
+	notice           string
+	swarmLine        string
 }
 
 func New(submitCh chan<- string, cancelCh chan<- struct{}, apiBaseURL, cwd string) *Model { //nolint:revive
-	ti := textinput.New()
-	ti.Placeholder = "输入您的请求..."
-	ti.Focus()
-	ti.CharLimit = 10000 // Generous limit to accommodate long inputs
-	ti.Width = 50
+	ta := textarea.New()
+	ta.Placeholder = "输入您的请求...  (Ctrl+J 换行 | Enter 发送 | 行尾 \\ 续行)"
+	ta.Focus()
+	ta.CharLimit = 10000 // Generous limit to accommodate long inputs
+	ta.SetWidth(50)
+	ta.SetHeight(1)
+	ta.ShowLineNumbers = false
+	ta.Prompt = ""
+	ta.KeyMap.InsertNewline.SetEnabled(false)
 
 	return &Model{
 		SubmitCh:   submitCh,
@@ -167,7 +188,7 @@ func New(submitCh chan<- string, cancelCh chan<- struct{}, apiBaseURL, cwd strin
 		status:     "等待输入",
 		apiBaseURL: apiBaseURL,
 		cwd:        cwd,
-		input:      ti,
+		input:      ta,
 
 		// History buffer initialization
 		sessionStartTime: time.Now(),
@@ -184,20 +205,18 @@ func New(submitCh chan<- string, cancelCh chan<- struct{}, apiBaseURL, cwd strin
 }
 
 func (m *Model) Init() tea.Cmd { //nolint:revive
-	banner := `
- _   _                      _                    _
-| \ | | __ _ _ __   ___    / \   __ _  ___ _ __ | |_
-|  \| |/ _` + "`" + ` | '_ \ / _ \  / _ \ / _` + "`" + ` |/ _ \ '_ \| __|
-| |\  | (_| | | | | (_) |/ ___ \ (_| |  __/ | | | |_
-|_| \_|\__,_|_| |_|\___//_/   \_\__, |\___|_| |_|\__|
-                                 |___/`
-	bannerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorUser)).Bold(true)
-	styledBanner := bannerStyle.Render(banner)
+	return textarea.Blink
+}
 
-	return tea.Batch(
-		textinput.Blink,
-		tea.Printf("%s\n", styledBanner),
-	)
+func (m *Model) BindOutbound(send func(eventsource.Outbound) error) {
+	m.outbound = send
+}
+
+func (m *Model) SendOutbound(o eventsource.Outbound) error {
+	if m.outbound == nil {
+		return nil
+	}
+	return m.outbound(o)
 }
 
 // ClearSession resets all UI state and (if handler set) starts a new agent session.
@@ -215,7 +234,9 @@ func (m *Model) ClearSession() string {
 	m.activeToolCalls = make(map[string]string)
 	m.currentPhase = phaseIdle
 	m.tokenStatus = ""
-	m.status = "等待输入"
+	m.status = m.formatStatusForPhase(phaseIdle, "")
+	m.input.Reset()
+	m.adjustInputHeight()
 
 	newID := ""
 	if m.newSessionHandler != nil {
@@ -309,17 +330,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		// Normal input handling when not showing confirmation
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
-		case "ctrl+z":
-			select {
-			case m.CancelCh <- struct{}{}:
-			default:
+			if m.outbound == nil {
+				return m, tea.Quit
 			}
-			return m, nil
+			return m, m.outboundCmd(eventsource.Outbound{Kind: "cancel"})
+		case "ctrl+z":
+			return m, m.outboundCmd(eventsource.Outbound{Kind: "cancel"})
 		case "up":
+			if m.input.Line() > 0 {
+				break
+			}
 			// Browse input history (most-recent first)
 			if len(m.inputHistory) == 0 {
-				return m, nil
+				break
 			}
 			if m.historyIndex == -1 {
 				// Save current draft before navigating
@@ -332,8 +355,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			m.input.CursorEnd()
 			return m, nil
 		case "down":
+			if m.input.Line() < m.input.LineCount()-1 {
+				break
+			}
 			if m.historyIndex == -1 {
-				return m, nil
+				break
 			}
 			if m.historyIndex < len(m.inputHistory)-1 {
 				m.historyIndex++
@@ -360,11 +386,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			}
 			return m, nil
 		case "enter":
-			if m.input.Value() != "" {
-				input := m.input.Value()
+			val := m.input.Value()
+			if strings.HasSuffix(val, "\\") {
+				m.input.SetValue(strings.TrimSuffix(val, "\\") + "\n")
+				m.input.CursorEnd()
+				m.adjustInputHeight()
+				return m, nil
+			}
+			if strings.TrimSpace(val) != "" {
+				input := val
 
 				// Intercept permission slash commands before forwarding to agent
 				if strings.HasPrefix(input, "/") {
+					if m.shouldForwardBackendControl(input) {
+						m.input.Reset()
+						m.historyIndex = -1
+						return m, m.outboundCmd(eventsource.Outbound{Kind: "control", Control: strings.TrimSpace(input)})
+					}
 					if handled, cmd := m.handlePermissionSlashCommand(input); handled {
 						m.input.Reset()
 						m.historyIndex = -1
@@ -374,7 +412,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 
 				newLine := formatLine("user", input)
 				m.lines = append(m.lines, newLine)
-				m.SubmitCh <- input
+				cmds = append(cmds, m.outboundCmd(eventsource.Outbound{Kind: "submit", Text: input}))
 
 				// Record in history (avoid consecutive duplicates), cap at 100 entries
 				if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != input {
@@ -388,31 +426,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 
 				wrapped := truncateLines(wordwrap.String(newLine, m.termWidth), m.termWidth)
 				cmds = append(cmds, tea.Printf("%s", wrapped))
-				m.status = "处理中..."
+				m.currentPhase = phaseProcessing
+				m.status = m.formatStatusForPhase(phaseProcessing, "")
 				m.input.Reset()
 			}
 		case "ctrl+p":
 			m.openCommandsPalette()
 			return m, nil
 		case "ctrl+r":
-			// Ctrl+R: Start a new session (clear context)
-			newID := m.ClearSession()
-			msg := "已开启新会话"
-			if newID != "" {
-				msg = fmt.Sprintf("已开启新会话 (id: %s)", newID)
-			}
-			line := formatLine("system", msg)
-			m.lines = append(m.lines, line)
-			return m, tea.Sequence(
-				tea.ClearScreen,
-				tea.Printf("%s", line),
-			)
+			// Ctrl+R: Start a new session (clear context) - same as /clear
+			return m, m.clearSessionCmd()
+		case "ctrl+j", "shift+enter":
+			m.insertInputNewline()
+			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
 		m.termWidth = msg.Width
 		m.termHeight = msg.Height
-		m.input.Width = msg.Width - 4 // Leave some margin
+		m.input.SetWidth(msg.Width - 4) // Leave some margin
 		// No ClearScreen – just update dimensions to preserve scrollback
 		return m, nil
 
@@ -451,7 +483,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		// === Optimized rendering logic: compressed display ===
 		if isNewSession {
 			// New session: set phase and print title line only
-			m.currentPhase = phaseThinking
+			m.setAgentStatus(phaseThinking, m.buildThinkingPreview())
 			title := m.thinkingTitle
 			if strings.TrimSpace(title) == "" {
 				title = "正在思考..."
@@ -469,15 +501,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			m.lines = append(m.lines, summary)
 			wrapped := truncateLines(wordwrap.String(summary, m.termWidth), m.termWidth)
 			cmds = append(cmds, tea.Printf("%s", wrapped))
-			m.currentPhase = phaseIdle
 		}
 		// else: streaming update - don't print anything, just update status bar
 
 		// Update status bar
-		if isComplete {
-			m.status = "完成"
-		} else {
-			m.status = "思考中... " + m.buildThinkingPreview()
+		if !isComplete {
+			m.setAgentStatus(phaseThinking, m.buildThinkingPreview())
 		}
 		return m, tea.Batch(cmds...)
 
@@ -486,16 +515,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		if m.isStreaming {
 			cmds = append(cmds, m.flushStreamingBuffer()...)
 		}
-		// Guard: if this is the delayed reset to "等待输入", only apply it when
-		// the status is still "完成" (i.e. user has not submitted a new request).
-		if string(msg) == "等待输入" && m.status != "完成" {
-			return m, tea.Batch(cmds...)
-		}
-		m.status = string(msg)
-		if string(msg) == "完成" {
-			cmds = append(cmds, tea.Tick(time.Second, func(t time.Time) tea.Msg {
-				return StatusUpdate("等待输入")
-			}))
+		switch string(msg) {
+		case "完成":
+			m.setAgentStatus(phaseDone, "")
+		case "等待输入":
+			m.setAgentStatus(phaseIdle, "")
+		default:
+			if !m.isActivePhase() {
+				m.status = string(msg)
+			}
 		}
 		return m, tea.Batch(cmds...)
 
@@ -555,6 +583,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			m.activeToolCalls[msg.ID] = msg.Status
 		}
 
+		// Update status bar to reflect tool execution state
+		switch msg.Status {
+		case "executing":
+			detail := msg.ToolName
+			if len(m.activeToolCalls) > 1 {
+				detail = ""
+			}
+			m.setAgentStatus(phaseToolCall, detail)
+		case "success", "cancelled":
+			if len(m.activeToolCalls) > 0 {
+				m.setAgentStatus(phaseToolCall, "")
+			} else {
+				m.setAgentStatus(phaseProcessing, "")
+			}
+		case "error":
+			m.setAgentStatus(phaseToolCall, msg.ToolName+" 失败")
+		}
+
 	case Message:
 		if msg.Role == "assistant_stream" {
 			// Accumulate streaming chunks; flush only when streaming ends
@@ -575,6 +621,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		m.lines = append(m.lines, newLine)
 		wrapped := truncateLines(wordwrap.String(newLine, m.termWidth), m.termWidth)
 		cmds = append(cmds, tea.Printf("%s", wrapped))
+		if msg.Role == "assistant" || msg.Role == "assistant_stream" {
+			m.setAgentStatus(phaseResponse, "")
+		}
 
 	case ShowConfirmationMsg:
 		m.showingCommands = false // dismiss commands palette so dialog is always visible
@@ -583,7 +632,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		m.confirmationToolInfo = msg.ToolInfo
 		m.confirmationCallback = msg.Callback
 		m.confirmationSelected = 0
+		toolName, _ := msg.ToolInfo["Name"].(string)
+		m.setAgentStatus(phaseAwaitingApproval, toolName)
 		return m, nil
+
+	case TaskCompletionMsg:
+		if m.isStreaming {
+			cmds = append(cmds, m.flushStreamingBuffer()...)
+		}
+		m.currentPhase = phaseDone
+		m.status = m.formatStatusForPhase(phaseDone, "")
+		return m, tea.Batch(cmds...)
 
 	case TokenStatsUpdate: // Handle token stats updates
 		in := formatCount(msg.InputTokens)
@@ -595,16 +654,163 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		}
 		m.tokenStatus = tokens
 		return m, nil
+	case ConnectionStatusMsg:
+		m.connectionState = msg.State
+		m.connectionDetail = msg.Detail
+		return m, nil
+	case NoticeMsg:
+		line := formatLine("system", string(msg))
+		m.notice = string(msg)
+		m.lines = append(m.lines, line)
+		return m, tea.Printf("%s", line)
+	case MailboxMsg:
+		m.swarmLine = fmt.Sprintf("📬 %s → %s [%s] %s", msg.From, msg.To, msg.Kind, msg.Preview)
+		return m, nil
+	case IdleNotifyMsg:
+		m.swarmLine = fmt.Sprintf("💤 %s: %s", msg.Agent, msg.Summary)
+		return m, nil
+	case SpawnTeammateMsg:
+		m.swarmLine = fmt.Sprintf("🧑‍💻 %s spawned for %s (%s)", msg.Agent, msg.Topic, msg.SessionID)
+		return m, nil
 	}
 
 	// Update input
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	m.adjustInputHeight()
 	if cmd != nil {
 		cmds = append(cmds, cmd)
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) outboundCmd(o eventsource.Outbound) tea.Cmd {
+	if m.outbound != nil {
+		send := m.outbound
+		return func() tea.Msg {
+			_ = send(o)
+			return nil
+		}
+	}
+	switch o.Kind {
+	case "submit":
+		if m.SubmitCh != nil {
+			return func() tea.Msg {
+				m.SubmitCh <- o.Text
+				return nil
+			}
+		}
+	case "cancel":
+		if m.CancelCh != nil {
+			return func() tea.Msg {
+				select {
+				case m.CancelCh <- struct{}{}:
+				default:
+				}
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Model) insertInputNewline() {
+	m.input.SetValue(m.input.Value() + "\n")
+	m.input.CursorEnd()
+	m.adjustInputHeight()
+}
+
+func (m *Model) adjustInputHeight() {
+	n := m.input.LineCount()
+	if n < 1 {
+		n = 1
+	}
+	if n > maxInputHeight {
+		n = maxInputHeight
+	}
+	if m.input.Height() != n {
+		m.input.SetHeight(n)
+	}
+}
+
+func (m *Model) clearSessionCmd() tea.Cmd {
+	newID := m.ClearSession()
+	msg := "已开启新会话"
+	if newID != "" {
+		msg = fmt.Sprintf("已开启新会话 (id: %s)", newID)
+	}
+	line := formatLine("system", msg)
+	m.lines = append(m.lines, line)
+
+	cmds := []tea.Cmd{
+		tea.ClearScreen,
+		tea.Printf("%s", line),
+	}
+	if m.outbound != nil {
+		cmds = append(cmds, m.outboundCmd(eventsource.Outbound{Kind: "control", Control: "/clear"}))
+	}
+	return tea.Sequence(cmds...)
+}
+
+func (m *Model) shouldForwardBackendControl(input string) bool {
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "/reset", "/sessions", "/cancel":
+		return m.outbound != nil
+	default:
+		return false
+	}
+}
+
+func (m *Model) setAgentStatus(phase displayPhase, detail string) {
+	if (phase == phaseIdle || phase == phaseDone) && m.isActivePhase() {
+		return
+	}
+	m.currentPhase = phase
+	m.status = m.formatStatusForPhase(phase, detail)
+}
+
+func (m *Model) formatStatusForPhase(phase displayPhase, detail string) string {
+	switch phase {
+	case phaseIdle:
+		return "等待输入"
+	case phaseProcessing:
+		return "处理中..."
+	case phaseThinking:
+		if detail != "" {
+			return "思考中... " + detail
+		}
+		return "思考中..."
+	case phaseToolCall:
+		n := len(m.activeToolCalls)
+		if n <= 1 {
+			if detail != "" {
+				return "工具执行中: " + detail
+			}
+			return "工具执行中..."
+		}
+		return fmt.Sprintf("工具执行中 (%d 个并行)", n)
+	case phaseAwaitingApproval:
+		if detail != "" {
+			return "等待用户确认: " + detail
+		}
+		return "等待用户确认"
+	case phaseResponse:
+		return "正在回复..."
+	case phaseDone:
+		return "✅ 完成"
+	default:
+		return ""
+	}
+}
+
+func (m *Model) isActivePhase() bool {
+	switch m.currentPhase {
+	case phaseThinking, phaseToolCall, phaseAwaitingApproval:
+		return true
+	default:
+		return false
+	}
 }
 
 // buildConfirmationCmd captures the current confirmation state and returns a
@@ -657,11 +863,21 @@ func (m *Model) flushStreamingBuffer() []tea.Cmd {
 		return nil
 	}
 	content := m.streamingBuf.String()
+	width := m.termWidth
+	if width < minMarkdownRenderWidth {
+		width = defaultMarkdownRenderWidth
+	}
+	if rendered, err := uirender.Markdown(content, uirender.MarkdownOptions{Width: width}); err == nil {
+		content = rendered
+	} else {
+		logger.Warnf("markdown render failed: %v", err)
+	}
 	m.streamingBuf.Reset()
 	m.isStreaming = false
 
 	newLine := formatLine("assistant_stream", content)
 	m.lines = append(m.lines, newLine)
+	m.setAgentStatus(phaseResponse, "")
 	wrapped := truncateLines(wordwrap.String(newLine, m.termWidth), m.termWidth)
 	return []tea.Cmd{tea.Printf("%s", wrapped)}
 }
@@ -687,12 +903,9 @@ func (m *Model) View() string { //nolint:revive
 }
 
 // renderInputSection renders the input and status section.
-// It always outputs exactly 5 lines to keep the Bubble Tea renderer's
-// linesRendered count stable; an unstable count causes CursorUp to
-// over- or under-shoot and leaves ghost copies of the input block.
-// Each line is also capped at m.termWidth columns so that wide characters
-// or long help text never trigger terminal auto-wrapping, which would
-// inflate the physical line count beyond what the renderer expects.
+// It outputs a dynamic number of input rows for the textarea while keeping
+// non-input lines capped at m.termWidth columns so that wide characters or
+// long help text never trigger terminal auto-wrapping.
 func (m *Model) renderInputSection(b *strings.Builder) {
 	// Line 1: separator — cap at termWidth so it never auto-wraps on very
 	// narrow terminals (termWidth < 5 would otherwise overflow the 5-rune
@@ -728,11 +941,17 @@ func (m *Model) renderInputSection(b *strings.Builder) {
 	}
 	b.WriteString(statusWithPerm + "\n")
 
-	// Line 3: token status (always rendered)
+	// Line 3: token status / connection status (always rendered)
 	tokenStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorStatus))
 	tokenText := m.tokenStatus
 	if tokenText == "" {
 		tokenText = "---"
+	}
+	if m.connectionState != "" {
+		tokenText += " | ● " + m.connectionState
+		if m.connectionDetail != "" {
+			tokenText += " " + m.connectionDetail
+		}
 	}
 	tokenLine := tokenStyle.Render("[令牌] " + tokenText)
 	if m.termWidth > 0 && lipgloss.Width(tokenLine) > m.termWidth {
@@ -743,7 +962,16 @@ func (m *Model) renderInputSection(b *strings.Builder) {
 
 	// Line 4: input prompt
 	inputStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorUser))
-	b.WriteString(inputStyle.Render("💬 ") + m.input.View() + "\n")
+	prefix := inputStyle.Render("💬 ")
+	inputView := m.input.View()
+	inputLines := strings.Split(inputView, "\n")
+	for i, line := range inputLines {
+		if i == 0 {
+			b.WriteString(prefix + line + "\n")
+			continue
+		}
+		b.WriteString("   " + line + "\n")
+	}
 
 	// Line 5: help text (width-adaptive to prevent terminal auto-wrapping)
 	helpStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
@@ -756,15 +984,15 @@ func (m *Model) renderInputSection(b *strings.Builder) {
 // renderer's line count to differ from actual displayed lines, leading to
 // duplicate View output in non-AltScreen (inline) mode.
 func (m *Model) buildHelpText() string {
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
 	if m.termWidth <= 0 || lipgloss.Width(full) <= m.termWidth {
 		return full
 	}
-	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
+	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全"
 	if lipgloss.Width(short) <= m.termWidth {
 		return short
 	}
-	minimal := "^C退出 | ^Z取消 | ^R新会话 | ^P命令 | Tab补全"
+	minimal := "Enter发送 | ^J换行 | ^R新会话"
 	if lipgloss.Width(minimal) <= m.termWidth {
 		return minimal
 	}
@@ -828,6 +1056,30 @@ type ShowConfirmationMsg struct {
 	Message  string
 	ToolInfo map[string]interface{}
 	Callback func(bool)
+}
+
+type ConnectionStatusMsg struct {
+	State  string
+	Detail string
+}
+
+type NoticeMsg string
+
+type MailboxMsg struct {
+	From, To, Kind, Preview string
+}
+
+type IdleNotifyMsg struct {
+	Agent, Summary string
+}
+
+type SpawnTeammateMsg struct {
+	Agent, Topic, SessionID string
+}
+
+// TaskCompletionMsg signals that the entire agent turn has completed.
+type TaskCompletionMsg struct {
+	Reason string
 }
 
 func formatLine(kind, s string) string {
@@ -1063,17 +1315,7 @@ func (m *Model) handlePermissionSlashCommand(input string) (bool, tea.Cmd) {
 
 	case lower == "/clear", lower == "/new":
 		// /clear or /new: Start a new session (clear context) - equivalent to Ctrl+R
-		newID := m.ClearSession()
-		msg := "已开启新会话"
-		if newID != "" {
-			msg = fmt.Sprintf("已开启新会话 (id: %s)", newID)
-		}
-		line := formatLine("system", msg)
-		m.lines = append(m.lines, line)
-		return true, tea.Sequence(
-			tea.ClearScreen,
-			tea.Printf("%s", line),
-		)
+		return true, m.clearSessionCmd()
 	}
 
 	return false, nil
@@ -1252,6 +1494,9 @@ func (m *Model) hideConfirmation() {
 	m.confirmationToolInfo = nil
 	m.confirmationCallback = nil
 	m.confirmationSelected = 0
+	// After approval/rejection, agent typically resumes work.
+	m.currentPhase = phaseProcessing
+	m.status = m.formatStatusForPhase(phaseProcessing, "")
 }
 
 // renderConfirmationDialog renders the confirmation dialog

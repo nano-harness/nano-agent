@@ -3,6 +3,8 @@ package agent
 import (
 	"sort"
 	"strings"
+
+	"github.com/nano-harness/nano-agent/pkg/logger"
 )
 
 // CacheBoundaryMarker is inserted between cacheable and non-cacheable prompt sections.
@@ -83,6 +85,10 @@ func (pa *PromptAssembler) Build() string {
 
 	cacheableSection := strings.Join(cacheableParts, "\n\n")
 	dynamicSection := strings.Join(dynamicParts, "\n\n")
+
+	// Log prompt assembly stats for observability
+	logger.Debugf("Prompt assembly: %d cacheable components (%d chars), %d dynamic components (%d chars)",
+		len(cacheable), len(cacheableSection), len(dynamic), len(dynamicSection))
 
 	switch {
 	case cacheableSection == "" && dynamicSection == "":

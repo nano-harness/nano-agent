@@ -178,12 +178,18 @@ func (s *AgentTestSuite) runAgentInternal(prompt string, images []llm.Multimodal
 	ctx := context.Background()
 	sessionID := fmt.Sprintf("test_session_%d", time.Now().UnixNano())
 
-	var events []event.StreamEvent
+	var (
+		events   []event.StreamEvent
+		eventsMu sync.Mutex
+	)
 	onEvent := func(ev event.StreamEvent) {
 		s.eventMu.Lock()
 		s.Events = append(s.Events, ev)
 		s.eventMu.Unlock()
+
+		eventsMu.Lock()
 		events = append(events, ev)
+		eventsMu.Unlock()
 	}
 
 	if images != nil {

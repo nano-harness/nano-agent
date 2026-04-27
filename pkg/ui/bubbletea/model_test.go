@@ -1,24 +1,65 @@
 package bubbletea
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	xansi "github.com/charmbracelet/x/ansi"
 )
 
 // newTestModel returns a minimal Model suitable for unit tests.
 func newTestModel(termWidth int) *Model {
-	ti := textinput.New()
-	ti.Placeholder = "输入您的请求..."
-	ti.Focus()
-	ti.Width = 50
+	ta := textarea.New()
+	ta.Placeholder = "输入您的请求..."
+	ta.Focus()
+	ta.SetWidth(50)
+	ta.SetHeight(1)
+	ta.ShowLineNumbers = false
+	ta.Prompt = ""
+	ta.KeyMap.InsertNewline.SetEnabled(false)
 	return &Model{
-		status:    "等待输入",
-		termWidth: termWidth,
-		input:     ti,
+		status:          "等待输入",
+		termWidth:       termWidth,
+		input:           ta,
+		historyIndex:    -1,
+		activeToolCalls: make(map[string]string),
+		currentPhase:    phaseIdle,
+	}
+}
+
+// runTeaCmd recursively executes Bubble Tea commands so tests can observe
+// side effects from batched or sequenced command chains.
+func runTeaCmd(t *testing.T, cmd tea.Cmd) {
+	t.Helper()
+	if cmd == nil {
+		return
+	}
+	msg := cmd()
+	switch msg := msg.(type) {
+	case nil:
+		return
+	case tea.BatchMsg:
+		for _, c := range msg {
+			runTeaCmd(t, c)
+		}
+	default:
+		// tea.Sequence returns an unexported slice type (sequenceMsg), so tests
+		// use reflection to recurse through that command chain as well.
+		v := reflect.ValueOf(msg)
+		if v.Kind() != reflect.Slice {
+			return
+		}
+		for i := 0; i < v.Len(); i++ {
+			c, ok := v.Index(i).Interface().(tea.Cmd)
+			if !ok {
+				continue
+			}
+			runTeaCmd(t, c)
+		}
 	}
 }
 
@@ -58,7 +99,7 @@ func TestTruncateLines_TruncatesLongLine(t *testing.T) {
 
 func TestBuildHelpText_WideTerminal(t *testing.T) {
 	m := newTestModel(200)
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
 	if got := m.buildHelpText(); got != full {
 		t.Errorf("expected full text for wide terminal, got %q", got)
 	}
@@ -66,7 +107,7 @@ func TestBuildHelpText_WideTerminal(t *testing.T) {
 
 func TestBuildHelpText_NoTermWidth(t *testing.T) {
 	m := newTestModel(0)
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
 	if got := m.buildHelpText(); got != full {
 		t.Errorf("expected full text when termWidth=0, got %q", got)
 	}
@@ -83,8 +124,8 @@ func TestBuildHelpText_NarrowFallsBack(t *testing.T) {
 }
 
 func TestBuildHelpText_ShortVariant(t *testing.T) {
-	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
-	full := "Ctrl+C 退出 | Ctrl+Z 取消任务 | Ctrl+R 新会话 | Ctrl+P 命令列表 | Tab 补全 | ↑↓ 历史"
+	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全"
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
 	// Choose a width that fits short but not full.
 	width := xansi.StringWidth(short)
 	if xansi.StringWidth(full) <= width {
@@ -102,8 +143,8 @@ func TestBuildHelpText_ShortVariant(t *testing.T) {
 }
 
 func TestBuildHelpText_MinimalVariant(t *testing.T) {
-	minimal := "^C退出 | ^Z取消 | ^R新会话 | ^P命令 | Tab补全"
-	short := "Ctrl+C 退出 | Ctrl+Z 取消 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全 | ↑↓ 历史"
+	minimal := "Enter发送 | ^J换行 | ^R新会话"
+	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 新会话 | Ctrl+P 命令 | Tab 补全"
 	// Choose a width that fits minimal but not short.
 	width := xansi.StringWidth(minimal)
 	if xansi.StringWidth(short) <= width {
@@ -281,6 +322,128 @@ func TestQKeyDoesNotQuit(t *testing.T) {
 	}
 }
 
+func TestCtrlJInsertsNewline(t *testing.T) {
+	m := newTestModel(80)
+	m.input.SetValue("hello")
+
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	if cmd != nil {
+		t.Fatalf("Ctrl+J should not submit or produce a command, got %v", cmd)
+	}
+	updatedModel := newModel.(*Model)
+	if got := updatedModel.input.Value(); got != "hello\n" {
+		t.Fatalf("expected Ctrl+J to append newline, got %q", got)
+	}
+	if got := updatedModel.input.Height(); got != 2 {
+		t.Fatalf("expected textarea height to grow to 2, got %d", got)
+	}
+}
+
+func TestBackslashEnterInsertsNewline(t *testing.T) {
+	m := newTestModel(80)
+	var outbound []eventsource.Outbound
+	m.BindOutbound(func(o eventsource.Outbound) error {
+		outbound = append(outbound, o)
+		return nil
+	})
+	m.input.SetValue("hello\\")
+
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	runTeaCmd(t, cmd)
+
+	updatedModel := newModel.(*Model)
+	if got := updatedModel.input.Value(); got != "hello\n" {
+		t.Fatalf("expected trailing backslash Enter to insert newline, got %q", got)
+	}
+	if len(outbound) != 0 {
+		t.Fatalf("expected no outbound submit for line continuation, got %+v", outbound)
+	}
+}
+
+func TestEnterSubmits(t *testing.T) {
+	m := newTestModel(80)
+	var outbound []eventsource.Outbound
+	m.BindOutbound(func(o eventsource.Outbound) error {
+		outbound = append(outbound, o)
+		return nil
+	})
+	m.input.SetValue("hi")
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	runTeaCmd(t, cmd)
+
+	if len(outbound) != 1 {
+		t.Fatalf("expected one outbound submit, got %+v", outbound)
+	}
+	if outbound[0].Kind != "submit" || outbound[0].Text != "hi" {
+		t.Fatalf("expected submit outbound with text hi, got %+v", outbound[0])
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("expected input reset after submit, got %q", got)
+	}
+}
+
+func TestCtrlRClearsAndPrintsFeedback(t *testing.T) {
+	m := newTestModel(80)
+	m.status = "处理中..."
+	m.lines = []string{"old"}
+	m.input.SetValue("draft")
+	m.newSessionHandler = func() string { return "session_test" }
+
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	if cmd == nil {
+		t.Fatal("expected Ctrl+R to return clear/print command")
+	}
+	updatedModel := newModel.(*Model)
+	if len(updatedModel.lines) == 0 {
+		t.Fatal("expected Ctrl+R to append feedback line")
+	}
+	last := updatedModel.lines[len(updatedModel.lines)-1]
+	if !strings.Contains(last, "已开启新会话 (id: session_test)") {
+		t.Fatalf("expected new-session feedback, got %q", last)
+	}
+	if updatedModel.status != "等待输入" {
+		t.Fatalf("expected status reset to 等待输入, got %q", updatedModel.status)
+	}
+	if got := updatedModel.input.Value(); got != "" {
+		t.Fatalf("expected input reset, got %q", got)
+	}
+}
+
+func TestUpDownArrowOnlyBrowsesHistoryAtBoundary(t *testing.T) {
+	m := newTestModel(80)
+	m.inputHistory = []string{"previous"}
+	m.input.SetValue("line1\nline2\nline3")
+	m.input.CursorUp()
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updatedModel := newModel.(*Model)
+	if got := updatedModel.input.Value(); got != "line1\nline2\nline3" {
+		t.Fatalf("up from middle line should move cursor, not browse history; got %q", got)
+	}
+	if updatedModel.historyIndex != -1 {
+		t.Fatalf("expected history browsing to remain inactive, got index %d", updatedModel.historyIndex)
+	}
+
+	updatedModel.input.CursorEnd()
+	newModel, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updatedModel = newModel.(*Model)
+	if got := updatedModel.input.Value(); got != "line1\nline2\nline3" {
+		t.Fatalf("down before last line should move cursor, not browse history; got %q", got)
+	}
+	if updatedModel.historyIndex != -1 {
+		t.Fatalf("expected history browsing to remain inactive, got index %d", updatedModel.historyIndex)
+	}
+
+	updatedModel.input.CursorUp()
+	updatedModel.input.CursorUp()
+	newModel, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updatedModel = newModel.(*Model)
+	if got := updatedModel.input.Value(); got != "previous" {
+		t.Fatalf("up on first line should browse history, got %q", got)
+	}
+}
+
 // TestCtrlCStillQuits verifies that Ctrl+C still triggers quit
 // even after removing 'q' from the quit keys.
 func TestCtrlCStillQuits(t *testing.T) {
@@ -300,5 +463,157 @@ func TestCtrlCStillQuits(t *testing.T) {
 	result := cmd()
 	if _, isQuit := result.(tea.QuitMsg); !isQuit {
 		t.Error("Ctrl+C should return a QuitMsg")
+	}
+}
+
+// --- status state machine tests ---
+
+func TestRenderInputSectionMultilineAtLeastFixedLineCount(t *testing.T) {
+	m := newTestModel(80)
+	m.input.SetValue("line 1\nline 2\nline 3")
+	m.adjustInputHeight() // sync height after direct SetValue
+
+	var b strings.Builder
+	m.renderInputSection(&b)
+	output := b.String()
+
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	if len(lines) < 5 {
+		t.Errorf("expected at least 5 lines, got %d:\n%s", len(lines), output)
+	}
+	for _, want := range []string{"line 1", "line 2", "line 3"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("expected rendered multiline input to contain %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestToolUseMsgUpdatesStatusToToolExecuting(t *testing.T) {
+	m := newTestModel(80)
+
+	_, _ = m.Update(ToolUseMsg{ID: "1", ToolName: "read_file", Status: "executing"})
+
+	if got := m.status; got != "工具执行中: read_file" {
+		t.Fatalf("expected tool executing status, got %q", got)
+	}
+	if m.currentPhase != phaseToolCall {
+		t.Fatalf("expected phaseToolCall, got %v", m.currentPhase)
+	}
+}
+
+func TestToolUseMsgMultipleParallelShowsCount(t *testing.T) {
+	m := newTestModel(80)
+
+	_, _ = m.Update(ToolUseMsg{ID: "1", ToolName: "read_file", Status: "executing"})
+	_, _ = m.Update(ToolUseMsg{ID: "2", ToolName: "write_file", Status: "executing"})
+
+	if got := m.status; got != "工具执行中 (2 个并行)" {
+		t.Fatalf("expected parallel tool count status, got %q", got)
+	}
+}
+
+func TestToolUseMsgSuccessTransitsBackToProcessing(t *testing.T) {
+	m := newTestModel(80)
+	_, _ = m.Update(ToolUseMsg{ID: "1", ToolName: "read_file", Status: "executing"})
+
+	_, _ = m.Update(ToolUseMsg{ID: "1", ToolName: "read_file", Status: "success", Result: "ok"})
+
+	if got := m.status; got != "处理中..." {
+		t.Fatalf("expected processing after final tool success, got %q", got)
+	}
+	if m.currentPhase != phaseProcessing {
+		t.Fatalf("expected phaseProcessing, got %v", m.currentPhase)
+	}
+}
+
+func TestStatusUpdateDoneDoesNotDowngradeToolPhase(t *testing.T) {
+	m := newTestModel(80)
+	_, _ = m.Update(ToolUseMsg{ID: "1", ToolName: "read_file", Status: "executing"})
+
+	_, _ = m.Update(StatusUpdate("完成"))
+
+	if got := m.status; got != "工具执行中: read_file" {
+		t.Fatalf("expected stale Done to be ignored during tool execution, got %q", got)
+	}
+	if m.currentPhase != phaseToolCall {
+		t.Fatalf("expected phaseToolCall, got %v", m.currentPhase)
+	}
+}
+
+func TestShowConfirmationSetsAwaitingApproval(t *testing.T) {
+	m := newTestModel(80)
+
+	_, _ = m.Update(ShowConfirmationMsg{ToolInfo: map[string]interface{}{"Name": "write_file"}})
+
+	if got := m.status; got != "等待用户确认: write_file" {
+		t.Fatalf("expected awaiting approval status, got %q", got)
+	}
+	if m.currentPhase != phaseAwaitingApproval {
+		t.Fatalf("expected phaseAwaitingApproval, got %v", m.currentPhase)
+	}
+}
+
+func TestHideConfirmationResumesProcessing(t *testing.T) {
+	m := newTestModel(80)
+	_, _ = m.Update(ShowConfirmationMsg{ToolInfo: map[string]interface{}{"Name": "write_file"}})
+
+	m.hideConfirmation()
+
+	if got := m.status; got != "处理中..." {
+		t.Fatalf("expected processing status after hiding confirmation, got %q", got)
+	}
+	if m.currentPhase != phaseProcessing {
+		t.Fatalf("expected phaseProcessing, got %v", m.currentPhase)
+	}
+}
+
+func TestTaskCompletionMsgForcesPhaseDone(t *testing.T) {
+	m := newTestModel(80)
+	_, _ = m.Update(ToolUseMsg{ID: "1", ToolName: "read_file", Status: "executing"})
+
+	_, _ = m.Update(TaskCompletionMsg{Reason: "done"})
+
+	if got := m.status; got != "✅ 完成" {
+		t.Fatalf("expected done status, got %q", got)
+	}
+	if m.currentPhase != phaseDone {
+		t.Fatalf("expected phaseDone, got %v", m.currentPhase)
+	}
+}
+
+func TestSubmitForcesProcessingEvenWhenInToolPhase(t *testing.T) {
+	m := newTestModel(80)
+	var outbound []eventsource.Outbound
+	m.BindOutbound(func(o eventsource.Outbound) error {
+		outbound = append(outbound, o)
+		return nil
+	})
+	m.currentPhase = phaseToolCall
+	m.status = "工具执行中: read_file"
+	m.activeToolCalls["1"] = "executing"
+	m.input.SetValue("next question")
+
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if got := m.status; got != "处理中..." {
+		t.Fatalf("expected submit to force processing, got %q", got)
+	}
+	if m.currentPhase != phaseProcessing {
+		t.Fatalf("expected phaseProcessing, got %v", m.currentPhase)
+	}
+}
+
+func TestStatusNoLongerTicksBackToIdleAfterDone(t *testing.T) {
+	m := newTestModel(80)
+
+	_, cmd := m.Update(StatusUpdate("完成"))
+
+	if got := m.status; got != "✅ 完成" {
+		t.Fatalf("expected done status, got %q", got)
+	}
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			t.Fatalf("expected no delayed idle tick command, got %#v", msg)
+		}
 	}
 }

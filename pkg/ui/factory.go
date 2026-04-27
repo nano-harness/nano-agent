@@ -12,6 +12,8 @@ import (
 type Config struct {
 	APIBaseURL string
 	WorkingDir string
+	// ShowBanner controls whether to play the animated banner on TUI startup. Default true.
+	ShowBanner bool
 }
 
 // Factory creates UI adapters.
@@ -40,13 +42,10 @@ func (f *Factory) Create(mode Mode) (Adapter, error) {
 // ─── Bubble Tea adapter ──────────────────────────────────────────────────────
 
 func (f *Factory) newBubbleTeaAdapter() *BubbleTeaAdapter {
-	submitCh := make(chan string, 1)
-	cancelCh := make(chan struct{}, 1)
 	return &BubbleTeaAdapter{
-		model:    bubbletea.New(submitCh, cancelCh, f.cfg.APIBaseURL, f.cfg.WorkingDir),
-		submitCh: submitCh,
-		cancelCh: cancelCh,
-		sendCh:   make(chan tea.Msg, 256),
+		model:      bubbletea.New(nil, nil, f.cfg.APIBaseURL, f.cfg.WorkingDir),
+		sendCh:     make(chan tea.Msg, 256),
+		showBanner: f.cfg.ShowBanner,
 	}
 }
 

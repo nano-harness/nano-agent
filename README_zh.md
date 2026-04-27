@@ -8,6 +8,7 @@
 
 - **多种运行模式**: TUI交互模式、Bubble Tea TUI 模式、Daemon后台服务模式、Client客户端模式和一次性 Binary 模式
 - **专家系统**: 通过`@expert-name`语法调用专门的子代理,包括内置的`@investigator`（只读代码探索）、`@help`（CLI帮助）和`@generalist`（通用代理）。支持通过YAML前置元数据在Markdown文件中定义自定义专家
+- **多代理邮箱**: 通过Mailbox抽象实现父子代理之间的异步消息传递，在基于fork的并行执行期间实现结构化通信，支持内存和文件后端
 - **后台任务管理**: 支持在后台运行长时间运行的Shell命令，具有实时输出流、任务监控和优雅关闭功能
 - **基于回合的架构**: 通过智能工作流选择消除简单查询的过度规划
 - **动态规划系统**: 实时待办事项列表生成和自适应执行
@@ -28,10 +29,19 @@
 - **工作区与Git工具**: 集成工作区管理器、Git操作、OSS存储和工程工具
 - **中间件链**: 可插拔的安全、审计、指标和弹性中间件用于工具执行
 - **事件系统**: 结构化事件调度、监控和验证，支持可观测性
-- **安全特性**: 命令验证、文件大小限制、路径验证和备份支持
-- **增强的TUI界面**: 默认使用`tview`构建的仪表盘；也可选择非 Alt Screen 的 Bubble Tea TUI（实验性），提供贴近 Claude Code 的样式与配色
+- **安全特性**: 命令验证、基于工作目录的自动免确认、文件大小限制、路径验证和备份支持
+- **增强的TUI界面**: 默认使用`tview`构建的仪表盘，带有动画横幅；也可选择非 Alt Screen 的 Bubble Tea TUI（实验性），提供贴近 Claude Code 的样式与配色，以及 Standard Figlet 细线 ASCII 艺术横幅
 - **跨平台支持**: Linux、macOS和Windows的原生构建
 - **开发工具**: 具有测试、代码检查和发布自动化的综合构建系统
+
+
+## 权限自动免确认
+
+nano-agent 会对 agent 工作目录内的只读 shell 命令（`grep`、`rg`、`ls`、`find` 等）和文件编辑工具（`write_file`、`edit_file`、`delete_file`）自动免确认。路径位于工作目录之外时仍会要求确认。详见 [权限自动免确认](./docs/PERMISSION_AUTO_APPROVAL.md)。
+
+## Web 客户端集成
+
+Daemon 集成请以 `docs/DAEMON_API.md` 为准。交互式 CLI 渲染统一经过 EventSource 层：`nano chat` 与 `nano lead-chat` 默认使用 BubbleTea，`--ui tview` 可切换到 tview 后端。自动化脚本请使用 `nano daemon execute --json "command"`，不要解析 TUI 输出。
 
 ## 🚀 快速开始
 
@@ -116,7 +126,6 @@ export NANO_API_KEY="your-llm-api-key"
 - `NANO_FILE_DIFF_MAX_LINES`: 文件差异显示的最大行数
 - `NANO_GIT_MAX_LOG_ENTRIES`: 最大git日志条目数
 - `NANO_MEMORY_MAX_ENTRIES`: 最大持久内存条目数
-- `NANO_LIST_DIRECTORY_MAX_DEPTH`: list_directory的最大深度
 - `SERPER_API_KEY`: Serper网络搜索的API密钥
 - `TAVILY_API_KEY`: Tavily网络搜索的API密钥
 
@@ -566,9 +575,8 @@ curl http://localhost:8080/api/v1/stats
 
 ### 工具模块
 
-- **文件系统** (`pkg/tools/filesystem/`): 文件操作(读取、写入、编辑、列表、目录管理)
-- **搜索** (`pkg/tools/search/`): 使用glob模式、正则表达式和zoekt索引搜索的代码搜索
-- **系统** (`pkg/tools/system/`): 带有安全控制和验证的Shell命令执行
+- **文件系统** (`pkg/tools/filesystem/`): 文件操作(读取、写入、编辑、删除和代码骨架)
+- **系统** (`pkg/tools/system/`): 带有安全控制和验证的Shell命令执行，并通过 CLI 命令完成文件查找/搜索
 - **Web** (`pkg/tools/web/`): Web获取、搜索功能和API集成
 - **内存** (`pkg/memory/`): 上下文管理、存储和语义搜索
 - **MCP工具** (`pkg/tools/mcp/`): 模型上下文协议工具集成和管理

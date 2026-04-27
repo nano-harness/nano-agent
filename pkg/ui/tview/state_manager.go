@@ -58,7 +58,9 @@ type StateManager struct {
 	animationFrame  int
 	animationTicker *time.Ticker
 	updateCallback  func(UIState)
+	callbackMu      sync.Mutex
 	quit            chan struct{}
+	stopOnce        sync.Once
 }
 
 // NewStateManager creates a new state manager
@@ -127,7 +129,7 @@ func (sm *StateManager) TransitionTo(newState AgentState, activity string, conte
 	sm.mu.Unlock()
 
 	if cb != nil {
-		cb(stateCopy)
+		sm.invokeCallback(cb, stateCopy)
 	}
 }
 
@@ -143,7 +145,7 @@ func (sm *StateManager) UpdateTokenStats(stats *event.TokenStats) {
 	sm.mu.Unlock()
 
 	if cb != nil {
-		cb(stateCopy)
+		sm.invokeCallback(cb, stateCopy)
 	}
 }
 
@@ -309,7 +311,7 @@ func (sm *StateManager) startAnimation() {
 				sm.mu.Unlock()
 
 				if isAnimated && cb != nil {
-					cb(stateCopy)
+					sm.invokeCallback(cb, stateCopy)
 				}
 			case <-sm.quit:
 				return
@@ -320,21 +322,23 @@ func (sm *StateManager) startAnimation() {
 
 // Stop stops the state manager and cleans up resources
 func (sm *StateManager) Stop() {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	if sm.animationTicker != nil {
-		sm.animationTicker.Stop()
-		sm.animationTicker = nil
-	}
-
-	// Signal the animation goroutine to exit
-	select {
-	case <-sm.quit:
-		// Already closed
-	default:
+	sm.stopOnce.Do(func() {
 		close(sm.quit)
-	}
+		sm.mu.Lock()
+		ticker := sm.animationTicker
+		sm.mu.Unlock()
+		if ticker != nil {
+			ticker.Stop()
+		}
+	})
+}
+
+func (sm *StateManager) invokeCallback(cb func(UIState), state UIState) {
+	// Serialize callbacks because they update tview primitives. Callbacks must
+	// not call back into StateManager while running.
+	sm.callbackMu.Lock()
+	defer sm.callbackMu.Unlock()
+	cb(state)
 }
 
 // addTransitionLog adds a transition to the log (internal, assumes lock held)

@@ -1,922 +1,292 @@
-# Nano Agent Daemon API 文档
-
-## 概述
-
-Nano Agent Daemon 提供了一个 RESTful API 和 WebSocket 接口，用于与 nano agent 进行交互。daemon 运行在后台，提供持久化的服务接口。
-
-## 基础信息
-
-- 基础URL: `http://{host}:{port}/api/v1`
-- 默认端口: 8080
-- 默认主机: 127.0.0.1
-- 认证方式: API Key (可选)
-- 内容类型: application/json
-
-## 认证
-
-如果配置了 API Key，除公开端点外均需要携带凭证：
-```
-X-API-Key: your-api-key
-```
-或：
-```
-Authorization: Bearer your-api-key
-```
-
-## API 端点
-
-### 1. 健康检查
-
-#### GET /health
-
-检查 daemon 服务的健康状态。
-
-**响应示例**:
-```json
-{
-  "status": "healthy"
-}
-```
-
-**响应字段**:
-- `status`: 服务状态（"healthy"）
-
-#### GET /health（v1）
-
-同上，也可通过 v1 路径访问：
-
-- `GET /api/v1/health`
-
-### 2. 服务状态
-
-#### GET /status
-
-获取 agent 的详细状态信息。
-
-**响应示例**:
-```json
-{
-  "agent_status": "running",
-  "mcp_enabled": true,
-  "memory_size": 0,
-  "active_tools": 15
-}
-```
-
-**响应字段**:
-- `agent_status`: Agent 状态
-- `mcp_enabled`: MCP 是否启用
-- `memory_size`: 内存使用大小
-- `active_tools`: 活跃工具数量
-
-### 3. 执行命令
-
-执行入口已统一为 `POST /sessions/{id}/execute`（见第 4 节）。旧的 `POST /execute` 已移除，不再兼容 task 语义。
-
-### 4. 会话执行（HTTP）
-
-#### POST /sessions/{id}/execute
-
-在指定 session 内执行一条命令。支持两种模式：
-- 同步模式（默认）：阻塞等待完成并返回聚合结果
-- 异步模式：仅启动执行并立即返回（用于后台执行），结果通过 WebSocket 流式获取
-
-**请求体**:
-```json
-{
-  "command": "生成一份项目审计报告并保存到文件",
-  "timeout": 3600,
-  "include_steps": false,
-  "async": false
-}
-```
-
-**请求字段**:
-- `command`: 要执行的命令（必需）
-- `timeout`: 超时时间（秒，可选，默认 3600，最大 86400）
-- `include_steps`: 是否在 HTTP 响应中附带 steps（仅同步模式有效）
-- `async`: 是否异步启动（true=后台执行；false=同步等待）
-- `images`: 多模态图片数组（可选），结构与 WebSocket 一致
-
-**响应示例（异步）**:
-```json
-{
-  "success": true,
-  "session_id": "sess_1234567890abcdef",
-  "message": "Session execution started",
-  "status": "running"
-}
-```
-
-**响应示例（同步）**:
-```json
-{
-  "success": true,
-  "session_id": "sess_1234567890abcdef",
-  "status": "completed",
-  "completed": true,
-  "result": "（聚合输出）",
-  "token_stats": { "input_tokens": 1, "output_tokens": 2, "total_tokens": 3 }
-}
-```
-
-### 5. 流式执行 (WebSocket)
-
-#### GET /stream
-
-通过 WebSocket 进行流式命令执行。
-
-**连接信息**:
-- WebSocket URL: `ws://localhost:8080/api/v1/stream`
-- 认证方式:
-  - URL参数: `?api_key=your-api-key`（也支持 `apikey` / `apiKey` / `key`）
-  - 或请求头: `X-API-Key: your-api-key` 或 `Authorization: Bearer your-api-key` 或 `Authorization: ApiKey your-api-key`
-
-**输入格式**:
-
-客户端发送给服务器的消息格式为JSON对象：
-
-**基础命令格式**:
-```json
-{
-  "command": "要执行的命令",
-  "session_id": "sess_1234567890abcdef",
-  "timeout": 30
-}
-```
-
-**订阅/断线续传（推荐用于长任务）**:
-
-当客户端断线重连或需要“只订阅执行轨迹”时，可发送 `type=subscribe`。服务端会先下发 `session_start`（包含 `last_seq`），再发送快照（Planner/Executor/Worker 当前态），最后回放 `since_seq` 之后的增量事件并进入实时流。
-
-```json
-{
-  "type": "subscribe",
-  "session_id": "sess_1234567890abcdef",
-  "run_id": "run_abcdef1234",
-  "since_seq": 120,
-  "streams": ["planner", "executor", "worker", "tool", "content"]
-}
-```
-
-字段说明：
-- `run_id`：可选；用于校验订阅的执行实例（不匹配会返回 warning error）。
-- `since_seq`：可选；客户端已接收的最后一个事件序号，服务端将补发更大的 `seq`。
-- `streams`：可选；事件分流过滤。支持：`planner`、`executor`、`worker`、`tool`、`content`。不传表示不过滤。
-
-**多模态命令格式（支持图片）**:
-```json
-{
-  "command": "分析这张图片",
-  "session_id": "sess_1234567890abcdef",
-  "timeout": 30,
-  "images": [
-    {
-      "url": "https://example.com/image.jpg",
-      "mime_type": "image/jpeg"
-    },
-    {
-      "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-      "mime_type": "image/png"
-    }
-  ]
-}
-```
-
-**字段说明**:
-- `command`: 字符串，要执行的命令内容（必需）
-- `session_id`: 字符串，会话 ID（可选）。同一连接内不传时会使用连接级隔离 session_id
-- `timeout`: 数字，命令执行的超时时间，单位为秒（可选）
-- `images`: 数组，多模态图片数据（可选），支持以下格式：
-  - `url`: 图片URL地址（与base64二选一）
-  - `base64`: 图片的base64编码数据（与url二选一）
-  - `mime_type`: 图片MIME类型（必需），支持 `image/jpeg`, `image/png`, `image/webp`, `image/gif`
-
-**输出格式**:
-
-服务器在执行过程中会发送以下类型的消息：
-
-1. **会话开始消息**（首先发送，用于确认已开始/已附着）：
-
-```json
-{
-  "type": "session_start",
-  "session_id": "sess_1234567890abcdef",
-  "run_id": "run_abcdef1234",
-  "command": "创建一个简单的Python脚本",
-  "status": "running",
-  "since_seq": 0,
-  "last_seq": 120
-}
-```
-
-2. **流式事件消息**（执行过程中发送）：
-
-服务器会发送 StreamEvent（完整事件对象）。事件会包含 `session_id` 用于隔离/续聊；不再使用 `task_id`。
-
-3. **完成消息**（始终在最后发送）：
-
-```json
-{
-  "type": "completion",
-  "session_id": "sess_1234567890abcdef",
-  "success": true,
-  "token_stats": {
-    "input_tokens": 123,
-    "output_tokens": 456,
-    "total_tokens": 579,
-    "tokens_per_second": 60.0,
-    "peak_tokens_per_second": 140.0,
-    "request_size_bytes": 2048,
-    "response_size_bytes": 8192,
-    "start_time": 1703123400,
-    "end_time": 1703123405,
-    "duration_ms": 5000,
-    "session_input_tokens": 1000,
-    "session_output_tokens": 800,
-    "session_total_tokens": 1800,
-    "update_count": 5,
-    "is_streaming": false
-  }
-}
-```
-
-**字段说明**：
-- `type`: 消息类型（"session_start", "completion" 或具体的事件类型）
-- `success`: 布尔值，表示执行是否成功（仅在 completion 消息中）
-- `token_stats`: 最终一次的 Token 统计信息。仅在服务器能够统计到 token 信息时返回；若本次执行未产生相关统计，该字段可能为 null 或缺省
-- `session_id`: 会话 ID
-
-说明：WebSocket 渠道不会发送 `token_stats` 事件，但会在最终的 completion 消息中附带最后一次 `token_stats` 聚合结果。
-
-**大消息分片（Chunking）**：
-
-当单条 WebSocket 消息序列化后超过 64KB 时，服务端会自动分片发送。分片消息格式：
-
-```json
-{
-  "id": "20250916083152.123456",
-  "index": 0,
-  "total": 3,
-  "data": "分片数据内容（JSON 字符串片段）",
-  "is_chunk": true,
-  "complete": false
-}
-```
-
-客户端应将同一 `id` 的 `data` 按 `index` 拼接为完整 JSON 字符串后再解析。
-
-1. 事件消息（StreamEvent，对象字段随事件类型不同而不同，例如）：
-```json
-{
-  "type": "stream_content",
-  "session_id": "sess_1234567890abcdef",
-  "content": "流式文本片段"
-}
-```
-
-```json
-{
-  "type": "tool_call",
-  "session_id": "sess_1234567890abcdef",
-  "tool_calls": [
-    { "id": "call_123", "name": "write_to_file", "arguments": "{\"file_path\":\"/tmp/script.py\",\"content\":\"print('Hello, World!')\"}" }
-  ]
-}
-```
-
-```json
-{
-  "type": "tool_result",
-  "session_id": "sess_1234567890abcdef",
-  "tool_result": { "id": "call_123", "content": "文件已成功创建", "error": "" }
-}
-```
-
-```json
-{
-  "type": "error",
-  "session_id": "sess_1234567890abcdef",
-  "error": "错误信息",
-  "severity": "warning"
-}
-```
-
-```json
-{
-  "type": "thinking",
-  "session_id": "sess_1234567890abcdef",
-  "content": "正在分析用户需求与上下文..."
-}
-```
-
-```json
-{
-  "type": "compression",
-  "session_id": "sess_1234567890abcdef",
-  "content": "已压缩历史上下文为若干条关键要点"
-}
-```
-
-
-**事件类型详解**:
-
-- `content`: 主要文本内容（注：WebSocket 渠道中为避免与 `stream_content` 重复，`content` 类型会被过滤，不发送）
-- `stream_content`: 用于实时渲染的流式文本
-- `tool_call`: 工具调用事件。字段：`tool_calls`（数组，元素包含 `id`, `name`, `arguments`（字符串，可能为 JSON 文本））
-- `tool_result`: 工具调用结果事件。字段：`tool_result`（对象，包含 `id`, `content`, `error`）
-- `tool_use`: 工具使用过程事件。字段：`tool_use`（对象，包含 `id`, `tool_name`, `parameters`, `status`, `result?`）
-- `error`: 错误事件（含 `error` 与可选 `severity`）
-- `done`: 完成事件（内部使用）
-- `waiting_for_user`: 等待用户输入事件
-- `todo_list_update` / `todo_update`: 待办事项相关事件
-- `final_summary`: 最终总结
-- `task_start` / `task_progress` / `task_cancel` / `task_completion`: 执行生命周期事件（事件 type 名称保留，但以 session_id 作为主标识）
-- `retry` / `warning` / `debug`: 重试 / 警告 / 调试事件
-- `thinking`: 思考阶段事件，可包含 `content` 或元数据，用于展示 Agent 的推理/规划状态。支持通过 `metadata` 字段区分实时和最终thinking事件：
-  - 实时thinking事件：`metadata.thinking_type = "realtime"`, `metadata.is_streaming = true`
-  - 最终thinking事件：`metadata.thinking_type = "final"`, `metadata.is_complete = true`
-- `compression`: 上下文压缩事件，必须包含 `content` 字段，用于描述压缩摘要或策略变更
-- `token_stats`: Token 用量统计事件（WebSocket 渠道不发送该中间事件）
-- `satisfaction_eval`: 满意度评估等内部事件（WebSocket 渠道不发送）
-
-**被过滤的事件类型（WebSocket）**:
-
-以下事件类型不会发送给 WebSocket 客户端：
-- `token_stats`、`debug`、`satisfaction_eval`
-- `content`（为避免与 `stream_content` 的重复，WebSocket 渠道只发送 `stream_content`）
-
-**使用示例**:
-
-客户端发送命令：
-```json
-{
-  "command": "创建一个简单的Python脚本",
-  "timeout": 30
-}
-```
-
-服务器响应流：
-```json
-{"type":"session_start","session_id":"sess_1234567890abcdef","command":"创建一个简单的Python脚本","status":"running"}
-{"type":"task_start","session_id":"sess_1234567890abcdef","content":"Session started: 创建一个简单的Python脚本"}
-{"type":"thinking","session_id":"sess_1234567890abcdef","content":"用户想要一个简单的Python脚本，我需要分析需求并选择合适的实现方式","metadata":{"thinking_type":"realtime","is_streaming":true}}
-{"type":"stream_content","session_id":"sess_1234567890abcdef","content":"我将为您创建一个简单的Python脚本。"}
-{"type":"tool_call","session_id":"sess_1234567890abcdef","tool_calls":[{"id":"call_123","name":"write_to_file","arguments":"{\"file_path\":\"/tmp/script.py\",\"content\":\"print('Hello, World!')\"}"}]}
-{"type":"tool_result","session_id":"sess_1234567890abcdef","tool_result":{"id":"call_123","content":"文件已成功创建"}}
-{"type":"thinking","session_id":"sess_1234567890abcdef","content":"我已经成功创建了一个打印Hello World的Python脚本，这是一个经典的入门示例，满足了用户的需求","metadata":{"thinking_type":"final","is_complete":true}}
-{"type":"stream_content","session_id":"sess_1234567890abcdef","content":"我已经创建了一个简单的Python脚本，它会打印'Hello, World!'。"}
-{"type":"completion","session_id":"sess_1234567890abcdef","success":true,"status":"completed","session_done":true}
-```
-
-**多模态使用示例（图片分析）**:
-
-客户端发送多模态命令：
-```json
-{
-  "command": "请分析这张图片的内容",
-  "timeout": 60,
-  "images": [
-    {
-      "url": "https://example.com/sample-image.jpg",
-      "mime_type": "image/jpeg"
-    }
-  ]
-}
-```
-
-服务器响应流：
-```json
-{"type":"session_start","session_id":"sess_abcdef1234567890","command":"请分析这张图片的内容","status":"running"}
-{"type":"task_start","session_id":"sess_abcdef1234567890","content":"Session started: 请分析这张图片的内容"}
-{"type":"thinking","session_id":"sess_abcdef1234567890","content":"用户想要分析一张图片，我需要仔细观察图片内容并提供详细描述","metadata":{"thinking_type":"realtime","is_streaming":true}}
-{"type":"stream_content","session_id":"sess_abcdef1234567890","content":"我来为您分析这张图片。"}
-{"type":"stream_content","session_id":"sess_abcdef1234567890","content":"从图片中我可以看到..."}
-{"type":"thinking","session_id":"sess_abcdef1234567890","content":"我已经完成了对图片的分析，提供了详细的描述和见解","metadata":{"thinking_type":"final","is_complete":true}}
-{"type":"completion","session_id":"sess_abcdef1234567890","success":true,"status":"completed","session_done":true}
-```
-
-**错误处理**:
-
-如果在执行过程中发生错误，服务器会发送一个带有错误信息的事件消息，然后发送一个失败的完成消息：
-```json
-{"type":"error","error":"执行命令时出错：权限被拒绝"}
-{"type":"completion","success":false,"error":"执行命令失败：权限被拒绝"}
-```
-
-**注意事项**:
-1. 客户端应该准备好处理任何类型的事件消息，包括未在此文档中列出的新事件类型
-2. 事件消息可能会以任何顺序到达，客户端应该根据事件类型适当处理
-3. WebSocket连接可能会因为超时或服务器重启而断开，客户端应该实现重连逻辑
-4. 完成消息总是最后一个消息，表示命令执行已结束
-5. 执行期间，服务端会将客户端发送的文本消息排队，并在当前执行完成后按发送顺序依次处理（同一连接内串行执行）
-
-### 6. MCP 管理
-
-#### GET /mcp/status
-
-获取 MCP 服务状态。
-
-**响应示例**:
-```json
-{
-  "enabled": true,
-  "servers": 3,
-  "tools": 25,
-  "resources": 12,
-  "prompts": 4,
-  "connections": []
-}
-```
-
-#### GET /mcp/tools
-
-获取可用的 MCP 工具列表。
-
-**响应示例**:
-```json
-{
-  "tools": [
-    {
-      "name": "read_file",
-      "description": "读取文件内容",
-      "server": "filesystem",
-      "connected": true
-    }
-  ]
-}
-```
-
-#### GET /mcp/diagnostics
-
-获取 MCP 诊断信息。
-
-**响应示例**:
-```json
-{
-  "status": "healthy",
-  "servers": [
-    {
-      "name": "filesystem",
-      "status": "connected",
-      "last_ping": 1703123456
-    }
-  ],
-  "metrics": {
-    "total_requests": 1234,
-    "failed_requests": 5,
-    "avg_response_time": 150
-  }
-}
-```
-
-### 7. 内存管理
-
-#### GET /memory
-
-获取内存条目列表。
-
-**响应示例**:
-```json
-{
-  "entries": [
-    {
-      "message": "..."
-    }
-  ],
-  "count": 1
-}
-```
-
-#### POST /memory
-
-保存内存条目。
-
-**请求体**:
-```json
-{
-  "key": "user_preference",
-  "content": "用户偏好使用 TypeScript",
-  "category": "General",
-  "tags": ["preference", "typescript"],
-  "priority": "medium"
-}
-```
-
-**响应示例**:
-```json
-{
-  "success": true,
-  "key": "user_preference",
-  "message": "Memory entry saved successfully"
-}
-```
-
-#### GET /memory/{key}
-
-获取特定的内存条目。
-
-**响应示例**:
-```json
-{
-  "key": "user_preference",
-  "content": "用户偏好使用 TypeScript",
-  "found": true
-}
-```
-
-#### DELETE /memory/{key}
-
-删除内存条目。
-
-**响应示例**:
-```json
-{
-  "success": false,
-  "key": "user_preference",
-  "error": "Delete operation not yet implemented in Memory Manager"
-}
-```
-
-### 8. 监控指标
-
-#### GET /metrics
-
-获取当前系统指标。
-
-**响应示例**:
-```json
-{
-  "system": {
-    "cpu_usage": 45.2,
-    "memory_usage": 67.8,
-    "disk_usage": 23.1,
-    "load_average": [1.2, 1.5, 1.8]
-  },
-  "performance": {
-    "requests_per_second": 12.5,
-    "avg_response_time": 150,
-    "error_rate": 0.02
-  },
-  "timestamp": 1703123456
-}
-```
-
-#### GET /metrics/history
-
-获取历史指标数据。
-
-**查询参数**:
-- `limit`: 返回的记录数量（默认 100）
-
-**响应示例**:
-```json
-{
-  "system_history": [
-    {
-      "timestamp": 1703123456,
-      "cpu_usage": 45.2,
-      "memory_usage": 67.8
-    }
-  ],
-  "performance_history": [
-    {
-      "timestamp": 1703123456,
-      "requests_per_second": 12.5,
-      "avg_response_time": 150
-    }
-  ],
-  "count": 100,
-  "timestamp": 1703123456
-}
-```
-
-#### GET /system/health
-
-获取系统健康状态。
-
-**响应示例**:
-```json
-{
-  "overall_status": "healthy",
-  "components": {
-    "cpu": "healthy",
-    "memory": "warning",
-    "disk": "healthy",
-    "network": "healthy"
-  },
-  "alerts": [
-    {
-      "level": "warning",
-      "component": "memory",
-      "message": "内存使用率超过 80%"
-    }
-  ],
-  "timestamp": 1703123456
-}
-```
-
-### 9. Commands
-
-#### GET /commands
-
-列出 daemon 可用的命令描述（基于工作目录的 command definitions）。
-
-**响应示例**:
-```json
-{
-  "commands": [
-    {
-      "name": "serve",
-      "namespace": "subagent",
-      "description": "启动子代理服务",
-      "source": "builtin",
-      "allowedTools": ["search_codebase", "read_file"]
-    }
-  ]
-}
-```
-
-### 10. 会话（统一历史）
-
-daemon 将所有对话/执行统一到 “session” 概念（不再区分 task）。
-
-#### GET /sessions
-
-返回统一历史列表。
-
-**查询参数**:
-- `limit`: 返回条数（默认 200，最大 2000）
-
-**响应示例**:
-```json
-{
-  "success": true,
-  "sessions": [
-    {
-      "id": "sess_1234567890abcdef",
-      "type": "session",
-      "title": "Chat abcdef",
-      "created_at": "2026-01-01T12:00:00Z",
-      "last_active_at": "2026-01-01T12:10:00Z",
-      "stored": true,
-      "active": true
-    }
-  ]
-}
-```
-
-#### GET /sessions/{id}
-
-获取会话详情（含 metadata 与 history）。
-
-**响应示例（chat）**:
-```json
-{
-  "success": true,
-  "session": {
-    "id": "sess_1234567890abcdef",
-    "created_at": "2026-01-01T12:00:00Z",
-    "last_active_at": "2026-01-01T12:10:00Z",
-    "metadata": {
-      "type": "chat"
-    },
-    "history": [
-      { "role": "user", "content": "你好" },
-      { "role": "assistant", "content": "我能帮你做什么？" }
-    ]
-  },
-  "history": [
-    { "role": "user", "content": "你好" },
-    { "role": "assistant", "content": "我能帮你做什么？" }
-  ]
-}
-```
-
-#### DELETE /sessions/{id}
-
-删除会话（若仍在运行会先尝试取消）。成功时返回 JSON；找不到时返回 404。
-
-**响应示例**:
-```json
-{
-  "success": true,
-  "message": "session deleted",
-  "id": "sess_1234567890abcdef"
-}
-```
-
-#### POST /sessions/{id}/cancel
-
-取消正在运行的会话执行。
-
-**响应示例**:
-```json
-{
-  "success": true,
-  "session_id": "sess_1234567890abcdef",
-  "status": "cancelled"
-}
-```
-
-#### POST /sessions/reset
-
-重置会话历史。支持重置默认会话，或通过 `session_id` 精确指定。
-
-**请求方式**:
-- Query: `POST /sessions/reset?session_id=sess_...`
-- JSON body: `{ "session_id": "sess_..." }`
-
-**响应示例**:
-```json
-{
-  "success": true,
-  "session_id": "sess_1234567890abcdef",
-  "message": "Session sess_1234567890abcdef history has been reset",
-  "timestamp": 1703123456
-}
-```
-
-## 错误处理
-
-所有 API 端点都使用标准的 HTTP 状态码：
-
-- `200 OK`: 请求成功
-- `400 Bad Request`: 请求参数错误
-- `401 Unauthorized`: 认证失败
-- `404 Not Found`: 资源不存在
-- `500 Internal Server Error`: 服务器内部错误
-
-说明：
-- 部分参数校验错误使用 `http.Error` 返回纯文本错误信息
-- 部分业务错误返回 JSON（例如 `{ "success": false, "error": "..." }`）
-
-## CORS 支持
-
-如果启用了 CORS，daemon 会设置以下响应头：
-- `Access-Control-Allow-Origin: *`
-- `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
-- `Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key`
-
-## 配置
-
-Daemon 配置结构：
-```json
-{
-  "port": 8080,
-  "host": "127.0.0.1",
-  "pid_file": "/path/to/daemon.pid",
-  "log_file": "/path/to/daemon.log",
-  "enable_cors": true,
-  "api_key": "your-api-key",
-  "tls_cert_file": "/path/to/cert.pem",
-  "tls_key_file": "/path/to/key.pem"
-}
-```
-
-## 使用示例
-
-### cURL 示例
+# Nano Agent Daemon API（Web 客户端实现指南）
+
+## 0. 阅读指南
+
+本文面向 Web/桌面客户端实现者，描述 nano daemon 的 REST 与 WebSocket 协议。当前版本为 v4，包含破坏性变更：CLI 纯文本流式渲染已移除，交互式渲染统一由 BubbleTea/tview TUI 消费 EventSource；自动化场景请使用 `nano daemon execute --json`。
+
+## 1. 协议总览
+
+| 项 | 说明 |
+|---|---|
+| Base URL | `http://HOST:PORT/api/v1` |
+| WebSocket | `ws://HOST:PORT/api/v1/stream` 或 `/teams/sessions/{id}/stream` |
+| 鉴权 | `X-API-Key` header 或 `?api_key=` query |
+| 编码 | UTF-8 JSON |
+| 错误 | `{ "error": "message", "code": "optional_code" }` |
+| 限流 | 对 HTTP 429/503、网络超时、WebSocket 异常关闭实现指数退避：1s/2s/5s/10s/30s，封顶 30s |
+
+## 2. REST API 路由总表
+
+| Method | Path | 鉴权 | 幂等性 | 用途 |
+|---|---|---:|---:|---|
+| GET | `/api/v1/health` | 否 | 是 | 健康检查 |
+| GET | `/api/v1/status` | 是 | 是 | daemon 状态 |
+| GET | `/api/v1/sessions` | 是 | 是 | 列出普通会话 |
+| GET | `/api/v1/sessions/{id}` | 是 | 是 | 查看会话 |
+| DELETE | `/api/v1/sessions/{id}` | 是 | 是 | 删除会话 |
+| POST | `/api/v1/sessions/{id}/execute` | 是 | 否 | 同步/异步执行 |
+| POST | `/api/v1/sessions/{id}/cancel` | 是 | 是 | 取消当前任务 |
+| POST | `/api/v1/sessions/reset` | 是 | 是 | 重置普通会话 |
+| GET | `/api/v1/teams/sessions` | 是 | 是 | 列出 team-lead 会话 |
+| POST | `/api/v1/teams/sessions` | 是 | 是 | 创建/恢复 team-lead 会话 |
+| GET | `/api/v1/teams/sessions/{id}/events?since_seq=N` | 是 | 是 | HTTP poll 续传 |
+| POST | `/api/v1/teams/sessions/{id}/cancel` | 是 | 是 | 取消 team-lead 任务 |
+
+## 3. REST API 详解
+
+### GET /api/v1/health
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| status | string | `ok`/`healthy` |
+| timestamp | number | Unix 秒 |
+| version | string | daemon 版本 |
 
 ```bash
-# 健康检查
-curl -X GET http://localhost:8080/api/v1/health
-
-# 执行命令（仅结果）
-curl -X POST http://localhost:8080/api/v1/sessions/sess_demo/execute \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-api-key" \
-  -d '{"command": "创建一个 README 文件"}'
-
-# 执行命令（包含步骤）
-curl -X POST http://localhost:8080/api/v1/sessions/sess_demo/execute \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-api-key" \
-  -d '{"command": "创建一个 README 文件", "include_steps": true}'
-
-# 获取内存条目
-curl -X GET http://localhost:8080/api/v1/memory/project_info \
-  -H "X-API-Key: your-api-key"
-
-# 重置会话历史
-curl -X POST http://localhost:8080/api/v1/sessions/reset \
-  -H "X-API-Key: your-api-key"
+curl http://127.0.0.1:8080/api/v1/health
 ```
 
-### JavaScript 示例
-
-```javascript
-// 使用 fetch API（包含步骤）
-const response = await fetch('http://localhost:8080/api/v1/sessions/sess_demo/execute', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'X-API-Key': 'your-api-key'
-  },
-  body: JSON.stringify({
-    command: '分析项目结构',
-    timeout: 30,
-    include_steps: true,
-    async: false
-  })
-});
-
-const result = await response.json();
-console.log(result.steps); // 包含过滤后的 StreamEvent 列表
+```ts
+export interface HealthResponse { status: string; timestamp: number; version: string; uptime?: number }
 ```
 
-### WebSocket 示例
+### GET /api/v1/status
 
-```javascript
-const ws = new WebSocket('ws://localhost:8080/api/v1/stream');
-
-const uiState = {
-  textBuffer: '',
-  thinking: '',
-  thinkingSummary: '',
-  compression: '',
-  toolActivities: [],
-  errors: []
-};
-
-ws.onopen = () => {
-  ws.send(JSON.stringify({ command: '创建一个新的组件', timeout: 30 }));
-};
-
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  switch (data.type) {
-    case 'stream_content': {
-      uiState.textBuffer += data.content || '';
-      // 例如：实时渲染到界面
-      console.log('[stream]', data.content);
-      break;
-    }
-    case 'thinking': {
-      // 根据 metadata.thinking_type 区分实时和最终thinking事件
-      const thinkingType = data.metadata?.thinking_type;
-      if (thinkingType === 'realtime') {
-        // 实时推理过程，适合显示动态思考状态
-        uiState.thinking = data.content || '正在思考...';
-        console.log('[thinking:realtime]', uiState.thinking);
-        // 例如：在状态栏显示实时思考过程
-      } else if (thinkingType === 'final') {
-        // 最终推理结果，适合显示完整的思考总结
-        uiState.thinkingSummary = data.content || '';
-        console.log('[thinking:final]', uiState.thinkingSummary);
-        // 例如：在侧边栏显示完整的推理总结
-      } else {
-        // 兼容旧版本或未指定类型的thinking事件
-        uiState.thinking = data.content || '正在思考...';
-        console.log('[thinking]', uiState.thinking);
-      }
-      break;
-    }
-    case 'compression': {
-      // 压缩事件包含 content（压缩摘要/策略说明），可用于侧边状态栏或提示
-      uiState.compression = data.content || '';
-      console.log('[compression]', uiState.compression);
-      break;
-    }
-    case 'tool_call':
-    case 'tool_result':
-    case 'tool_use': {
-      uiState.toolActivities.push(data);
-      console.log('[tool]', data);
-      break;
-    }
-    case 'error': {
-      uiState.errors.push(data.error);
-      console.warn('[error]', data.error);
-      break;
-    }
-    case 'completion': {
-      // 最后一条完成消息，可读取 token_stats 聚合结果
-      console.log('[completion]', data.success, data.token_stats || null);
-      // 在此处结束加载动画、落盘结果等
-      break;
-    }
-    default: {
-      // 为向前兼容，建议记录未识别的新事件类型
-      console.debug('[event]', data.type, data);
-    }
-  }
-};
-
-ws.onerror = (e) => console.error('WebSocket error:', e);
-ws.onclose = () => console.log('WebSocket closed');
+```bash
+curl -H "X-API-Key: $NANO_API_KEY" http://127.0.0.1:8080/api/v1/status
 ```
 
-**最佳实践**
-- 使用 `stream_content` 作为主要渲染源；`content` 事件在 WebSocket 渠道中被过滤以避免重复。
-- 监听 `thinking` 事件以展示"思考/规划中"的状态，避免与 `stream_content` 竞争主区域渲染；适合放在状态栏或顶部提示。可通过 `metadata.thinking_type` 区分：
-  - `"realtime"`: 实时推理过程，适合显示动态思考状态
-  - `"final"`: 最终推理结果，适合显示完整的思考总结
-- 监听 `compression` 事件以显示上下文压缩摘要或策略变更，帮助用户理解为什么上下文被精简。
-- `token_stats` 为中间统计事件，WebSocket 渠道不发送，但会在最终 `completion` 消息中附带一次聚合结果。
-- 客户端可将 `token_stats` 可视化为 `in/out/total (+ peak rate)`：
-  - `input_tokens`/`output_tokens`/`total_tokens` 对应 `in/out/total`
-  - `peak_tokens_per_second` 可用于显示峰值速率（例如 `120 t/s`）
-  - 数值格式由客户端决定（例如 `1.2k`/`45.6`），API 返回原始数值
-- 事件可能乱序到达，应基于 `type` 分发处理并保持幂等更新。
-- 实现断线重连与超时处理，避免因网络中断导致的任务状态不一致。
+```ts
+export interface StatusResponse { agent_status: string; mcp_enabled: boolean; memory_size: number; active_tools: number }
+```
+
+### Sessions
+
+```bash
+curl -H "X-API-Key: $NANO_API_KEY" http://127.0.0.1:8080/api/v1/sessions
+curl -X POST -H "X-API-Key: $NANO_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"command":"hello","timeout":120}' \
+  http://127.0.0.1:8080/api/v1/sessions/web-1/execute
+curl -X POST -H "X-API-Key: $NANO_API_KEY" http://127.0.0.1:8080/api/v1/sessions/web-1/cancel
+curl -X POST -H "X-API-Key: $NANO_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"session_id":"web-1"}' http://127.0.0.1:8080/api/v1/sessions/reset
+```
+
+```ts
+export interface ExecuteRequest { command: string; timeout?: number; include_steps?: boolean; async?: boolean }
+export interface ExecuteResponse { success: boolean; result: string; error?: string; session_id?: string; run_id?: string; status?: string; completed?: boolean; token_stats?: TokenStats }
+export interface SessionSummary { id: string; type?: string; title?: string; created_at?: string; last_active_at?: string; status?: string; stored?: boolean; active?: boolean }
+export interface SessionsListResponse { success: boolean; sessions: SessionSummary[] }
+```
+
+### Team-lead sessions
+
+```bash
+curl -X POST -H "X-API-Key: $NANO_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"session_id":"lead-alpha-chat","team_name":"alpha","interactive_confirm":true}' \
+  http://127.0.0.1:8080/api/v1/teams/sessions
+curl -H "X-API-Key: $NANO_API_KEY" \
+  'http://127.0.0.1:8080/api/v1/teams/sessions/lead-alpha-chat/events?since_seq=42'
+```
+
+```ts
+export interface TeamLeadSessionRequest { session_id?: string; team_name: string; interactive_confirm?: boolean }
+export interface TeamLeadSessionResponse { session_id: string; team_name: string; status: string; created_at?: string; last_active_at?: string }
+```
+
+## 4. WebSocket 协议
+
+### 4.1 连接建立
+
+普通会话连接 `/api/v1/stream`，发送 `subscribe` 帧指定 `session_id`。Team-lead 会话连接 `/api/v1/teams/sessions/{id}/stream`，可直接发送 `lead_input` 或 `subscribe`。
+
+### 4.2 帧分类总览
+
+Client → Server：`subscribe`、`command`、`lead_input`、`tool_approval`、`cancel`、`ping`。
+
+Server → Client：`session_start`、`stream_content`、`thinking`、`tool_call`、`tool_result`、`tool_use`、`tool_approval_request`、`mailbox_sent`、`idle_notification`、`spawn_teammate`、`error`、`completion`、`pong`、`chunk`。
+
+### 4.3 每帧 JSON Schema
+
+#### subscribe
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---:|---|
+| type | string | 是 | `subscribe` |
+| session_id | string | 普通会话必填 | 会话 ID |
+| since_seq | number | 否 | 只回放该序号之后的事件 |
+
+```json
+{ "type": "subscribe", "session_id": "web-1", "since_seq": 42 }
+```
+
+#### command / lead_input
+
+```json
+{ "type": "command", "session_id": "web-1", "command": "hello" }
+{ "type": "lead_input", "command": "summarize mailbox", "since_seq": 42 }
+```
+
+```ts
+export type ClientFrame = SubscribeFrame | CommandFrame | LeadInputFrame | ToolApprovalFrame | CancelFrame | PingFrame;
+export interface SubscribeFrame { type: 'subscribe'; session_id?: string; since_seq?: number }
+export interface CommandFrame { type: 'command'; session_id: string; command: string }
+export interface LeadInputFrame { type: 'lead_input'; command: string; task_id?: string; since_seq?: number }
+```
+
+#### tool_approval_request / tool_approval
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---:|---|
+| call_id | string | 是 | 工具调用 ID |
+| tool_name | string | 是 | 工具名 |
+| parameters | object | 否 | 参数 |
+| timeout_seconds | number | 否 | 超时时间 |
+
+```json
+{ "type":"tool_approval_request", "call_id":"call_1", "tool_name":"Bash", "parameters":{"command":"git status"}, "timeout_seconds":60 }
+```
+
+```json
+{ "type":"tool_approval", "call_id":"call_1", "approved":true, "always_allow":false }
+```
+
+```ts
+export interface ToolApprovalRequestFrame { type: 'tool_approval_request'; call_id: string; tool_name: string; parameters?: Record<string, unknown>; timeout_seconds?: number }
+export interface ToolApprovalFrame { type: 'tool_approval'; call_id: string; approved: boolean; always_allow?: boolean }
+```
+
+#### swarm events
+
+```json
+{ "type":"spawn_teammate", "agent":"researcher", "topic":"API scan", "session_id":"tm_1", "seq":51 }
+{ "type":"idle_notification", "agent":"researcher", "summary":"found 3 endpoints", "seq":52 }
+{ "type":"mailbox_sent", "from":"researcher", "to":"team-lead@alpha", "kind":"finding", "preview":"/sessions supports cancel", "seq":53 }
+```
+
+Web UI 建议：将 `spawn_teammate` 显示为团队成员加入；`idle_notification` 显示为成员状态摘要；`mailbox_sent` 显示为团队动态/收件箱提示行。
+
+### 4.4 大消息分片
+
+```json
+{ "type":"chunk", "id":"msg_1", "index":0, "total":3, "data":"...", "is_chunk":true, "complete":false }
+```
+
+客户端按 `id` 收集 `index`，达到 `total` 后拼接 `data` 并重新解析 JSON。
+
+### 4.5 重连与续传
+
+客户端必须持久化最大 `seq`，断线后用 `since_seq` 恢复。
+
+```mermaid
+sequenceDiagram
+  participant Web
+  participant Daemon
+  Web->>Daemon: subscribe since_seq=42
+  Daemon-->>Web: replay seq=43..N
+  Daemon-->>Web: live stream seq=N+1
+  Web--xDaemon: network break
+  Web->>Daemon: reconnect subscribe since_seq=N+1
+  Daemon-->>Web: replay missed events
+```
+
+### 4.6 心跳
+
+客户端每 30s 发送 `ping`，90s 未收到任何消息应断开并重连。
+
+## 5. 事件类型枚举
+
+| StreamEvent.type | WS 发送 | Web UI 建议 |
+|---|---:|---|
+| `stream_content` | 是 | 追加 assistant 流式文本 |
+| `content` | 是 | 完成态 assistant 文本 |
+| `thinking` | 是 | 可折叠思考块 |
+| `tool_use` | 是 | 工具调用卡片 |
+| `tool_call` / `tool_result` | 是 | 调试/详细步骤 |
+| `waiting_for_user` / `tool_approval_request` | 是 | 审批 UI |
+| `mailbox_sent` | 是 | 团队动态 |
+| `idle_notification` | 是 | teammate 状态 |
+| `spawn_teammate` | 是 | roster 更新 |
+| `error` | 是 | 错误提示 |
+| `completion` / `done` | 是 | 标记 turn 完成 |
+| `token_stats` | 是 | 状态栏 token 统计 |
+
+## 6. Swarm / Team-Lead 流程
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant Web
+  participant Lead as team-lead
+  participant Mate as teammate
+  User->>Web: submit task
+  Web->>Lead: lead_input
+  Lead-->>Web: spawn_teammate
+  Lead->>Mate: spawn run
+  Mate-->>Lead: mailbox_sent finding
+  Mate-->>Web: idle_notification
+  Lead-->>Web: stream_content + completion
+```
+
+## 7. 工具审批协议
+
+客户端收到审批请求后应阻塞该工具调用的 UI 决策，但不阻塞 WebSocket 读循环。用户选择后发送 `tool_approval`；`always_allow=true` 表示客户端希望后续同类调用自动允许，daemon 可选择记录 session allowlist。
+
+```mermaid
+sequenceDiagram
+  participant Daemon
+  participant Web
+  participant User
+  Daemon-->>Web: tool_approval_request(call_id)
+  Web->>User: inline approval UI
+  User-->>Web: approve/reject
+  Web->>Daemon: tool_approval(call_id, approved)
+  Daemon-->>Web: tool_use success/error
+```
+
+## 8. 错误码表
+
+| 层级 | 示例 | 处理建议 |
+|---|---|---|
+| HTTP 400 | invalid JSON | 修正请求 |
+| HTTP 401/403 | invalid API key | 重新鉴权 |
+| HTTP 404 | session not found | 创建或恢复会话 |
+| HTTP 409 | run mismatch | 重新订阅最新 run |
+| HTTP 5xx | daemon error | 退避重试 |
+| WS close 1006 | abnormal close | reconnect with since_seq |
+| WS error frame | `{type:'error'}` | 展示并按 severity 决定是否重试 |
+
+## 9. TypeScript 类型定义
+
+```ts
+export interface TokenStats { input_tokens: number; output_tokens: number; total_tokens: number; peak_tokens_per_second?: number }
+export interface StreamEvent { type: string; content?: string; error?: string; source?: string; seq?: number; session_id?: string; metadata?: Record<string, unknown>; token_stats?: TokenStats }
+export interface ChunkFrame { type: 'chunk'; id: string; index: number; total: number; data: string; is_chunk: true; complete?: boolean }
+export type ServerFrame = StreamEvent | ToolApprovalRequestFrame | ChunkFrame;
+```
+
+## 10. 客户端实现 Checklist
+
+- [ ] 持久化最大 `seq`
+- [ ] 断线用 `since_seq` 续传
+- [ ] 指数退避并封顶 30s
+- [ ] chunk 重组后再解析
+- [ ] ping/pong 心跳与超时
+- [ ] 审批 UI 不阻塞读循环
+- [ ] cancel/reset/sessions 走 REST 或控制帧
+- [ ] 未知事件以 warning 记录，不崩溃
+
+## 11. 兼容性与版本
+
+v4 破坏性变更：删除旧 Adapter `SendEvent/SubmitChannel/CancelChannel`；删除 `lead-chat --plain` 与 readline 纯文本输出；删除 daemon stream-exec 的 `fmt.Print` 渲染分支；脚本应迁移到 `nano daemon execute --json`。
+
+## 12. 附录
+
+```bash
+wscat -c 'ws://127.0.0.1:8080/api/v1/teams/sessions/lead-alpha-chat/stream?api_key=KEY'
+> {"type":"subscribe","since_seq":0}
+> {"type":"lead_input","command":"hello","since_seq":0}
+> {"type":"cancel"}
+```
+
+CLI 对应关系：`nano chat` 使用本地 EventSource；`nano chat --daemon` 与 `nano lead-chat` 使用 daemon WebSocket；`nano daemon execute --json` 使用同步 HTTP，适合 CI。

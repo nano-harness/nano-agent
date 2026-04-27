@@ -48,13 +48,13 @@ func TestBuildBaseSystemPromptContainsToolSelectionPriority(t *testing.T) {
 		t.Error("BuildBaseSystemPrompt() should contain 'Tool Selection Priority' section")
 	}
 	// Verify correct tool names are used
-	for _, toolName := range []string{"search_file_content", "glob", "edit_file"} {
+	for _, toolName := range []string{"run_shell_command", "edit_file"} {
 		if !strings.Contains(prompt, toolName) {
 			t.Errorf("Tool Selection Priority should reference real tool %q", toolName)
 		}
 	}
-	// Verify non-existent tool names are not referenced
-	for _, badName := range []string{"search_files", "grep_files", "patch_file"} {
+	// Verify removed or non-existent tool names are not referenced
+	for _, badName := range []string{"search_file_content", "glob", "list_directory", "search_files", "grep_files", "patch_file"} {
 		if strings.Contains(prompt, badName) {
 			t.Errorf("Tool Selection Priority must not reference non-existent tool %q", badName)
 		}

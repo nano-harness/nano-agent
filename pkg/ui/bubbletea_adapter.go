@@ -1,60 +1,95 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"strings"
 
-	"github.com/nano-harness/nano-agent/pkg/agent/permission"
-	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
+	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea/banner"
+	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/uuid"
 )
 
 // BubbleTeaAdapter wraps pkg/ui/bubbletea as a ui.Adapter.
 type BubbleTeaAdapter struct {
-	model    *bubbletea.Model
-	program  *tea.Program
-	submitCh chan string
-	cancelCh chan struct{}
+	model   *bubbletea.Model
+	program *tea.Program
 
 	// sendCh serializes all program.Send calls so that event ordering is
 	// preserved and goroutine count stays bounded.
-	sendCh chan tea.Msg
+	sendCh     chan tea.Msg
+	showBanner bool
 }
 
 // Run starts the Bubble Tea program and blocks until exit.
-func (a *BubbleTeaAdapter) Run() error {
+func (a *BubbleTeaAdapter) Run(ctx context.Context, src eventsource.EventSource) error {
+	if a.showBanner {
+		_ = banner.Play(os.Stdout, banner.Options{
+			Theme:    banner.DefaultTheme,
+			Colorize: banner.IsInteractiveTTY(),
+		})
+	}
+
+	a.model.BindOutbound(src.Send)
 	a.program = tea.NewProgram(a.model)
 
-	// Start the serializing dispatcher before blocking on Run.
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := src.Start(childCtx); err != nil {
+		return err
+	}
+
 	go func() {
 		for msg := range a.sendCh {
 			a.program.Send(msg)
 		}
 	}()
+	go a.pumpInbound(childCtx, src)
 
 	_, err := a.program.Run()
+	_ = src.Close()
 	return err
 }
 
-// send enqueues a message for delivery to the Bubble Tea program.
-// All sends go through this single channel to guarantee ordering.
 func (a *BubbleTeaAdapter) send(msg tea.Msg) {
 	if a.program == nil {
 		return
 	}
-	// Non-blocking send: drop the message if the channel is full to avoid
-	// blocking the caller on a stalled/stopped program.
 	select {
 	case a.sendCh <- msg:
 	default:
 	}
 }
 
-// SendEvent forwards a StreamEvent to the Bubble Tea model via the serialized send queue.
-func (a *BubbleTeaAdapter) SendEvent(e event.StreamEvent) {
+func (a *BubbleTeaAdapter) pumpInbound(ctx context.Context, src eventsource.EventSource) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case in, ok := <-src.Inbound():
+			if !ok {
+				return
+			}
+			if in.State != nil {
+				a.send(bubbletea.ConnectionStatusMsg{State: in.State.String(), Detail: src.Describe()})
+			}
+			if in.Notice != "" {
+				a.send(bubbletea.NoticeMsg(in.Notice))
+			} else if in.ResumedFrom > 0 {
+				a.send(bubbletea.NoticeMsg(fmt.Sprintf("已重连，自 seq=%d 续传事件", in.ResumedFrom)))
+			}
+			if in.Event != nil {
+				a.sendEvent(*in.Event)
+			}
+		}
+	}
+}
+
+func (a *BubbleTeaAdapter) sendEvent(e event.StreamEvent) {
 	if a.program == nil {
 		return
 	}
@@ -76,12 +111,15 @@ func (a *BubbleTeaAdapter) SendEvent(e event.StreamEvent) {
 		})
 	case event.EventTypeDone:
 		a.send(bubbletea.StatusUpdate("完成"))
+	case event.EventTypeTaskCompletion:
+		a.send(bubbletea.TaskCompletionMsg{Reason: stringFromMetadata(e.Metadata, "reason")})
 	case event.EventTypeTokenStats:
 		if e.TokenStats != nil {
 			a.send(bubbletea.TokenStatsUpdate{
 				InputTokens:  e.TokenStats.InputTokens,
 				OutputTokens: e.TokenStats.OutputTokens,
 				TotalTokens:  e.TokenStats.TotalTokens,
+				Peak:         e.TokenStats.PeakTokensPerSecond,
 			})
 		}
 	case event.EventTypeToolUse:
@@ -98,14 +136,31 @@ func (a *BubbleTeaAdapter) SendEvent(e event.StreamEvent) {
 				Result:   e.ToolUse.Result,
 			})
 		}
+	case event.EventTypeWaitingForUser:
+		if req, ok := approvalFromEvent(e); ok {
+			a.send(bubbletea.ShowConfirmationMsg{
+				Message:  fmt.Sprintf("确认执行工具：%s (ID: %s)？", req.toolName, req.callID),
+				ToolInfo: req.toolInfo,
+				Callback: func(approved bool) {
+					_ = a.model.SendOutbound(eventsource.Outbound{
+						Kind: "approval",
+						Approval: &eventsource.ApprovalDecision{
+							CallID: req.callID,
+							Allow:  approved,
+						},
+					})
+				},
+			})
+		}
+	case event.EventTypeMailboxSent:
+		a.send(bubbletea.MailboxMsg{
+			From:    stringFromMetadata(e.Metadata, "from"),
+			To:      stringFromMetadata(e.Metadata, "to"),
+			Kind:    stringFromMetadata(e.Metadata, "kind"),
+			Preview: e.Content,
+		})
 	}
 }
-
-// SubmitChannel returns the channel that receives user-submitted text.
-func (a *BubbleTeaAdapter) SubmitChannel() <-chan string { return a.submitCh }
-
-// CancelChannel returns the channel that fires on user cancellation.
-func (a *BubbleTeaAdapter) CancelChannel() <-chan struct{} { return a.cancelCh }
 
 // Stop quits the Bubble Tea program.
 func (a *BubbleTeaAdapter) Stop() {
@@ -114,55 +169,34 @@ func (a *BubbleTeaAdapter) Stop() {
 	}
 }
 
-// SetPermissionManager wires a permission.Manager into the Bubble Tea model so
-// that slash commands (/yolo, /permission, etc.) work at runtime.
-func (a *BubbleTeaAdapter) SetPermissionManager(mgr *permission.Manager) {
-	if a.model != nil {
-		a.model.SetPermissionManager(mgr)
-	}
+type approvalRequest struct {
+	callID   string
+	toolName string
+	toolInfo map[string]interface{}
 }
 
-// SetEngine wires an Engine into the Bubble Tea model so that slash commands
-// (/think) can control thinking mode and other engine-level settings.
-func (a *BubbleTeaAdapter) SetEngine(eng *engine.Engine) {
-	if a.model != nil {
-		a.model.SetEngine(eng)
+func approvalFromEvent(e event.StreamEvent) (approvalRequest, bool) {
+	if e.Metadata == nil || strings.TrimSpace(stringFromMetadata(e.Metadata, "kind")) != "tool_approval_request" {
+		return approvalRequest{}, false
 	}
+	callID := strings.TrimSpace(stringFromMetadata(e.Metadata, "call_id"))
+	if callID == "" {
+		return approvalRequest{}, false
+	}
+	toolName := strings.TrimSpace(stringFromMetadata(e.Metadata, "tool_name"))
+	params, _ := e.Metadata["parameters"].(map[string]interface{})
+	return approvalRequest{
+		callID:   callID,
+		toolName: toolName,
+		toolInfo: map[string]interface{}{
+			"ID":         callID,
+			"Name":       toolName,
+			"Parameters": params,
+		},
+	}, true
 }
 
-// SetAvailableToolNames passes the list of tool names to the model for Tab completion.
-func (a *BubbleTeaAdapter) SetAvailableToolNames(names []string) {
-	if a.model != nil {
-		a.model.SetAvailableToolNames(names)
-	}
-}
-
-// ShowConfirmation sends a confirmation request to the Bubble Tea event loop.
-// It uses program.Send() directly (blocking, goroutine-safe) to guarantee
-// delivery — confirmation messages must never be silently dropped, as losing
-// one would leave the tool scheduler permanently stuck in awaiting_approval.
-func (a *BubbleTeaAdapter) ShowConfirmation(message string, toolInfo map[string]interface{}, callback func(bool)) {
-	if a.program == nil {
-		return
-	}
-	a.program.Send(bubbletea.ShowConfirmationMsg{
-		Message:  message,
-		ToolInfo: toolInfo,
-		Callback: callback,
-	})
-}
-
-// SetAllowlistHandler registers the callback for the "始终允许" (always allow) option.
-func (a *BubbleTeaAdapter) SetAllowlistHandler(h func(toolName string, params map[string]interface{})) {
-	if a.model != nil {
-		a.model.SetAllowlistHandler(h)
-	}
-}
-
-// SetNewSessionHandler wires the callback used by Ctrl+R / /clear to create
-// a new agent session.
-func (a *BubbleTeaAdapter) SetNewSessionHandler(h func() string) {
-	if a.model != nil {
-		a.model.SetNewSessionHandler(h)
-	}
+func stringFromMetadata(m map[string]interface{}, key string) string {
+	v, _ := m[key].(string)
+	return v
 }

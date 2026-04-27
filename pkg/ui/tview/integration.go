@@ -12,6 +12,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/slash"
+	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
 	"github.com/google/uuid"
 )
 
@@ -39,6 +40,7 @@ type Integration struct {
 	// Handlers
 	inputHandler  func(context.Context, string) error
 	cancelHandler func() error
+	outbound      func(eventsource.Outbound) error
 
 	// Event channel
 	eventChan chan func()
@@ -63,6 +65,44 @@ type Integration struct {
 	// newSessionCallback is invoked when Ctrl+R / /clear is triggered.
 	// It is wired by the cli layer to call agent.StartNewSession().
 	newSessionCallback func() string
+}
+
+func (i *Integration) BindOutbound(send func(eventsource.Outbound) error) {
+	i.outbound = send
+	i.model.SetInputHandler(func(input string) {
+		i.forwardOutboundInput(input)
+	})
+	i.model.SetCancelHandler(func() bool {
+		_ = i.SendOutbound(eventsource.Outbound{Kind: "cancel"})
+		return true
+	})
+	i.model.SetNewSessionHandler(func() {
+		_ = i.SendOutbound(eventsource.Outbound{Kind: "control", Control: "/clear"})
+	})
+}
+
+func (i *Integration) SendOutbound(o eventsource.Outbound) error {
+	if i.outbound == nil {
+		return nil
+	}
+	return i.outbound(o)
+}
+
+func (i *Integration) forwardOutboundInput(input string) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return
+	}
+	if strings.HasPrefix(trimmed, "/") {
+		switch strings.ToLower(trimmed) {
+		case "/clear", "/reset", "/sessions", "/cancel":
+			_ = i.SendOutbound(eventsource.Outbound{Kind: "control", Control: trimmed})
+			return
+		}
+	}
+	i.AddMessage("user", trimmed)
+	i.model.GetStateManager().SetThinking("正在处理您的请求...")
+	_ = i.SendOutbound(eventsource.Outbound{Kind: "submit", Text: trimmed})
 }
 
 // NewIntegration creates a new TUI integration
@@ -283,7 +323,28 @@ func (i *Integration) AddToolUse(toolUse *event.ToolUse) {
 		normalizedToolUse = &toolUseCopy
 	}
 	i.eventChan <- func() {
+		if normalizedToolUse != nil {
+			i.model.GetStateManager().SetToolExecution(normalizedToolUse.ToolName, "")
+		}
 		i.model.AddToolUse(normalizedToolUse)
+	}
+}
+
+func (i *Integration) SetConnectionStatus(state, detail string) {
+	i.eventChan <- func() {
+		i.model.SetConnectionStatus(state, detail)
+	}
+}
+
+func (i *Integration) AddNotice(text string) {
+	i.eventChan <- func() {
+		i.model.AddMessage("system", text)
+	}
+}
+
+func (i *Integration) UpdateSwarmRoster(roster string) {
+	i.eventChan <- func() {
+		i.model.UpdateSwarmRoster(roster)
 	}
 }
 

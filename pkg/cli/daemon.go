@@ -35,10 +35,47 @@ func NewDaemonCommand() *cobra.Command {
 	cmd.AddCommand(newDaemonLogsCommand())
 	cmd.AddCommand(newDaemonConfigCommand())
 	cmd.AddCommand(newDaemonCleanupLegacyCommand())
+	cmd.AddCommand(newDaemonExecuteCommand())
 
 	// Add special foreground command (used internally)
 	cmd.AddCommand(newDaemonForegroundCommand())
 
+	return cmd
+}
+
+func newDaemonExecuteCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "execute [command]",
+		Short: "Execute a command synchronously via daemon HTTP",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			command := strings.Join(args, " ")
+			timeout, _ := cmd.Flags().GetInt("timeout")
+			sessionID, _ := cmd.Flags().GetString("session-id")
+			includeSteps, _ := cmd.Flags().GetBool("include-steps")
+			jsonOut, _ := cmd.Flags().GetBool("json")
+			resp, err := createDaemonClient().ExecuteInSession(command, sessionID, timeout, includeSteps, false)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(resp)
+			}
+			if resp.Result != "" {
+				fmt.Println(resp.Result)
+			}
+			if !resp.Success {
+				return fmt.Errorf("daemon execute failed: %s", resp.Error)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().Int("timeout", daemon.DefaultTaskTimeoutSeconds, "Command timeout in seconds")
+	cmd.Flags().String("session-id", "", "Execute within an existing session ID")
+	cmd.Flags().Bool("include-steps", false, "Include streamed steps in response when supported")
+	cmd.Flags().Bool("json", false, "Output structured JSON")
 	return cmd
 }
 

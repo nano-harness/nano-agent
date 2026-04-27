@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking / UI Daemon Refactor
+- BREAKING ui: `Adapter` now uses `Run(ctx, EventSource) error`; `SendEvent`, `SubmitChannel`, and `CancelChannel` were removed.
+- BREAKING cli: removed `lead-chat` readline/plain rendering and daemon streaming `fmt.Print` path; use `nano daemon execute --json` for scripts.
+- feat(ui): added shared EventSource abstraction consumed by BubbleTea and tview.
+- feat(daemon-client): exposed WebSocket URLs and team cancel helper for renderer-owned daemon streams.
+- docs(daemon-api): rewrote daemon API as a Web client implementation guide.
+
 ### Added
+- **Multi-Agent Mailbox System**: Asynchronous message passing infrastructure for fork-based parallel execution
+  - Core interfaces: `Mailbox`, `Backend`, `Manager` for structured agent-to-agent communication
+  - Memory backend for single-process CLI mode and testing
+  - File backend with JSONL + flock for daemon mode with crash recovery
+  - `send_message` tool for sub-agents to communicate with parent agents
+  - Support for message topics: `progress`, `finding`, `amend_task`
+  - Rate limiting: 20 messages per agent run
+  - Configurable TTL (default 7 days) and capacity limits (default 1000 messages)
+- **Enhanced Bubble Tea Banner**: New cinematic animated banner with Standard Figlet thin-line font
+  - 20-frame animation (~3000ms) with atomic mascot, NANO-AGENT text, and sweep shine effects
+  - Replaced old box-drawing frames with elegant thin-line ASCII art
+  - Added `ElemSubtitle` semantic color role for muted gray subtitles
 - **Expert System**: New expert/sub-agent architecture aligned with Gemini CLI
   - Three built-in experts: `@investigator`, `@help`, `@generalist`
   - Explicit `@expert-name` trigger syntax (users only, LLM cannot call directly)

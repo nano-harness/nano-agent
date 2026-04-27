@@ -150,23 +150,44 @@ var builtinCommands = []Command{
 
 	// ── agent ────────────────────────────────────────────────────────────────
 	{
+		Name:        "teammates",
+		Description: "列出当前团队的 teammate",
+		Usage:       "/teammates",
+		Category:    CategoryAgent,
+		Source:      "built-in",
+	},
+	{
+		Name:        "teammates:list",
+		Description: "列出当前团队的 teammate（别名）",
+		Usage:       "/teammates:list",
+		Category:    CategoryAgent,
+		Source:      "built-in",
+	},
+	{
+		Name:        "teammates:show",
+		Description: "显示特定 teammate 的详细信息",
+		Usage:       "/teammates:show <name>",
+		Category:    CategoryAgent,
+		Source:      "built-in",
+	},
+	{
 		Name:        "agents",
-		Description: "列出所有可用的专家代理",
+		Description: "列出当前团队的 teammate（兼容旧别名）",
 		Usage:       "/agents",
 		Category:    CategoryAgent,
 		Source:      "built-in",
 	},
 	{
 		Name:        "agents:list",
-		Description: "列出所有可用的专家代理（别名）",
+		Description: "列出当前团队的 teammate（兼容旧别名）",
 		Usage:       "/agents:list",
 		Category:    CategoryAgent,
 		Source:      "built-in",
 	},
 	{
 		Name:        "agents:show",
-		Description: "显示特定专家代理的详细信息",
-		Usage:       "/agents:show <expert-name>",
+		Description: "显示特定 teammate 的详细信息（兼容旧别名）",
+		Usage:       "/agents:show <name>",
 		Category:    CategoryAgent,
 		Source:      "built-in",
 	},

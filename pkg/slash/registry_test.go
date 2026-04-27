@@ -17,6 +17,7 @@ func TestNewRegistry_BuiltinCommands(t *testing.T) {
 	wantNames := []string{
 		"yolo", "permission", "permissions", "allow", "disallow", "think", "clear",
 		"skill:list", "skill:use", "skill:off", "skill:info", "skill:install",
+		"teammates", "teammates:list", "teammates:show",
 		"agents", "agents:list", "agents:show",
 		"routines list", "routines add", "routines remove", "routines status", "routines pause", "routines resume",
 		"opsx:propose", "opsx:explore", "opsx:new", "opsx:continue", "opsx:ff",

@@ -150,3 +150,8 @@ func (h *DaemonHarness) WaitReady(timeout time.Duration) error {
 func (h *DaemonHarness) URL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", h.Port)
 }
+
+// BaseURL returns the base URL of the daemon server.
+func (h *DaemonHarness) BaseURL() string {
+	return h.URL()
+}

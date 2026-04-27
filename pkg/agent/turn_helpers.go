@@ -15,21 +15,30 @@ func (t *Turn) buildUserContextPrefix() string {
 	return t.SystemPromptBuilder.BuildUserContextNote() + "\n\n"
 }
 
-// ensureSystemPrompt ensures the system prompt is present in the messages
+// ensureSystemPrompt ensures the system prompt is present in the messages.
+// Mailbox messages are drained by the turn preprocessor before this runs.
 func (t *Turn) ensureSystemPrompt() {
 	if t.systemPrompt == "" {
 		t.systemPrompt = t.buildUnifiedSystemPrompt()
 	}
 
-	hasSystem := false
-	for _, msg := range t.Messages {
+	fullSystemPrompt := t.systemPrompt
+
+	// Find and update existing system message, or add new one
+	systemIdx := -1
+	for i, msg := range t.Messages {
 		if msg.Role == "system" {
-			hasSystem = true
+			systemIdx = i
 			break
 		}
 	}
-	if !hasSystem && t.systemPrompt != "" {
-		t.Messages = append([]llm.Message{{Role: "system", Content: t.systemPrompt}}, t.Messages...)
+
+	if systemIdx >= 0 {
+		// Update existing system message
+		t.Messages[systemIdx].Content = fullSystemPrompt
+	} else if fullSystemPrompt != "" {
+		// Add new system message at the beginning
+		t.Messages = append([]llm.Message{{Role: "system", Content: fullSystemPrompt}}, t.Messages...)
 	}
 }
 

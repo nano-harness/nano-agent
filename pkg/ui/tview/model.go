@@ -17,6 +17,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/slash"
+	uirender "github.com/nano-harness/nano-agent/pkg/ui/render"
 	"github.com/atotto/clipboard"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -38,6 +39,8 @@ const (
 	MessageTypeConfirmation MessageType = "confirmation"
 	MessageTypeThinking     MessageType = "thinking"
 )
+
+const minMarkdownViewportWidth = 20
 
 // MessageInterface defines the common interface for all message types
 type MessageInterface interface {
@@ -275,11 +278,15 @@ type Model struct {
 	layout     *tview.Flex
 	pages      *tview.Pages
 	statusBar  *tview.TextView
+	swarmBar   *tview.TextView
 
 	// State
-	messages   []MessageInterface
-	isLoading  bool //nolint:unused
-	activeView string
+	messages         []MessageInterface
+	isLoading        bool //nolint:unused
+	activeView       string
+	connectionState  string
+	connectionDetail string
+	swarmRoster      string
 
 	// New state management
 	stateManager *StateManager
@@ -339,6 +346,7 @@ type Model struct {
 	// Whether SIGINT (Ctrl+C) has been ignored during TUI run
 	ignoredSigInt bool
 	soundMutex    sync.Mutex
+	inputStateMu  sync.Mutex
 
 	// Commands view
 	commandsList     *tview.List
@@ -443,6 +451,7 @@ func (m *Model) createComponents() {
 	m.chatView = chatViewComponent
 	m.inputField = inputFieldComponent
 	m.statusBar = statusBarComponent.GetPrimitive().(*tview.TextView)
+	m.swarmBar = tview.NewTextView().SetDynamicColors(true)
 
 	// Apply styles to status bar
 	if m.styles != nil {
@@ -549,6 +558,7 @@ func (m *Model) setupLayout() {
 	chatLayout := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(m.chatView.GetPrimitive(), 0, 1, true).
 		AddItem(m.inputField, 3, 0, true).
+		AddItem(m.swarmBar, 1, 0, false).
 		AddItem(m.statusBar, 1, 0, false)
 
 	// Add pages
@@ -725,7 +735,11 @@ func (m *Model) setupKeyBindings() {
 				return nil // consume to avoid exiting app
 			}
 
-			// For other focuses, just consume to prevent exit
+			if m.cancelHandler != nil && m.cancelHandler() {
+				if m.stateManager != nil {
+					m.stateManager.TransitionTo(AgentStateIdle, "任务已取消，等待用户输入", nil)
+				}
+			}
 			return nil
 		}
 
@@ -833,6 +847,19 @@ func (m *Model) SetInputHandler(handler func(string)) {
 // SetCancelHandler sets the handler invoked when user presses Ctrl+Z to cancel.
 func (m *Model) SetCancelHandler(handler func() bool) {
 	m.cancelHandler = handler
+}
+
+func (m *Model) SetConnectionStatus(state, detail string) {
+	m.connectionState = state
+	m.connectionDetail = detail
+	m.updateStatusBarDirect()
+}
+
+func (m *Model) UpdateSwarmRoster(roster string) {
+	m.swarmRoster = roster
+	if m.swarmBar != nil {
+		m.swarmBar.SetText("[gray]团队动态:[-] " + roster)
+	}
 }
 
 // SetNewSessionHandler sets the handler invoked when user presses Ctrl+R to start a new session.
@@ -1332,9 +1359,22 @@ func (m *Model) FinishStreaming() {
 		for i := len(m.messages) - 1; i >= 0; i-- {
 			if llmMsg, ok := m.messages[i].(*LLMResponseMessage); ok && llmMsg.Streaming {
 				llmMsg.Streaming = false
+				width := 100
+				if m.chatView != nil && m.chatView.GetPrimitive() != nil {
+					_, _, w, _ := m.chatView.GetPrimitive().GetRect()
+					if w > minMarkdownViewportWidth {
+						width = w
+					}
+				}
+				if rendered, err := uirender.Markdown(llmMsg.Content, uirender.MarkdownOptions{Width: width}); err == nil {
+					llmMsg.Content = rendered
+				} else {
+					logger.Warnf("markdown render failed: %v", err)
+				}
 				break
 			}
 		}
+		m.updateChatView()
 	}
 }
 
@@ -1537,6 +1577,8 @@ func (m *Model) updateInputFieldState() {
 // updateInputFieldStateDirect performs the actual input field updates.
 // This must be called from the UI goroutine only.
 func (m *Model) updateInputFieldStateDirect() {
+	m.inputStateMu.Lock()
+	defer m.inputStateMu.Unlock()
 	// 检查是否正在显示确认对话框，如果是则禁用输入框
 	if m.showingConfirm || m.showingUserConfirm {
 		m.inputField.SetPlaceholder("等待用户确认...")
@@ -1558,7 +1600,12 @@ func (m *Model) updateInputFieldStateDirect() {
 			m.inputField.SetDisabled(true)
 		case AgentStateProcessing, AgentStateThinking, AgentStateToolExecution:
 			// 处理状态下启用输入框但提示排队（支持队列模式）
-			m.inputField.SetPlaceholder("AI正在处理中，输入将排队处理 (Enter换行，双击Enter发送)")
+			queueSuffix := "，您的输入将在当前任务结束后处理 (双击Enter发送)"
+			placeholder := "⏳ AI 正在处理中" + queueSuffix
+			if currentState.AgentState == AgentStateToolExecution && currentState.ToolName != "" {
+				placeholder = fmt.Sprintf("⏳ 正在执行工具 [%s]%s", currentState.ToolName, queueSuffix)
+			}
+			m.inputField.SetPlaceholder(placeholder)
 			m.inputField.SetDisabled(false)
 		default:
 			// 其他状态启用输入框
@@ -1880,13 +1927,26 @@ func (m *Model) updateStatusBar() {
 	if m.stateManager != nil {
 		status.WriteString(m.stateManager.FormatStatusText())
 	}
+	if m.connectionState != "" {
+		fmt.Fprintf(&status, " | [green]● %s[-]", m.connectionState)
+		if m.connectionDetail != "" {
+			fmt.Fprintf(&status, " [gray]%s[-]", m.connectionDetail)
+		}
+	}
 	m.setStatusBarText(status.String())
 }
 
 func (m *Model) updateStatusBarDirect() {
 	if m.stateManager != nil {
 		hint := m.styles.GetColorTag("muted") + "Ctrl+R 新会话 | Ctrl+P 命令 | Ctrl+Z 取消 | Tab 切换 | q 退出" + m.styles.GetResetTag()
-		m.setStatusBarText(hint + " | " + m.stateManager.FormatStatusText())
+		conn := ""
+		if m.connectionState != "" {
+			conn = fmt.Sprintf(" | [green]● %s[-]", m.connectionState)
+			if m.connectionDetail != "" {
+				conn += fmt.Sprintf(" [gray]%s[-]", m.connectionDetail)
+			}
+		}
+		m.setStatusBarText(hint + " | " + m.stateManager.FormatStatusText() + conn)
 	}
 }
 

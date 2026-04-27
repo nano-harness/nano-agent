@@ -88,7 +88,7 @@ func NewShellTool(workingDir string, cfg map[string]interface{}, sandboxCfg *con
 	if dr, ok := cfg["deny_rules"].([]string); ok {
 		denyRules = dr
 	}
-	tool.guard = middleware.NewCommandGuard(allowRules, denyRules, nil)
+	tool.guard = middleware.NewCommandGuardWithWorkdir(allowRules, denyRules, nil, workingDir)
 
 	return tool
 }
@@ -201,7 +201,8 @@ func (t *ShellTool) Schema() *interfaces.ToolSchema { //nolint:revive
 	commandProp.Examples = []string{"git status", "npm install", "go test ./...", "docker ps"}
 	commandProp.Usage = "IMPORTANT: This tool is for terminal operations like git, npm, docker, build tools, etc. " +
 		"DO NOT use it for: file reading (use read_file), file writing (use write_file/edit_file), " +
-		"file searching (use search_file_content for content search or glob for filename/path matching), web fetching (use web_fetch), " +
+		"web fetching (use web_fetch), " +
+		"Use it for file listing and search with commands like ls, tree, find, fd, rg, git grep, or grep. " +
 		"skill installation (use manage_skill with action=install). " +
 		"Commands are security-filtered. Dangerous commands (rm, sudo, curl, wget, etc.) are blocked in daemon mode."
 

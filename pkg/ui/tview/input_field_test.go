@@ -1,6 +1,7 @@
 package tview
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +58,24 @@ func TestInputFieldStateManagement(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	t.Logf("Confirmation dialog hidden and idle state restored - input should be enabled")
+}
+
+func TestInputFieldToolExecutionPlaceholder(t *testing.T) {
+	model := NewModel()
+	defer model.Stop()
+
+	model.stateManager.SetToolExecution("run_shell_command", "")
+	time.Sleep(20 * time.Millisecond)
+
+	placeholder := model.inputField.GetPlaceholder()
+	for _, want := range []string{"工具", "run_shell_command"} {
+		if !strings.Contains(placeholder, want) {
+			t.Fatalf("placeholder %q should contain %q", placeholder, want)
+		}
+	}
+	if model.inputField.IsDisabled() {
+		t.Fatal("input field should remain enabled during tool execution")
+	}
 }
 
 func TestStateManagerCallback(t *testing.T) {

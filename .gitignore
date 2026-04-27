@@ -53,11 +53,13 @@ logs/
 *.json
 *.jsonl
 
+# Exception: banner manifest is required for embed
+!pkg/ui/bubbletea/banner/frames/manifest.json
+
 venv/
 
 __pycache__/
 
-.zoekt
 
 results
 

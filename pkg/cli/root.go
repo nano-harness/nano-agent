@@ -18,7 +18,9 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/runtime"
+	"github.com/nano-harness/nano-agent/pkg/ui"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
+	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea/banner"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
 	"github.com/nano-harness/nano-agent/pkg/version"
 	tea "github.com/charmbracelet/bubbletea"
@@ -152,6 +154,10 @@ func init() {
 	rootCmd.AddCommand(NewUpdateCommand())
 	rootCmd.AddCommand(NewRoutinesCommand())
 	rootCmd.AddCommand(NewSessionCommand())
+	// Swarm commands
+	rootCmd.AddCommand(NewChatCommand())
+	rootCmd.AddCommand(NewLeadChatCommand())
+	rootCmd.AddCommand(NewTeammateCommand())
 
 	// Flags for mode selection
 	rootCmd.PersistentFlags().BoolP("version", "v", false, "version for nano")
@@ -160,13 +166,16 @@ func init() {
 	rootCmd.Flags().Int("timeout", daemon.DefaultTaskTimeoutSeconds, "command timeout in seconds for daemon mode")
 	rootCmd.Flags().String("session-id", "", "session id for daemon mode execution")
 	rootCmd.PersistentFlags().StringP("config", "c", "", "config file path (optional, overrides auto-discovery)")
+	rootCmd.PersistentFlags().String("ui", string(ui.ModeBubbleTea), "TUI backend: bubbletea or tview")
 
 	// Experimental: Bubble Tea non-alt-screen TUI
 	rootCmd.Flags().Bool("tea", false, "use experimental Bubble Tea TUI (non alt-screen)")
+	rootCmd.Flags().Bool("no-banner", false, "disable startup ASCII banner animation in TUI mode")
 
 	// TUI session management flags
 	rootCmd.Flags().Bool("continue", false, "resume the most recent session in the current project (TUI mode)")
 	rootCmd.Flags().String("session", "", "use a specific session id (TUI mode); creates if not exists")
+	rootCmd.Flags().String("team", "", "start TUI in team-lead mode with mailbox support (TUI mode)")
 
 	// SWE-bench compatibility flags
 	rootCmd.Flags().Bool("binary-mode", false, "Enable binary mode for SWE-bench evaluation")
@@ -175,6 +184,26 @@ func init() {
 	// Permission mode flags
 	rootCmd.Flags().String("permission-mode", "", "permission mode: default, acceptEdits, yolo")
 	rootCmd.Flags().Bool("dangerously-skip-permissions", false, "skip all permission checks (equivalent to --permission-mode=yolo)")
+}
+
+func getUIMode(cmd *cobra.Command) ui.Mode {
+	raw := string(ui.ModeBubbleTea)
+	if cmd != nil {
+		if v, err := cmd.Flags().GetString("ui"); err == nil && strings.TrimSpace(v) != "" {
+			raw = v
+		} else if v, err := cmd.Root().PersistentFlags().GetString("ui"); err == nil && strings.TrimSpace(v) != "" {
+			raw = v
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(ui.ModeTView):
+		return ui.ModeTView
+	case string(ui.ModeBubbleTea), "":
+		return ui.ModeBubbleTea
+	default:
+		logger.Warnf("unknown --ui value %q; falling back to bubbletea", raw)
+		return ui.ModeBubbleTea
+	}
 }
 
 // initConfig reads configuration from multiple sources in priority order
@@ -448,7 +477,7 @@ func runDaemonClientMode(cmd *cobra.Command, args []string) {
 	client := createDaemonClient()
 
 	// Execute command
-	response, err := executeDaemonCommandStreaming(client, command, sessionID, timeout, false)
+	response, err := client.ExecuteInSession(command, sessionID, timeout, false, false)
 	if err != nil {
 		color.Red("❌ Failed to execute command via daemon: %v", err)
 		color.Yellow("💡 Try 'nano --tui \"%s\"' to run in TUI mode instead.", command)
@@ -607,7 +636,15 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 	}
 
 	// Build the engine (agent + scheduler + watcher) using the approval handler
-	eng, err := engine.New(cfg, approvalHandler)
+	// Check if team-lead mode is requested
+	var eng *engine.Engine
+	teamName, _ := cmd.Flags().GetString("team")
+	if teamName != "" {
+		logger.Infof("Starting TUI in team-lead mode for team '%s'", teamName)
+		eng, err = engine.NewLeadEngine(cfg, approvalHandler, teamName)
+	} else {
+		eng, err = engine.New(cfg, approvalHandler)
+	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
 		os.Exit(1)
@@ -667,7 +704,7 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 		initialCommand = strings.Join(args, " ")
 	}
 
-	// Redirect stdout to prevent third-party library logs (like zoekt "loading shards") from interfering with TUI
+	// Redirect stdout to prevent third-party library logs from interfering with TUI
 	originalStdout := os.Stdout
 	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err == nil {
@@ -694,6 +731,9 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 			case event.EventTypeDone:
 				integration.GetModel().GetStateManager().SetIdle()
 			case event.EventTypeToolUse:
+				if streamEvent.ToolUse != nil {
+					integration.GetModel().GetStateManager().SetToolExecution(streamEvent.ToolUse.ToolName, "")
+				}
 				integration.GetModel().AddToolUse(streamEvent.ToolUse)
 			case event.EventTypeTokenStats:
 				integration.GetModel().GetStateManager().UpdateTokenStats(streamEvent.TokenStats)
@@ -778,6 +818,9 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 				case event.EventTypeDone:
 					integration.GetModel().GetStateManager().SetIdle()
 				case event.EventTypeToolUse:
+					if streamEvent.ToolUse != nil {
+						integration.GetModel().GetStateManager().SetToolExecution(streamEvent.ToolUse.ToolName, "")
+					}
 					integration.GetModel().AddToolUse(streamEvent.ToolUse)
 				case event.EventTypeTokenStats:
 					integration.GetModel().GetStateManager().UpdateTokenStats(streamEvent.TokenStats)
@@ -961,6 +1004,15 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 		return false
 	}
 
+	// Play banner animation BEFORE redirecting stdout (so banner is visible to user)
+	noBanner, _ := cmd.Flags().GetBool("no-banner")
+	if !noBanner {
+		_ = banner.Play(os.Stdout, banner.Options{
+			Theme:    banner.DefaultTheme,
+			Colorize: banner.IsInteractiveTTY(),
+		})
+	}
+
 	// Redirect stdout to prevent third-party library logs from interfering with BubbleTea TUI
 	originalStdout := os.Stdout
 	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
@@ -985,7 +1037,15 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 
 	// Build the engine (agent + scheduler + watcher) using the approval handler
 	// defined above. agentInstance is assigned here so the closure can resolve it.
-	eng, err := engine.New(cfg, approvalHandler)
+	// Check if team-lead mode is requested
+	var eng *engine.Engine
+	teamName, _ := cmd.Flags().GetString("team")
+	if teamName != "" {
+		logger.Infof("Starting Bubble Tea TUI in team-lead mode for team '%s'", teamName)
+		eng, err = engine.NewLeadEngine(cfg, approvalHandler, teamName)
+	} else {
+		eng, err = engine.New(cfg, approvalHandler)
+	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
 		os.Exit(1)

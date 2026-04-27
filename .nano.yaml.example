@@ -89,7 +89,7 @@ sub_agents:
     # - "web_*" matches all web-related tools
     # - "file_*" matches all file operation tools
     # - "?" matches any single character
-    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "list_directory", "glob", "search_file_content", "mcp_*", "mem0_memory"]
+    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "mcp_*", "mem0_memory"]
     auto_save_memory: true                 # Auto-save conversation to Mem0 (requires memory tools in allowed_tools)
     enabled: true                          # Enable this sub-agent
 
@@ -101,7 +101,7 @@ sub_agents:
     model_base_url: "https://api.openai.com/v1"  # Optional: Custom base URL for this sub-agent's model
     model_api_key: "sk-your-openai-api-key"      # Optional: Custom API key for this sub-agent's model
     # Example using wildcard patterns for tool filtering
-    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "list_directory", "glob", "search_file_content", "mcp_web_*", "mem0_memory"]
+    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "mcp_web_*", "mem0_memory"]
     auto_save_memory: false                # Disable auto-save of conversation
     enabled: true                          # Enable this sub-agent
 
@@ -112,7 +112,7 @@ sub_agents:
     # New fields for independent model configuration
     model_base_url: "https://api.openai.com/v1"  # Optional: Custom base URL for this sub-agent's model
     model_api_key: "sk-your-openai-api-key"      # Optional: Custom API key for this sub-agent's model
-    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "list_directory", "glob", "search_file_content", "mem0_memory", "task_done"]
+    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "mem0_memory", "task_done"]
     auto_save_memory: false                # Disable auto-save of conversation
     enabled: true                          # Enable this sub-agent
 
@@ -123,7 +123,7 @@ sub_agents:
     # New fields for independent model configuration
     model_base_url: "https://api.openai.com/v1"  # Optional: Custom base URL for this sub-agent's model
     model_api_key: "sk-your-openai-api-key"      # Optional: Custom API key for this sub-agent's model
-    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "list_directory", "glob", "search_file_content", "mem0_memory", "task_done"]
+    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "mem0_memory", "task_done"]
     auto_save_memory: true                 # Auto-save conversation to Mem0
     enabled: true                          # Enable this sub-agent
 
@@ -134,7 +134,7 @@ sub_agents:
     # New fields for independent model configuration - Example with Anthropic
     model_base_url: "https://api.anthropic.com/v1"  # Optional: Custom base URL for this sub-agent's model
     model_api_key: "sk-ant-your-anthropic-api-key"  # Optional: Custom API key for this sub-agent's model
-    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "list_directory", "glob", "search_file_content", "mem0_memory", "task_done"]
+    allowed_tools: ["web_search", "workspace_manager", "write_file", "read_file", "mem0_memory", "task_done"]
     auto_save_memory: true                 # Auto-save conversation to Mem0
     enabled: true                          # Enable this sub-agent
 
@@ -200,8 +200,27 @@ daemon:
   # Examples:
   # allowlisted_tools:
   #   - "read_file"
-  #   - "list_directory"
+  #   - "run_shell_command"
   #   - "web_search"
+
+# Mailbox Configuration
+# Multi-agent asynchronous message passing system for sub-agent communication
+# Enables structured communication between parent and child agents during fork-based execution
+# Backend options:
+#   - "memory": In-memory storage (default for CLI mode, not persistent across restarts)
+#   - "file": File-based storage (recommended for daemon mode, supports crash recovery)
+mailbox:
+  enabled: false                # Enable/disable mailbox system
+  backend: "memory"             # Storage backend: "memory" or "file"
+  root_dir: ""                  # Root directory for file backend (default: ~/.nano-agent/mailbox)
+  ttl_days: 7                   # Message time-to-live in days (expired messages auto-cleaned)
+  max_per_agent: 1000           # Maximum messages per agent inbox (oldest dropped when exceeded)
+  max_body_kb: 16               # Maximum message body size in KB
+  ack_timeout_sec: 10           # Timeout for acknowledging drained messages (seconds)
+  injection_limit: 5            # Maximum messages injected per turn
+  injection_max_kb: 4           # Maximum total size of injected messages per turn (KB)
+  guidance_prompt_enabled: true # Include guidance text in mailbox injection
+  janitor_interval_sec: 300     # Janitor cleanup interval in seconds (0 = disabled)
 
 # Watcher Configuration
 # Event-driven monitoring rules that poll external sources at regular intervals

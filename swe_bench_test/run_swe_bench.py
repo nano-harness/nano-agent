@@ -298,7 +298,6 @@ class SWEBenchRunner:
             "NANO_WEB_SEARCH_MAX_RESULTS": "10",
             "NANO_FILE_DIFF_MAX_LINES": "500",
             "NANO_GIT_MAX_LOG_ENTRIES": "100",
-            "NANO_LIST_DIRECTORY_MAX_DEPTH": "3",
 
             # Profiling (pprof) 设置：启用并在二进制模式下监听容器本地端口
             "NANO_ENABLE_PPROF": os.getenv("NANO_ENABLE_PPROF", "true"),

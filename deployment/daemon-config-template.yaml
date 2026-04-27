@@ -178,7 +178,7 @@ sandbox:
   network_access: true
 
   # 文件系统工具路径白名单（空列表 = 不限制）。
-  # 非空时, read_file/write_file/edit_file/delete_file/list_directory 只允许访问列表内路径。
+  # 非空时, read_file/write_file/edit_file/delete_file 只允许访问列表内路径。
   # 通过环境变量 NANO_SANDBOX_ALLOWED_PATHS=path1,path2 设置。
   allowed_paths: []
 

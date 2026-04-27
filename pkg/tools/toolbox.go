@@ -20,7 +20,6 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/tools/filesystem"
 	mcptool "github.com/nano-harness/nano-agent/pkg/tools/mcp"
 	openspectool "github.com/nano-harness/nano-agent/pkg/tools/openspec"
-	"github.com/nano-harness/nano-agent/pkg/tools/search"
 	"github.com/nano-harness/nano-agent/pkg/tools/system"
 	"github.com/nano-harness/nano-agent/pkg/tools/web"
 	"github.com/nano-harness/nano-agent/pkg/tools/workspace"
@@ -254,43 +253,7 @@ func (tb *Toolbox) SetMiddlewareChain(chain *middleware.Chain) {
 // registerDefaultTools registers the default set of tools
 func (tb *Toolbox) registerDefaultTools() {
 	// Get toolbox config for tools
-	config := make(map[string]interface{})
-	if tb.config != nil {
-		// Only propagate command allow/block lists if provided; preserve tool defaults otherwise
-		if len(tb.config.AllowedCommands) > 0 {
-			config["allowed_commands"] = tb.config.AllowedCommands
-		}
-		if len(tb.config.BlockedCommands) > 0 {
-			config["blocked_commands"] = tb.config.BlockedCommands
-		}
-		config["max_file_size"] = tb.config.MaxFileSize
-		config["max_response_size"] = tb.config.MaxResponseSize
-		config["timeout"] = tb.config.Timeout
-		config["user_agent"] = tb.config.UserAgent
-
-		// Pass tool-specific configurations
-		config["read_file_max_lines"] = tb.config.ReadFileMaxLines
-		config["search_max_results"] = tb.config.SearchMaxResults
-		config["web_request_timeout"] = tb.config.WebRequestTimeout
-		config["web_search_timeout"] = tb.config.WebSearchTimeout
-		config["web_max_content_size"] = tb.config.WebMaxContentSize
-		config["web_search_max_results"] = tb.config.WebSearchMaxResults
-		config["file_diff_max_lines"] = tb.config.FileDiffMaxLines
-		config["git_max_log_entries"] = tb.config.GitMaxLogEntries
-
-		// NEW: propagate environment filtering and strict mode to tools
-		config["allowed_env_vars"] = tb.config.AllowedEnvVars
-		config["blocked_env_vars"] = tb.config.BlockedEnvVars
-		config["strict"] = tb.config.Strict
-
-		// NEW: propagate image generator settings to web tools
-		if tb.config.ImageAPIKey != "" {
-			config["image_api_key"] = tb.config.ImageAPIKey
-		}
-		if tb.config.ImageBaseURL != "" {
-			config["image_base_url"] = tb.config.ImageBaseURL
-		}
-	}
+	config := tb.config.ToolConfigMap()
 
 	// Build enabled/disabled sets for filtering
 	var enabledSet map[string]struct{}
@@ -342,10 +305,7 @@ func (tb *Toolbox) registerDefaultTools() {
 		filesystem.NewCodeSkeletonTool(tb.workingDir, config, nil),
 		filesystem.NewWriteFileToolWithState(tb.workingDir, config, pathChecker, readFileState),
 		filesystem.NewEditToolWithState(tb.workingDir, config, pathChecker, readFileState),
-		filesystem.NewLSTool(tb.workingDir, config, pathChecker),
 		filesystem.NewDeleteToolWithState(tb.workingDir, config, pathChecker, readFileState),
-		search.NewGrepTool(tb.workingDir, config, pathChecker),
-		search.NewGlobTool(tb.workingDir, config, pathChecker),
 		system.NewShellToolWithBgManager(tb.workingDir, config, sandboxCfg, bgManager),
 		system.NewTodoWriteTool(),
 		system.NewBashOutputTool(bgManager),
@@ -445,6 +405,16 @@ func (tb *Toolbox) Get(name string) (interfaces.Tool, bool) {
 // List returns all available tools
 func (tb *Toolbox) List() []interfaces.Tool {
 	return tb.registry.List()
+}
+
+// Descriptors returns typed metadata for all registered tools.
+func (tb *Toolbox) Descriptors() []ToolDescriptor {
+	registered := tb.registry.List()
+	descriptors := make([]ToolDescriptor, 0, len(registered))
+	for _, tool := range registered {
+		descriptors = append(descriptors, DescriptorFor(tool))
+	}
+	return descriptors
 }
 
 // ListByCategory returns tools in a specific category

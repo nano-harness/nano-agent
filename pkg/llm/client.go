@@ -1,12 +1,9 @@
 package llm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -16,8 +13,6 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
-	"github.com/openai/openai-go/v3/shared"
 )
 
 // MessageContent represents content that can be text or image
@@ -62,6 +57,7 @@ type Client struct {
 	client         openai.Client
 	model          string
 	baseURL        string
+	provider       ProviderInfo
 	tools          []interfaces.Tool
 	tokenCounter   *TokenCounter
 	validator      *event.EventValidator
@@ -69,165 +65,21 @@ type Client struct {
 	circuitBreaker *CircuitBreaker
 }
 
-const defaultOpenAIBaseURL = "https://api.openai.com/v1"
-
-// loggingRoundTripper wraps an http.RoundTripper to log requests and responses
-type loggingRoundTripper struct {
-	wrapped http.RoundTripper
-}
-
-// Log truncation limits for HTTP debug output.
-const (
-	requestBodyDisplayLimit  = 2000                         // max chars shown from request body
-	requestBodyReadLimit     = requestBodyDisplayLimit + 1  // +1 detects truncation
-	responseBodyDisplayLimit = 1000                         // max chars shown from error response body
-	responseBodyReadLimit    = responseBodyDisplayLimit + 1 // +1 detects truncation
-)
-
-// RoundTrip implements http.RoundTripper interface with logging
-func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Log request
-	logger.Debugf("[HTTP] → %s %s", req.Method, req.URL.String())
-
-	// Log headers (with Authorization redaction)
-	for key, values := range req.Header {
-		for _, value := range values {
-			if strings.EqualFold(key, "Authorization") {
-				// Redact authorization header: log only the auth scheme, never any token characters
-				fields := strings.Fields(value)
-				if len(fields) > 0 {
-					logger.Debugf("[HTTP]   %s: %s [REDACTED]", key, fields[0])
-				} else {
-					logger.Debugf("[HTTP]   %s: [REDACTED]", key)
-				}
-			} else {
-				logger.Debugf("[HTTP]   %s: %s", key, value)
-			}
-		}
-	}
-
-	// Log request body without consuming the live request stream
-	if req.Body != nil {
-		if req.GetBody != nil {
-			bodyReader, err := req.GetBody()
-			if err != nil {
-				logger.Debugf("[HTTP] Request body: unable to clone body for logging: %v", err)
-			} else {
-				defer func() { _ = bodyReader.Close() }()
-				bodyBytes, err := io.ReadAll(io.LimitReader(bodyReader, requestBodyReadLimit))
-				if err != nil {
-					logger.Debugf("[HTTP] Request body: unable to read cloned body for logging: %v", err)
-				} else {
-					bodyStr := string(bodyBytes)
-					if len(bodyStr) >= requestBodyReadLimit {
-						bodyStr = bodyStr[:requestBodyDisplayLimit] + "..."
-					}
-					logger.Debugf("[HTTP] Request body (%d bytes): %s", len(bodyBytes), bodyStr)
-				}
-			}
-		} else {
-			logger.Debugf("[HTTP] Request body present but cannot be logged safely: GetBody is nil")
-		}
-	}
-
-	// Execute the actual request
-	resp, err := l.wrapped.RoundTrip(req)
-	if err != nil {
-		logger.Debugf("[HTTP] ← Error: %v", err)
-		return resp, err
-	}
-
-	// Log response
-	logger.Debugf("[HTTP] ← %s", resp.Status)
-
-	// Log error response bodies (4xx/5xx)
-	if resp.StatusCode >= 400 {
-		if resp.Body != nil {
-			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, responseBodyReadLimit))
-			// Always restore the body: re-combine what we read with remaining stream
-			resp.Body = io.NopCloser(io.MultiReader(bytes.NewBuffer(bodyBytes), resp.Body))
-			if readErr != nil {
-				logger.Debugf("[HTTP] Error response body: failed to read: %v", readErr)
-			} else {
-				bodyStr := string(bodyBytes)
-				if len(bodyStr) >= responseBodyReadLimit {
-					bodyStr = bodyStr[:responseBodyDisplayLimit] + "..."
-				}
-				logger.Debugf("[HTTP] Error response body: %s", bodyStr)
-			}
-		}
-	}
-
-	return resp, nil
-}
-
 // NewClient creates a new optimized LLM client using official OpenAI SDK
 func NewClient(apiKey, baseURL, model string, tools []interfaces.Tool) *Client {
-	// Get timeout from config
 	cfg := config.Get()
-	httpTimeout := 60 * time.Second // default fallback
-	if cfg != nil {
-		httpTimeout = cfg.HTTPTimeout
-	}
-
-	// Configure HTTP client for streaming-friendly behavior:
-	// - Do NOT set http.Client.Timeout (set to 0) because it limits total body read time and breaks long-lived streams
-	// - Use Transport.ResponseHeaderTimeout to bound the time to first byte/headers
-	transport := &http.Transport{
-		ResponseHeaderTimeout: httpTimeout,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
-	// Wrap transport with HTTP logger when verbose mode is enabled
-	var httpTransport http.RoundTripper = transport
-	if cfg != nil && cfg.Verbose {
-		httpTransport = &loggingRoundTripper{wrapped: transport}
-	}
-
-	// Configure client options
-	opts := []option.RequestOption{
-		option.WithAPIKey(apiKey),
-		option.WithHTTPClient(&http.Client{
-			Timeout:   0, // rely on context deadlines for total request lifetime
-			Transport: httpTransport,
-		}),
-	}
-
-	// Add custom base URL if provided (for DeepSeek compatibility)
-	if baseURL != "" && baseURL != defaultOpenAIBaseURL {
-		opts = append(opts, option.WithBaseURL(baseURL))
-	}
-
 	tokenCounter, _ := NewTokenCounter(model)
-
-	// Configure circuit breaker with config overrides if available
-	cbCfg := DefaultCircuitBreakerConfig()
-	if cfg != nil && cfg.Advanced != nil && cfg.Advanced.CircuitBreaker != nil {
-		cbAdv := cfg.Advanced.CircuitBreaker
-		if cbAdv.MaxRetries > 0 {
-			cbCfg.MaxRetries = cbAdv.MaxRetries
-		}
-		if cbAdv.BaseDelayMs > 0 {
-			cbCfg.BaseDelay = time.Duration(cbAdv.BaseDelayMs) * time.Millisecond
-		}
-		if cbAdv.MaxDelayMs > 0 {
-			cbCfg.MaxDelay = time.Duration(cbAdv.MaxDelayMs) * time.Millisecond
-		}
-		if cbAdv.OpenTimeoutMs > 0 {
-			cbCfg.OpenTimeout = time.Duration(cbAdv.OpenTimeoutMs) * time.Millisecond
-		}
-	}
+	opts := newOpenAIRequestOptions(apiKey, baseURL, cfg)
 
 	client := &Client{
 		client:         openai.NewClient(opts...),
 		model:          model,
 		baseURL:        baseURL,
+		provider:       NewProviderInfo(baseURL),
 		tools:          tools,
 		tokenCounter:   tokenCounter,
 		config:         cfg, // Store config for reasoning support
-		circuitBreaker: NewCircuitBreaker(cbCfg),
+		circuitBreaker: newCircuitBreakerFromConfig(cfg),
 	}
 
 	return client
@@ -298,21 +150,9 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 	tokenStats.SetInputTokens(inputTokens)
 	tokenStats.StartStreaming() // Initialize streaming mode
 
-	// Show thinking indicator with reasoning info if enabled
-	thinkingContent := "正在思考..."
-	if c.config != nil && c.config.Reasoning != nil && c.config.Reasoning.IsEffectivelyEnabled() {
-		if c.config.Reasoning.MaxTokens > 0 {
-			thinkingContent = fmt.Sprintf("正在思考（推理令牌限制: %d）...", c.config.Reasoning.MaxTokens)
-		} else if c.config.Reasoning.Effort != "" {
-			thinkingContent = fmt.Sprintf("正在思考（推理强度: %s）...", c.config.Reasoning.Effort)
-		} else {
-			thinkingContent = "正在思考（推理模式）..."
-		}
-	}
-
 	sanitizedOnEvent(event.StreamEvent{
 		Type:    event.EventTypeThinking,
-		Content: thinkingContent,
+		Content: c.thinkingStatusMessage(),
 	})
 
 	// Convert our messages to OpenAI format
@@ -335,41 +175,8 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 	extraFields := make(map[string]interface{})
 	c.maybeSetReasoningMessagesOverride(extraFields, messages)
 
-	// Add reasoning parameters if enabled with graceful degradation
-	reasoningEnabled := false
-	if c.config != nil && c.config.Reasoning != nil && c.config.Reasoning.IsEffectivelyEnabled() {
-		logger.Debugf("Reasoning tokens enabled for model %s", c.model)
-
-		// Set effort level or max tokens
-		if c.config.Reasoning.MaxTokens > 0 {
-			extraFields["reasoning"] = map[string]interface{}{
-				"max_tokens": c.config.Reasoning.MaxTokens,
-			}
-			logger.Debugf("Using reasoning max_tokens: %d", c.config.Reasoning.MaxTokens)
-			reasoningEnabled = true
-		} else if c.config.Reasoning.Effort != "" {
-			extraFields["reasoning"] = map[string]interface{}{
-				"effort": c.config.Reasoning.Effort,
-			}
-			logger.Debugf("Using reasoning effort level: %s", c.config.Reasoning.Effort)
-			reasoningEnabled = true
-		} else {
-			logger.Warnf("推理功能已启用但未指定effort级别或max_tokens，将使用默认配置")
-		}
-
-		// Set exclude parameter
-		if c.config.Reasoning.Exclude {
-			extraFields["reasoning_exclude"] = true
-			logger.Debugf("Reasoning tokens will be excluded from response")
-		}
-
-		// Set reasoning statistics
-		if reasoningEnabled {
-			tokenStats.SetReasoningEnabled(true, c.config.Reasoning.Effort)
-		}
-	} else {
-		logger.Debugf("Reasoning tokens disabled or not configured")
-	}
+	// Add reasoning parameters if enabled with graceful degradation.
+	reasoningEnabled := c.applyReasoningRequestOptions(extraFields, tokenStats)
 
 	// When reasoning/thinking is enabled and tools are present, explicitly set
 	// tool_choice to "auto" to prevent providers (dashscope, gemini, etc.) from
@@ -409,24 +216,11 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 		// Create streaming request with reasoning fallback mechanism
 		stream := c.client.Chat.Completions.NewStreaming(streamCtx, params)
 
-		var responseContent strings.Builder
-		var reasoningContent strings.Builder // Accumulate reasoning content
+		assembler := NewStreamAssembler()
 		var toolCalls []tools.ToolCall
 		var lastThinkingSendTime time.Time
 		const thinkingSendInterval = 300 * time.Millisecond
 		var lastSentReasoningLen int
-
-		// A map to store partial tool call data, keyed by tool ID.
-		// This allows handling multiple tool calls streamed in parallel.
-		type toolCallBuilder struct {
-			ID          string
-			Name        string
-			Arguments   strings.Builder
-			NameCounted bool
-		}
-
-		partialToolCalls := make(map[int]*toolCallBuilder)
-		toolCallOrder := []int{}
 
 		// Process streaming response
 		for stream.Next() {
@@ -474,12 +268,12 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 				var deltaMap map[string]interface{}
 				if err := json.Unmarshal([]byte(rawJSON), &deltaMap); err == nil {
 					if reasoningStr, ok := deltaMap["reasoning_content"].(string); ok && reasoningStr != "" {
-						reasoningContent.WriteString(reasoningStr)
+						assembler.AddReasoning(reasoningStr)
 						// Send streaming thinking event with throttling to enable real-time display.
 						// Content is intentionally left empty to avoid overwriting any more
 						// informative title set by the initial thinking event.
 						if time.Since(lastThinkingSendTime) >= thinkingSendInterval {
-							fullContent := reasoningContent.String()
+							fullContent := assembler.Reasoning()
 							delta := fullContent[lastSentReasoningLen:]
 							sanitizedOnEvent(event.StreamEvent{
 								Type:           event.EventTypeThinking,
@@ -495,7 +289,7 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 
 			// Handle text content
 			if delta.Content != "" {
-				responseContent.WriteString(delta.Content)
+				assembler.AddContent(delta.Content)
 
 				// Count output tokens
 				outputTokens := 0
@@ -522,94 +316,41 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 				for _, toolCallChunk := range delta.ToolCalls {
 					// Aggregate by per-call index because subsequent chunks may omit the ID
 					idx := int(toolCallChunk.Index)
-
-					// Initialize builder for this index if first time seen
-					if _, ok := partialToolCalls[idx]; !ok {
-						partialToolCalls[idx] = &toolCallBuilder{}
-						toolCallOrder = append(toolCallOrder, idx)
+					if nameStarted := assembler.AddToolCallDelta(
+						idx,
+						toolCallChunk.ID,
+						toolCallChunk.Function.Name,
+						toolCallChunk.Function.Arguments,
+					); nameStarted {
+						nameTokens := 0
+						if c.tokenCounter != nil {
+							nameTokens = c.tokenCounter.CountTokens(assembler.ToolCallName(idx))
+						} else {
+							nameTokens = EstimateTokensFromChars(assembler.ToolCallName(idx))
+						}
+						tokenStats.AddOutputTokens(nameTokens)
+						statsEvent := event.NewStreamEvent(event.EventTypeTokenStats, "llm_client")
+						statsEvent.TokenStats = tokenStats.GetEvent()
+						sanitizedOnEvent(statsEvent)
 					}
-
-					// Update builder with current chunk data
-					if builder := partialToolCalls[idx]; builder != nil {
-						// Capture ID when available (may be present only in the first chunk)
-						if builder.ID == "" && toolCallChunk.ID != "" {
-							builder.ID = toolCallChunk.ID
+					if toolCallChunk.Function.Arguments != "" {
+						argTokens := 0
+						if c.tokenCounter != nil {
+							argTokens = c.tokenCounter.CountTokens(toolCallChunk.Function.Arguments)
+						} else {
+							argTokens = EstimateTokensFromChars(toolCallChunk.Function.Arguments)
 						}
-						// Capture name when available and count once
-						if toolCallChunk.Function.Name != "" && builder.Name == "" {
-							builder.Name = toolCallChunk.Function.Name
-							if !builder.NameCounted {
-								nameTokens := 0
-								if c.tokenCounter != nil {
-									nameTokens = c.tokenCounter.CountTokens(builder.Name)
-								} else {
-									nameTokens = EstimateTokensFromChars(builder.Name)
-								}
-								tokenStats.AddOutputTokens(nameTokens)
-								builder.NameCounted = true
-								statsEvent := event.NewStreamEvent(event.EventTypeTokenStats, "llm_client")
-								statsEvent.TokenStats = tokenStats.GetEvent()
-								sanitizedOnEvent(statsEvent)
-							}
-						}
-						// Append argument chunks and count incrementally
-						if toolCallChunk.Function.Arguments != "" {
-							builder.Arguments.WriteString(toolCallChunk.Function.Arguments)
-							argTokens := 0
-							if c.tokenCounter != nil {
-								argTokens = c.tokenCounter.CountTokens(toolCallChunk.Function.Arguments)
-							} else {
-								argTokens = EstimateTokensFromChars(toolCallChunk.Function.Arguments)
-							}
-							tokenStats.AddOutputTokens(argTokens)
-							statsEvent := event.NewStreamEvent(event.EventTypeTokenStats, "llm_client")
-							statsEvent.TokenStats = tokenStats.GetEvent()
-							sanitizedOnEvent(statsEvent)
-						}
+						tokenStats.AddOutputTokens(argTokens)
+						statsEvent := event.NewStreamEvent(event.EventTypeTokenStats, "llm_client")
+						statsEvent.TokenStats = tokenStats.GetEvent()
+						sanitizedOnEvent(statsEvent)
 					}
 				}
 			}
 
 			// Check if stream is finished
 			if choice.FinishReason != "" {
-				// Finalize all tool calls
-				for _, idx := range toolCallOrder {
-					if builder, ok := partialToolCalls[idx]; ok {
-						// Validate tool call has required fields
-						if builder.Name == "" {
-							logger.Warnf("第%d个工具调用缺少名称，已跳过", idx)
-							continue
-						}
-
-						toolCall := tools.ToolCall{
-							ID:   builder.ID,
-							Name: builder.Name,
-						}
-
-						// Parse accumulated arguments
-						var args map[string]interface{}
-						argumentsStr := builder.Arguments.String()
-						logger.Debugf("Raw arguments for tool %s: %s", toolCall.Name, argumentsStr)
-
-						if strings.TrimSpace(argumentsStr) != "" {
-							if err := json.Unmarshal([]byte(argumentsStr), &args); err != nil {
-								logger.Warnf("Failed to parse tool call arguments for %s (raw: %s): %v", toolCall.Name, argumentsStr, err)
-								args = make(map[string]interface{})
-							}
-						} else {
-							// Check if tool requires parameters but none provided
-							if c.toolRequiresParameters(toolCall.Name) {
-								logger.Warnf("Tool %s requires parameters but none provided; proceeding with empty arguments", toolCall.Name)
-							}
-							// Initialize empty args map when no arguments provided
-							args = make(map[string]interface{})
-						}
-
-						toolCall.Arguments = args
-						toolCalls = append(toolCalls, toolCall)
-						logger.Debugf("Successfully parsed tool call: %s with args: %v", toolCall.Name, toolCall.Arguments)
-					}
-				}
+				toolCalls = assembler.FinalizeToolCalls(c.toolRequiresParameters)
 				break
 			}
 		}
@@ -629,7 +370,7 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 
 			// Only retry if no content was streamed (safe to retry)
 			// and the error is retryable (rate limit, server error, etc.)
-			if attempt < maxRetries && responseContent.Len() == 0 && IsRetryableError(err) {
+			if attempt < maxRetries && assembler.ContentLen() == 0 && IsRetryableError(err) {
 				lastErr = err
 				if c.circuitBreaker != nil {
 					c.circuitBreaker.RecordFailure()
@@ -679,7 +420,7 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 		}
 
 		// Finalize response without tool execution
-		return c.finalizeResponse(responseContent.String(), reasoningContent.String(), toolCalls, sanitizedOnEvent, tokenStats)
+		return c.finalizeResponse(assembler.Content(), assembler.Reasoning(), toolCalls, sanitizedOnEvent, tokenStats)
 	}
 
 	// All retries exhausted (should not normally reach here)
@@ -688,26 +429,6 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 		return fmt.Errorf("LLM API request failed after %d total attempts: %w", totalAttempts, lastErr)
 	}
 	return fmt.Errorf("LLM API request failed after %d total attempts", totalAttempts)
-}
-
-func shouldFallbackWithoutReasoning(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "401") || strings.Contains(msg, "unauthorized") || strings.Contains(msg, "invalid api key") {
-		return false
-	}
-	if strings.Contains(msg, "403") || strings.Contains(msg, "forbidden") {
-		return false
-	}
-	if strings.Contains(msg, "429") && (strings.Contains(msg, "insufficient_quota") ||
-		strings.Contains(msg, "exceeded your current quota") ||
-		strings.Contains(msg, "billing") ||
-		strings.Contains(msg, "token-limit")) {
-		return false
-	}
-	return true
 }
 
 // streamCompletionWithoutReasoning performs streaming completion without reasoning parameters
@@ -1024,68 +745,6 @@ func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages 
 	return fmt.Errorf("fallback LLM API request failed after %d total attempts", totalAttempts)
 }
 
-// needsReasoningContentInMessages checks if the current API provider requires
-// reasoning_content field in assistant messages when reasoning/thinking is enabled.
-func (c *Client) needsReasoningContentInMessages() bool {
-	// Only needed when reasoning is actually enabled
-	if c.config == nil || c.config.Reasoning == nil || !c.config.Reasoning.IsEffectivelyEnabled() {
-		return false
-	}
-	effectiveBaseURL := strings.TrimSpace(c.baseURL)
-	if effectiveBaseURL == "" {
-		effectiveBaseURL = defaultOpenAIBaseURL
-	}
-	// Known providers that require reasoning_content in messages
-	lowerURL := strings.ToLower(effectiveBaseURL)
-	knownProviders := []string{"deepseek", "moonshot"}
-	for _, provider := range knownProviders {
-		if strings.Contains(lowerURL, provider) {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Client) maybeSetReasoningMessagesOverride(extraFields map[string]interface{}, messages []Message) {
-	if extraFields == nil {
-		return
-	}
-	if !c.needsReasoningContentInMessages() {
-		return
-	}
-
-	openaiMessages := c.convertMessages(messages)
-	rawMessages := make([]map[string]interface{}, 0, len(openaiMessages))
-
-	for idx, msg := range openaiMessages {
-		msgJSON, err := json.Marshal(msg)
-		if err != nil {
-			logger.Warnf("Failed to marshal message for reasoning override: %v", err)
-			continue
-		}
-
-		var msgMap map[string]interface{}
-		if err := json.Unmarshal(msgJSON, &msgMap); err != nil {
-			logger.Warnf("Failed to unmarshal message for reasoning override: %v", err)
-			continue
-		}
-
-		if role, ok := msgMap["role"].(string); ok && role == "assistant" {
-			reasoning := ""
-			if idx < len(messages) && messages[idx].Role == "assistant" {
-				reasoning = messages[idx].Reasoning
-			}
-			msgMap["reasoning_content"] = reasoning
-		}
-
-		rawMessages = append(rawMessages, msgMap)
-	}
-
-	if len(rawMessages) > 0 {
-		extraFields["messages"] = rawMessages
-	}
-}
-
 // StreamCompletionWithoutReasoning performs streaming completion with reasoning disabled for this call.
 // Use this for tasks like context compression summarization where thinking/reasoning tokens are unnecessary.
 func (c *Client) StreamCompletionWithoutReasoning(ctx context.Context, messages []Message, onEvent func(event.StreamEvent)) error {
@@ -1184,288 +843,6 @@ func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []
 	onEvent(doneEvent)
 
 	return nil
-}
-
-// validateMessageSequence checks if messages follow OpenAI API requirements
-func (c *Client) validateMessageSequence(messages []Message) error {
-	for i, msg := range messages {
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			// Assistant message with tool calls must be followed by tool messages
-			hasFollowingToolMessage := false
-
-			// Look for tool messages after this assistant message
-			for j := i + 1; j < len(messages); j++ {
-				nextMsg := messages[j]
-				if nextMsg.Role == "tool" {
-					hasFollowingToolMessage = true
-					break
-				}
-				// If we encounter another assistant message before finding a tool message,
-				// the sequence is invalid
-				if nextMsg.Role == "assistant" {
-					break
-				}
-			}
-
-			if !hasFollowingToolMessage {
-				return fmt.Errorf("assistant message at index %d has tool_calls but no following tool messages", i)
-			}
-		}
-	}
-	return nil
-}
-
-// cleanupMessages removes incomplete tool call sequences from messages
-func (c *Client) cleanupMessages(messages []Message) []Message {
-	if len(messages) == 0 {
-		return messages
-	}
-
-	var cleanedMessages []Message
-
-	for i, msg := range messages {
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			// Check if this assistant message with tool calls has following tool messages
-			hasFollowingToolMessage := false
-
-			for j := i + 1; j < len(messages); j++ {
-				nextMsg := messages[j]
-				if nextMsg.Role == "tool" {
-					hasFollowingToolMessage = true
-					break
-				}
-				if nextMsg.Role == "assistant" {
-					break
-				}
-			}
-
-			if hasFollowingToolMessage {
-				// This is a valid sequence, keep the message
-				cleanedMessages = append(cleanedMessages, msg)
-			} else {
-				// This is an incomplete tool call sequence, remove the tool calls
-				cleanedMsg := msg
-				cleanedMsg.ToolCalls = nil
-				cleanedMessages = append(cleanedMessages, cleanedMsg)
-				logger.Warn("Removed incomplete tool calls from assistant message at index %d during message conversion", i)
-			}
-		} else {
-			// Regular message, keep it
-			cleanedMessages = append(cleanedMessages, msg)
-		}
-	}
-
-	return cleanedMessages
-}
-
-// convertMessages converts our Message format to OpenAI format
-func (c *Client) convertMessages(messages []Message) []openai.ChatCompletionMessageParamUnion {
-	// Validate message sequence before conversion to prevent OpenAI API errors
-	if err := c.validateMessageSequence(messages); err != nil {
-		logger.Warn("Invalid message sequence detected in convertMessages: %v", err)
-		// Clean up the messages to ensure valid sequence
-		messages = c.cleanupMessages(messages)
-	}
-
-	openaiMessages := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
-
-	for _, msg := range messages {
-		switch msg.Role {
-		case "system":
-			if len(msg.Contents) > 0 {
-				// Handle multimodal system messages - convert to user message for multimodal content
-				contentParts := []openai.ChatCompletionContentPartUnionParam{}
-				for _, content := range msg.Contents {
-					if content.Type == "text" {
-						contentParts = append(contentParts, openai.TextContentPart(content.Text))
-					} else if content.Type == "image_url" && content.ImageURL != nil {
-						imageURLParam := openai.ChatCompletionContentPartImageImageURLParam{
-							URL:    content.ImageURL.URL,
-							Detail: content.ImageURL.Detail, // Direct string assignment
-						}
-						contentParts = append(contentParts, openai.ImageContentPart(imageURLParam))
-					}
-				}
-				// System messages with multimodal content need special handling
-				// Convert to user message with system prefix for multimodal support
-				systemPrefix := "System: "
-				// Always prepend system prefix as first text part
-				contentParts = append([]openai.ChatCompletionContentPartUnionParam{
-					openai.TextContentPart(systemPrefix),
-				}, contentParts...)
-				userMsg := openai.UserMessage(contentParts)
-				openaiMessages = append(openaiMessages, userMsg)
-			} else {
-				openaiMessages = append(openaiMessages, openai.SystemMessage(msg.Content))
-			}
-
-		case "user":
-			if len(msg.Contents) > 0 {
-				// Handle multimodal user messages
-				contentParts := []openai.ChatCompletionContentPartUnionParam{}
-				for _, content := range msg.Contents {
-					if content.Type == "text" {
-						contentParts = append(contentParts, openai.TextContentPart(content.Text))
-					} else if content.Type == "image_url" && content.ImageURL != nil {
-						imageURLParam := openai.ChatCompletionContentPartImageImageURLParam{
-							URL:    content.ImageURL.URL,
-							Detail: content.ImageURL.Detail, // Direct string assignment
-						}
-						contentParts = append(contentParts, openai.ImageContentPart(imageURLParam))
-					}
-				}
-				userMsg := openai.UserMessage(contentParts)
-				openaiMessages = append(openaiMessages, userMsg)
-			} else {
-				openaiMessages = append(openaiMessages, openai.UserMessage(msg.Content))
-			}
-
-		case "assistant":
-			if len(msg.ToolCalls) > 0 {
-				// Assistant message with tool calls - use proper API structure
-				toolCalls := make([]openai.ChatCompletionMessageToolCallUnionParam, len(msg.ToolCalls))
-				for i, tc := range msg.ToolCalls {
-					argsJSON, _ := json.Marshal(tc.Arguments)
-					toolCalls[i] = openai.ChatCompletionMessageToolCallUnionParam{
-						OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
-							ID: tc.ID,
-							Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
-								Name:      tc.Name,
-								Arguments: string(argsJSON),
-							},
-							// Type field will default to "function"
-						},
-					}
-				}
-
-				// Create assistant message with tool calls
-				assistantMsg := openai.ChatCompletionAssistantMessageParam{
-					Content: openai.ChatCompletionAssistantMessageParamContentUnion{
-						OfString: openai.String(msg.Content),
-					},
-					ToolCalls: toolCalls,
-					// Role field will default to "assistant"
-				}
-
-				// Convert to union type
-				assistantUnion := openai.ChatCompletionMessageParamUnion{
-					OfAssistant: &assistantMsg,
-				}
-				openaiMessages = append(openaiMessages, assistantUnion)
-			} else {
-				// Regular assistant message
-				openaiMessages = append(openaiMessages, openai.AssistantMessage(msg.Content))
-			}
-
-		case "tool":
-			// Tool result message
-			openaiMessages = append(openaiMessages, openai.ToolMessage(msg.Content, msg.ToolCallID))
-		}
-	}
-
-	return openaiMessages
-}
-
-// convertTools converts our tools to OpenAI format
-func (c *Client) convertTools() []openai.ChatCompletionToolUnionParam {
-	if len(c.tools) == 0 {
-		return nil
-	}
-
-	tools := make([]openai.ChatCompletionToolUnionParam, 0, len(c.tools))
-	var convertProperty func(prop *interfaces.PropertySchema) map[string]interface{}
-	convertProperty = func(prop *interfaces.PropertySchema) map[string]interface{} {
-		if prop == nil {
-			return map[string]interface{}{"type": "string"}
-		}
-		propType := prop.Type
-		if propType == "" {
-			propType = "string"
-		}
-		propDef := map[string]interface{}{
-			"type": propType,
-		}
-		if prop.Description != "" {
-			propDef["description"] = prop.Description
-		}
-
-		if prop.Enum != nil {
-			enumValues := make([]string, 0, len(prop.Enum))
-			for _, value := range prop.Enum {
-				if value != "" {
-					enumValues = append(enumValues, value)
-				}
-			}
-			if len(enumValues) > 0 {
-				propDef["enum"] = enumValues
-			}
-		}
-		if prop.Default != nil {
-			propDef["default"] = prop.Default
-		}
-		if prop.Pattern != "" {
-			propDef["pattern"] = prop.Pattern
-		}
-		if prop.MinLength != nil {
-			propDef["minLength"] = *prop.MinLength
-		}
-		if prop.MaxLength != nil {
-			propDef["maxLength"] = *prop.MaxLength
-		}
-		if prop.Minimum != nil {
-			propDef["minimum"] = *prop.Minimum
-		}
-		if prop.Maximum != nil {
-			propDef["maximum"] = *prop.Maximum
-		}
-		if prop.Examples != nil {
-			propDef["examples"] = prop.Examples
-		}
-
-		if strings.EqualFold(propType, "array") {
-			if prop.Items != nil {
-				propDef["items"] = convertProperty(prop.Items)
-			} else {
-				propDef["items"] = map[string]interface{}{"type": "string"}
-			}
-		}
-
-		return propDef
-	}
-
-	for _, tool := range c.tools {
-		schema := tool.Schema()
-		if schema == nil {
-			continue
-		}
-
-		// Convert tool schema to OpenAI function parameters
-		parameters := openai.FunctionParameters{
-			"type":       "object",
-			"properties": make(map[string]interface{}),
-		}
-
-		if len(schema.Required) > 0 {
-			parameters["required"] = schema.Required
-		}
-
-		// Convert properties
-		if schema.Properties != nil {
-			for name, prop := range schema.Properties {
-				parameters["properties"].(map[string]interface{})[name] = convertProperty(prop)
-			}
-		}
-
-		tools = append(tools, openai.ChatCompletionFunctionTool(
-			shared.FunctionDefinitionParam{
-				Name:        tool.Name(),
-				Description: openai.String(tool.Description()),
-				Parameters:  parameters,
-			},
-		))
-	}
-
-	return tools
 }
 
 // CompressionConfig holds configuration for conversation compression
@@ -1670,7 +1047,6 @@ func (c *Client) UpdateTools(tools []interfaces.Tool) {
 func (c *Client) toolRequiresParameters(toolName string) bool {
 	// List of tools that require mandatory parameters
 	requiredParamTools := map[string]bool{
-		"glob":            true,
 		"search_codebase": true,
 		"view_files":      true,
 		"write_file":      true,

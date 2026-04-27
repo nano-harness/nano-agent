@@ -691,7 +691,9 @@ func (c *sedValidator) Check(pc *ParsedCommand) *Decision {
 }
 
 // readOnlyAutoApprover auto-approves known read-only commands.
-type readOnlyAutoApprover struct{}
+type readOnlyAutoApprover struct {
+	workdir string
+}
 
 func (c *readOnlyAutoApprover) Name() string { return "ReadOnlyAutoApprover" }
 func (c *readOnlyAutoApprover) Check(pc *ParsedCommand) *Decision {
@@ -701,6 +703,21 @@ func (c *readOnlyAutoApprover) Check(pc *ParsedCommand) *Decision {
 	for _, stmt := range pc.AllStatements() {
 		if !isReadOnly(stmt) {
 			return nil // Not all statements are safe
+		}
+	}
+	if c.workdir != "" {
+		for _, stmt := range pc.AllStatements() {
+			for _, pathArg := range ExtractShellPathArgs(stmt) {
+				if !IsPathWithinWorkdir(c.workdir, pathArg) {
+					return &Decision{
+						Action:     ActionConfirm,
+						Reason:     fmt.Sprintf("read-only command path %q is outside working directory", pathArg),
+						Rule:       c.Name(),
+						Layer:      LayerAnalyzer,
+						Confidence: 0.5,
+					}
+				}
+			}
 		}
 	}
 	return &Decision{
@@ -785,28 +802,36 @@ func isSafeDevelopmentCommand(stmt Statement) bool {
 // SemanticAnalyzer runs all registered security checkers against a parsed command.
 type SemanticAnalyzer struct {
 	checkers []SecurityChecker
+	workdir  string
 }
 
 // DefaultSemanticAnalyzer creates an analyzer with all built-in checkers.
 // Checkers run in order; the first non-nil decision wins, except ReadOnlyAutoApprover
 // which runs first as a fast-path allow.
 func DefaultSemanticAnalyzer() *SemanticAnalyzer {
+	return DefaultSemanticAnalyzerWithWorkdir("")
+}
+
+// DefaultSemanticAnalyzerWithWorkdir creates an analyzer with path-aware
+// read-only auto-approval when workdir is non-empty.
+func DefaultSemanticAnalyzerWithWorkdir(workdir string) *SemanticAnalyzer {
 	return &SemanticAnalyzer{
+		workdir: workdir,
 		checkers: []SecurityChecker{
-			&readOnlyAutoApprover{},       // Fast-path allow
-			&safeWriteAutoApprover{},      // Auto-approve safe development commands
-			&unicodeWhitespaceChecker{},   // Block immediately
-			&controlCharChecker{},         // Block immediately
-			&ifsInjectionChecker{},        // Block
-			&pipelineInjectionChecker{},   // Block
-			&obfuscationChecker{},         // Block / Confirm
-			&protectedPathChecker{},       // Block
-			&broadDeletionChecker{},       // Block: broad recursive deletion
-			&envVarChecker{},              // Confirm
-			&envVarPathInjectionChecker{}, // Confirm: env vars in destructive args
-			&destructiveCommandChecker{},  // Confirm
-			&sedValidator{},               // Block / Confirm
-			&commandSubstitutionChecker{}, // Confirm
+			&readOnlyAutoApprover{workdir: workdir}, // Fast-path allow
+			&safeWriteAutoApprover{},                // Auto-approve safe development commands
+			&unicodeWhitespaceChecker{},             // Block immediately
+			&controlCharChecker{},                   // Block immediately
+			&ifsInjectionChecker{},                  // Block
+			&pipelineInjectionChecker{},             // Block
+			&obfuscationChecker{},                   // Block / Confirm
+			&protectedPathChecker{},                 // Block
+			&broadDeletionChecker{},                 // Block: broad recursive deletion
+			&envVarChecker{},                        // Confirm
+			&envVarPathInjectionChecker{},           // Confirm: env vars in destructive args
+			&destructiveCommandChecker{},            // Confirm
+			&sedValidator{},                         // Block / Confirm
+			&commandSubstitutionChecker{},           // Confirm
 		},
 	}
 }
@@ -860,10 +885,15 @@ type CommandGuard struct {
 
 // NewCommandGuard creates a CommandGuard with the given config rules and hooks.
 func NewCommandGuard(allowRules, denyRules []string, hooks []Hook) *CommandGuard {
+	return NewCommandGuardWithWorkdir(allowRules, denyRules, hooks, "")
+}
+
+// NewCommandGuardWithWorkdir creates a CommandGuard with path-aware semantic analysis.
+func NewCommandGuardWithWorkdir(allowRules, denyRules []string, hooks []Hook, workdir string) *CommandGuard {
 	return &CommandGuard{
 		configRules: NewConfigRuleEngine(allowRules, denyRules),
 		hooks:       NewHookEngine(hooks),
-		analyzer:    DefaultSemanticAnalyzer(),
+		analyzer:    DefaultSemanticAnalyzerWithWorkdir(workdir),
 	}
 }
 
@@ -976,7 +1006,7 @@ func getPathParam(toolName string) string {
 	switch toolName {
 	case "write_file", "read_file", "code_skeleton":
 		return "file_path"
-	case "edit_file", "delete_file", "list_directory", "search_file_content", "glob":
+	case "edit_file", "delete_file":
 		return "path"
 	default:
 		return ""
@@ -989,8 +1019,6 @@ func getFileOperation(toolName string) sandbox.FileOperation {
 		return sandbox.OpWrite
 	case "delete_file":
 		return sandbox.OpDelete
-	case "list_directory", "glob":
-		return sandbox.OpList
 	default:
 		return sandbox.OpRead
 	}

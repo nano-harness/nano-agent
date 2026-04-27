@@ -2,6 +2,7 @@ package permission_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
@@ -108,5 +109,40 @@ func TestAllowlistOverridesDefault(t *testing.T) {
 	// rm -rf / should still require confirmation.
 	if !mgr.ShouldConfirm("run_shell_command", map[string]interface{}{"command": "rm -rf /"}, shell) {
 		t.Error("non-allowlisted command should still require confirmation")
+	}
+}
+
+func TestShouldConfirm_FsToolWithinWorkdir_Skips(t *testing.T) {
+	workdir := t.TempDir()
+	mgr := permission.NewManagerWithWorkdir(permission.ModeDefault, nil, workdir)
+	tool := &contextualTool{
+		mockTool:      mockTool{requiresOK: true, category: interfaces.CategoryFileSystem},
+		paramsRequire: true,
+	}
+	params := map[string]interface{}{"file_path": filepath.Join(workdir, "notes.md")}
+	if mgr.ShouldConfirm("write_file", params, tool) {
+		t.Error("filesystem write inside workdir should not require confirmation")
+	}
+}
+
+func TestShouldConfirm_FsToolOutsideWorkdir_Confirms(t *testing.T) {
+	mgr := permission.NewManagerWithWorkdir(permission.ModeDefault, nil, t.TempDir())
+	tool := &contextualTool{
+		mockTool:      mockTool{requiresOK: true, category: interfaces.CategoryFileSystem},
+		paramsRequire: true,
+	}
+	if !mgr.ShouldConfirm("write_file", map[string]interface{}{"file_path": "/tmp/x.txt"}, tool) {
+		t.Error("filesystem write outside workdir should require confirmation")
+	}
+}
+
+func TestShouldConfirm_FsToolNoWorkdir_FallbackToContextual(t *testing.T) {
+	mgr := permission.NewManager(permission.ModeDefault, nil)
+	tool := &contextualTool{
+		mockTool:      mockTool{requiresOK: true, category: interfaces.CategoryFileSystem},
+		paramsRequire: true,
+	}
+	if !mgr.ShouldConfirm("write_file", map[string]interface{}{"file_path": "notes.md"}, tool) {
+		t.Error("without workdir, manager should use contextual confirmation")
 	}
 }

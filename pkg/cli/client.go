@@ -75,7 +75,7 @@ func newClientExecCommand(factory ClientFactory) *cobra.Command {
 				}
 				os.Exit(1)
 			}
-			response, err := executeDaemonCommandStreaming(client, command, sessionID, timeout, includeSteps)
+			response, err := client.ExecuteInSession(command, sessionID, timeout, includeSteps, false)
 			if err != nil {
 				color.Red("❌ Failed to execute command: %v", err)
 				os.Exit(1)

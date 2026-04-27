@@ -46,11 +46,8 @@ func TestToolboxIntegration(t *testing.T) {
 		"write_file",
 		"edit_file",
 		"delete_file",
-		"list_directory",
-		"search_file_content",
-		"glob",
 		"run_shell_command",
-		"todo_write",            // Added new todo write tool
+		"todo_write", // Added new todo write tool
 		"web_fetch",
 		"web_search",
 		"image_generate",        // New image generation tool
@@ -166,54 +163,7 @@ func TestToolboxWorkflow(t *testing.T) {
 		}
 	})
 
-	// Step 4: Search in file
-	t.Run("search in file", func(t *testing.T) {
-		result, err := toolbox.Execute(ctx, "search_file_content", map[string]interface{}{
-			"pattern": "Greetings",
-			"path":    tempDir,
-		})
-
-		if err != nil {
-			t.Fatalf("Failed to search: %v", err)
-		}
-
-		if !result.Success {
-			t.Fatalf("Search failed: %s", result.Error)
-		}
-	})
-
-	// Step 5: List directory
-	t.Run("list directory", func(t *testing.T) {
-		result, err := toolbox.Execute(ctx, "list_directory", map[string]interface{}{
-			"path": tempDir,
-		})
-
-		if err != nil {
-			t.Fatalf("Failed to list directory: %v", err)
-		}
-
-		if !result.Success {
-			t.Fatalf("Directory listing failed: %s", result.Error)
-		}
-	})
-
-	// Step 6: Use glob to find files
-	t.Run("glob files", func(t *testing.T) {
-		result, err := toolbox.Execute(ctx, "glob", map[string]interface{}{
-			"pattern": "*.txt",
-			"path":    tempDir,
-		})
-
-		if err != nil {
-			t.Fatalf("Failed to glob: %v", err)
-		}
-
-		if !result.Success {
-			t.Fatalf("Glob failed: %s", result.Error)
-		}
-	})
-
-	// Step 7: Run shell command
+	// Step 4: Run shell command
 	t.Run("run shell command", func(t *testing.T) {
 		result, err := toolbox.Execute(ctx, "run_shell_command", map[string]interface{}{
 			"command": "echo 'Integration test successful'",

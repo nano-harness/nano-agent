@@ -6,10 +6,12 @@ A lightweight AI-powered code assistant built in Go, featuring a modular tool ar
 
 ## ✨ Features
 
+- **Swarm Multi-Agent System**: Team-lead agents can spawn and coordinate multiple teammate agents for parallel task execution, with mailbox-based communication and daemon API for team session management
 - **Dual Operating Modes**: TUI interactive mode and Daemon background service mode
 - **Turn-Based Architecture**: Eliminates over-planning for simple queries with intelligent workflow selection
 - **Dynamic Planning System**: Real-time todo list generation and adaptive execution
 - **Expert System**: Specialized agents triggered via `@expert-name` syntax - built-in experts for codebase investigation, CLI help, and general tasks with support for custom expert definitions
+- **Multi-Agent Mailbox**: Asynchronous message passing between parent and child agents via the Mailbox abstraction, enabling structured communication during fork-based parallel execution with support for memory and file-based backends
 - **Background Task Management**: Run long-running shell commands in background with real-time output streaming, task monitoring, and graceful shutdown support
 - **Modular Tool System**: Comprehensive file operations, search, web capabilities, and memory management
 - **Advanced Reasoning Support**: Native support for reasoning models (e.g., o1, DeepSeek-R1) with configurable reasoning effort, token limits, and graceful fallback mechanisms
@@ -28,10 +30,19 @@ A lightweight AI-powered code assistant built in Go, featuring a modular tool ar
 - **Workspace & Git Tools**: Integrated workspace manager, Git operations, OSS storage, and engineering tools
 - **Middleware Chain**: Pluggable security, audit, metrics, and resilience middleware for tool execution
 - **Event System**: Structured event dispatching, monitoring, and validation for observability
-- **Safety Features**: Command validation, file size limits, path validation, and backup support
-- **Enhanced TUI Interface**: Modern terminal UI. Default dashboard built with `tview`; optional non alt-screen Bubble Tea TUI with Claude-like styling (experimental)
+- **Safety Features**: Command validation, workdir-aware auto-approval, file size limits, path validation, and backup support
+- **Enhanced TUI Interface**: Modern terminal UI with cinematic animated banner. Default dashboard built with `tview`; optional non alt-screen Bubble Tea TUI with Claude-like styling and Standard Figlet thin-line ASCII art banner (experimental)
 - **Cross-Platform Support**: Native builds for Linux, macOS, and Windows
 - **Development Tools**: Comprehensive build system with testing, linting, and release automation
+
+
+## Permission auto-approval
+
+nano-agent automatically skips confirmation for read-only shell commands (`grep`, `rg`, `ls`, `find`, etc.) and filesystem edits (`write_file`, `edit_file`, `delete_file`) when all target paths are inside the agent working directory. Paths outside the working directory still require approval. See [Permission Auto-Approval](./docs/PERMISSION_AUTO_APPROVAL.md).
+
+## Web Client Integration
+
+Daemon integrations should use `docs/DAEMON_API.md` as the source of truth. Interactive CLI rendering now goes through a shared EventSource layer: `nano chat` and `nano lead-chat` default to BubbleTea, and `--ui tview` selects the tview backend. Automation should call `nano daemon execute --json "command"` instead of parsing TUI output.
 
 ## 🚀 Quick Start
 
@@ -116,7 +127,6 @@ Optional environment variables (supported by current implementation):
 - `NANO_FILE_DIFF_MAX_LINES`: Max lines shown in file diff
 - `NANO_GIT_MAX_LOG_ENTRIES`: Max git log entries
 - `NANO_MEMORY_MAX_ENTRIES`: Max persistent memory entries
-- `NANO_LIST_DIRECTORY_MAX_DEPTH`: Max depth for list_directory
 - `SERPER_API_KEY`: API key for Serper web search
 - `TAVILY_API_KEY`: API key for Tavily web search
 
@@ -161,9 +171,25 @@ make run-debug
 
 # Force TUI mode (even if daemon is running)
 nano --tui "your command"
+
+# Team-lead mode with multi-agent coordination
+nano --team alpha --tui
 ```
 
-#### 2. Daemon Mode (Background Service)
+#### 2. Team-Lead REPL Mode
+Interactive team-lead session with mailbox support for multi-agent coordination:
+
+```bash
+# Start team-lead REPL
+nano chat --team alpha
+
+# The agent can spawn teammates and receive status updates
+[team-lead@alpha]> analyze the codebase for security issues using multiple teammates
+```
+
+See [SWARM.md](./SWARM.md) for detailed multi-agent documentation.
+
+#### 3. Daemon Mode (Background Service)
 Run as a background service for production environments:
 
 ```bash
@@ -180,7 +206,7 @@ nano daemon status
 nano daemon stop
 ```
 
-#### 3. Client Mode (API Communication)
+#### 4. Client Mode (API Communication)
 Communicate with running daemon via command line or API:
 
 ```bash
@@ -387,9 +413,7 @@ max_turns: 15
 max_time_minutes: 10
 allowed_tools:
   - read_file
-  - list_directory
-  - glob
-  - search_file_content
+  - run_shell_command
 ---
 
 You are a security auditor specialized in finding vulnerabilities in code.
@@ -664,9 +688,8 @@ Proposals flow through a structured DAG: `proposal → specs → design → task
 
 ### Tool Modules
 
-- **Filesystem** (`pkg/tools/filesystem/`): File operations (read, write, edit, list, directory management)
-- **Search** (`pkg/tools/search/`): Code search with glob patterns, regular expressions, and zoekt indexed search
-- **System** (`pkg/tools/system/`): Shell command execution with safety controls, sandbox integration, and validation
+- **Filesystem** (`pkg/tools/filesystem/`): File operations (read, write, edit, delete, and code skeletons)
+- **System** (`pkg/tools/system/`): Shell command execution with safety controls, sandbox integration, validation, and file discovery/search via CLI commands
 - **Web** (`pkg/tools/web/`): Web fetching, search capabilities (Serper, Tavily, DuckDuckGo), and API integration
 - **Workspace** (`pkg/tools/workspace/`): Workspace manager, Git operations, OSS storage, and engineering tools
 - **Agent** (`pkg/tools/agent/`): Agent delegation tools (main_agent for sub-agent orchestration)
@@ -780,7 +803,6 @@ NANO_WEB_SEARCH_MAX_RESULTS="10"
 NANO_FILE_DIFF_MAX_LINES="20"
 NANO_GIT_MAX_LOG_ENTRIES="100"
 NANO_MEMORY_MAX_ENTRIES="100"
-NANO_LIST_DIRECTORY_MAX_DEPTH="3"
 SERPER_API_KEY="your-serper-api-key"
 TAVILY_API_KEY="your-tavily-api-key"
 ```
@@ -1047,11 +1069,10 @@ nano-agent/
 │   ├── skill/           # Skill loading, parsing, and matching
 │   ├── tools/          # Tool implementations
 │   │   ├── agent/      # Agent delegation tools (main_agent)
-│   │   ├── filesystem/ # File system operations (read, write, edit, list)
+│   │   ├── filesystem/ # File system operations (read, write, edit, delete)
 │   │   ├── mcp/        # MCP tool integration
 │   │   ├── openspec/   # OpenSpec workflow tools
-│   │   ├── search/     # Code search (glob, regex, zoekt)
-│   │   ├── system/     # Shell command execution with safety controls
+│   │   ├── system/     # Shell command execution and CLI-based file search/listing
 │   │   ├── web/        # Web fetch, search, and API integration
 │   │   └── workspace/  # Workspace manager, Git, OSS, and engineering tools
 │   └── ui/             # UI adapter layer (factory pattern, tview + Bubble Tea backends)
@@ -1186,6 +1207,12 @@ nano daemon stop
 - `GET|POST /api/v1/memory/*` - Memory management
 - `POST /api/v1/sessions/{id}/execute` - Execute within a session
 - `GET|POST|DELETE /api/v1/sessions/*` - Session management
+- `POST /api/v1/teams/sessions` - Create team-lead session
+- `GET /api/v1/teams/sessions` - List team sessions
+- `GET|DELETE /api/v1/teams/sessions/{id}` - Get or delete team session
+- `POST /api/v1/teams/sessions/{id}/execute` - Execute in team session
+
+See [SWARM.md](./SWARM.md) for detailed team session API documentation.
 
 ### Daemon Configuration
 
@@ -1204,7 +1231,10 @@ For detailed daemon configuration, see the daemon section in this README and `.n
 ## 📞 Support
 
 - Report issues: [GitHub Issues](https://github.com/nano-harness/nano-agent/issues)
-- Documentation: Check the README files for comprehensive usage guidance
+- Documentation:
+  - [SWARM.md](./SWARM.md) - Multi-agent system documentation
+  - [MIGRATION.md](./MIGRATION.md) - Migration guide for swarm features
+  - Check the README files for comprehensive usage guidance
 - Configuration: See `.nano.yaml.example` for configuration examples and environment variables documentation
 
 ---

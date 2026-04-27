@@ -21,13 +21,13 @@ func RegisterAgentTools(registry interfaces.ToolRegistry, cfg *config.Config, ma
 		logger.Infof("Registered agent tool: %s", mainAgentTool.Name())
 	}
 
-	// Register task tool (only for main agent, not sub-agents)
-	if !cfg.IsSubAgent {
-		taskTool := NewTaskTool(cfg, mainAgent)
-		if err := registry.Register(taskTool); err != nil {
-			logger.Warnf("Failed to register task tool: %v", err)
+	// Register send_message tool (only for sub-agents)
+	if cfg.IsSubAgent && mainAgent.IsSubAgent() {
+		sendMessageTool := NewSendMessageTool(mainAgent)
+		if err := registry.Register(sendMessageTool); err != nil {
+			logger.Warnf("Failed to register send_message tool: %v", err)
 		} else {
-			logger.Infof("Registered agent tool: %s", taskTool.Name())
+			logger.Infof("Registered agent tool: %s", sendMessageTool.Name())
 		}
 	}
 }
@@ -36,7 +36,10 @@ func RegisterAgentTools(registry interfaces.ToolRegistry, cfg *config.Config, ma
 func GetAgentToolNames() []string {
 	return []string{
 		"main_agent",
-		"task",
+		"spawn_teammate",
+		"team_create",
+		"team_list",
+		"send_message",
 	}
 }
 

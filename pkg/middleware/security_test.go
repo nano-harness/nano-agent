@@ -225,65 +225,6 @@ func TestSecurityMiddleware_BlocksSensitivePath_ReadFile(t *testing.T) {
 	}
 }
 
-func TestSecurityMiddleware_BlocksSensitivePath_ListDirectory(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix-style absolute paths; skipping on Windows")
-	}
-	sm := NewSecurityMiddleware(nil, newBlockedPathChecker("/etc"), 0)
-	tool := &mockTool{name: "list_directory"}
-	result, err := sm.Execute(context.Background(), tool,
-		map[string]interface{}{"path": "/etc"},
-		func(_ context.Context, _ interfaces.Tool, _ map[string]interface{}) (*interfaces.ToolResult, error) {
-			return &interfaces.ToolResult{Success: true}, nil
-		})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Success {
-		t.Error("expected failure for blocked path /etc")
-	}
-}
-
-func TestSecurityMiddleware_BlocksSensitivePath_SearchFileContent(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix-style absolute paths; skipping on Windows")
-	}
-	sm := NewSecurityMiddleware(nil, newBlockedPathChecker("/etc"), 0)
-	tool := &mockTool{name: "search_file_content"}
-	result, err := sm.Execute(context.Background(), tool,
-		map[string]interface{}{"path": "/etc"},
-		func(_ context.Context, _ interfaces.Tool, _ map[string]interface{}) (*interfaces.ToolResult, error) {
-			return &interfaces.ToolResult{Success: true}, nil
-		})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Success {
-		t.Error("expected failure for blocked path /etc")
-	}
-}
-
-func TestSecurityMiddleware_BlocksSensitivePath_Glob(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix-style absolute paths; skipping on Windows")
-	}
-	sm := NewSecurityMiddleware(nil, newBlockedPathChecker("/etc"), 0)
-	tool := &mockTool{name: "glob"}
-	result, err := sm.Execute(context.Background(), tool,
-		map[string]interface{}{"path": "/etc"},
-		func(_ context.Context, _ interfaces.Tool, _ map[string]interface{}) (*interfaces.ToolResult, error) {
-			return &interfaces.ToolResult{Success: true}, nil
-		})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Success {
-		t.Error("expected failure for blocked path /etc")
-	}
-}
-
-// ─── ProtectedPathChecker ────────────────────────────────────────────────────
-
 func TestProtectedPathChecker_HomeDirBlock(t *testing.T) {
 	guard := NewCommandGuard(nil, nil, nil)
 	d, err := guard.Analyze(context.Background(), "rm -rf ~/")
@@ -621,6 +562,62 @@ func TestSafeWriteAutoApprover_GoTest(t *testing.T) {
 	}
 	if decision.Confidence != 0.85 {
 		t.Errorf("expected confidence 0.85, got %f", decision.Confidence)
+	}
+}
+
+func TestReadOnlyAutoApprover_PathInsideWorkdir_Allows(t *testing.T) {
+	workdir := t.TempDir()
+	analyzer := DefaultSemanticAnalyzerWithWorkdir(workdir)
+	decision, err := analyzer.Analyze("grep foo src/a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != ActionAllow {
+		t.Fatalf("expected ActionAllow, got %v (%s)", decision.Action, decision.Reason)
+	}
+}
+
+func TestReadOnlyAutoApprover_PathOutsideWorkdir_RequiresConfirm(t *testing.T) {
+	analyzer := DefaultSemanticAnalyzerWithWorkdir(t.TempDir())
+	decision, err := analyzer.Analyze("grep foo /etc/passwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action == ActionAllow {
+		t.Fatalf("expected non-Allow for outside path, got %v", decision)
+	}
+}
+
+func TestReadOnlyAutoApprover_NoWorkdir_PreservesLegacyBehavior(t *testing.T) {
+	analyzer := DefaultSemanticAnalyzer()
+	decision, err := analyzer.Analyze("grep foo /etc/passwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != ActionAllow {
+		t.Fatalf("expected legacy ActionAllow, got %v", decision.Action)
+	}
+}
+
+func TestReadOnlyAutoApprover_RelativePathInsideWorkdir(t *testing.T) {
+	analyzer := DefaultSemanticAnalyzerWithWorkdir(t.TempDir())
+	decision, err := analyzer.Analyze("grep foo ./sub/a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != ActionAllow {
+		t.Fatalf("expected ActionAllow, got %v", decision.Action)
+	}
+}
+
+func TestReadOnlyAutoApprover_RelativePathEscape(t *testing.T) {
+	analyzer := DefaultSemanticAnalyzerWithWorkdir(t.TempDir())
+	decision, err := analyzer.Analyze("grep foo ../../etc/passwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action == ActionAllow {
+		t.Fatalf("expected non-Allow for escaping path, got %v", decision)
 	}
 }
 

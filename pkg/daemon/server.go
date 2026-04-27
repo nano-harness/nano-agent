@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,6 +36,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const teamLeadStreamReadTimeout = 300 * time.Second
+
 // Server represents the daemon mode server
 type Server struct {
 	agent         *agent.Agent
@@ -53,6 +56,9 @@ type Server struct {
 
 	// engineManaged indicates that scheduler lifecycle is managed by Engine
 	engineManaged bool
+
+	// teamLeadRegistry manages team-lead sessions (optional, nil if not using teams)
+	teamLeadRegistry *TeamLeadRegistry
 }
 
 // ActiveTask represents a running task that can be cancelled
@@ -157,8 +163,49 @@ func NewServer(agentInstance *agent.Agent, daemonConfig *config.DaemonConfig) *S
 		_, err := server.startUnifiedTask(command, sessionID, 0, nil)
 		return err
 	})
+	server.EnableInteractiveApproval()
+
+	// Initialize team-lead registry with 30 minute idle timeout
+	// This can be disabled by setting NANO_DISABLE_TEAM_SESSIONS=true
+	if os.Getenv("NANO_DISABLE_TEAM_SESSIONS") != "true" {
+		server.teamLeadRegistry = NewTeamLeadRegistry(30 * time.Minute)
+		logger.Info("Team-lead session registry initialized")
+	}
 
 	return server
+}
+
+func (ds *Server) EnableInteractiveApproval() {
+	if ds == nil || ds.agent == nil {
+		return
+	}
+	ds.agent.SetApprovalHandler(ds.requestToolApproval)
+}
+
+func (ds *Server) requestToolApproval(info *agent.ToolCallInfo) bool {
+	if ds == nil || ds.agent == nil || info == nil {
+		return false
+	}
+	if handler := ds.agent.GetEventHandler(); handler != nil {
+		handler(event.StreamEvent{
+			Type: event.EventTypeWaitingForUser,
+			Metadata: map[string]interface{}{
+				"kind":       "tool_approval_request",
+				"call_id":    info.ID,
+				"tool_name":  info.Name,
+				"parameters": info.Parameters,
+				"status":     string(info.Status),
+			},
+		})
+	}
+	return false
+}
+
+func (ds *Server) SubmitToolApproval(callID string, approved bool) error {
+	if ds == nil || ds.agent == nil || ds.agent.GetToolScheduler() == nil {
+		return fmt.Errorf("daemon approval handler is unavailable")
+	}
+	return ds.agent.GetToolScheduler().HandleConfirmationResponse(callID, approved)
 }
 
 // NewServerWithEngine builds a Server from a pre-constructed Engine.
@@ -335,6 +382,14 @@ func (ds *Server) Start() error {
 	defer cancel()
 
 	logger.Info("Shutting down daemon server...")
+
+	// Shutdown team-lead registry if initialized
+	if ds.teamLeadRegistry != nil {
+		if err := ds.teamLeadRegistry.Shutdown(); err != nil {
+			logger.Warnf("Error shutting down team-lead registry: %v", err)
+		}
+	}
+
 	if ds.pprofServer != nil {
 		_ = ds.pprofServer.Shutdown(ctx)
 	}
@@ -361,6 +416,7 @@ func (ds *Server) setupRoutes() *mux.Router {
 
 	// WebSocket route (handles its own authentication) - must be before middleware
 	api.HandleFunc("/stream", ds.streamHandler).Methods("GET")
+	api.HandleFunc("/teams/sessions/{id}/stream", ds.teamLeadSessionStreamHandler).Methods("GET")
 
 	// Create a separate subrouter for authenticated routes
 	authenticatedAPI := api.PathPrefix("").Subrouter()
@@ -397,6 +453,17 @@ func (ds *Server) setupRoutes() *mux.Router {
 	authenticatedAPI.HandleFunc("/sessions/{id}", ds.deleteSessionHandler).Methods("DELETE")
 	authenticatedAPI.HandleFunc("/sessions/{id}/execute", ds.sessionExecuteHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/sessions/{id}/cancel", ds.cancelSessionPostHandler).Methods("POST")
+
+	// Team-lead session endpoints (if registry is initialized)
+	if ds.teamLeadRegistry != nil {
+		authenticatedAPI.HandleFunc("/teams/sessions", ds.createTeamLeadSessionHandler).Methods("POST")
+		authenticatedAPI.HandleFunc("/teams/sessions", ds.listTeamLeadSessionsHandler).Methods("GET")
+		authenticatedAPI.HandleFunc("/teams/sessions/{id}", ds.getTeamLeadSessionHandler).Methods("GET")
+		authenticatedAPI.HandleFunc("/teams/sessions/{id}", ds.deleteTeamLeadSessionHandler).Methods("DELETE")
+		authenticatedAPI.HandleFunc("/teams/sessions/{id}/execute", ds.executeInTeamLeadSessionHandler).Methods("POST")
+		authenticatedAPI.HandleFunc("/teams/sessions/{id}/cancel", ds.cancelTeamLeadSessionHandler).Methods("POST")
+		authenticatedAPI.HandleFunc("/teams/sessions/{id}/events", ds.teamLeadSessionEventsHandler).Methods("GET")
+	}
 
 	// Scheduler endpoints
 	authenticatedAPI.HandleFunc("/scheduler/tasks", ds.scheduleTaskHandler).Methods("POST")
@@ -1909,36 +1976,8 @@ func (ds *Server) loadTaskFromDisk(sessionID string) (*ActiveTask, error) {
 }
 
 func (ds *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
-	// Check authentication for WebSocket connections
-	if ds.config.APIKey != "" {
-		query := r.URL.Query()
-		var apiKey string
-		for _, name := range []string{"api_key", "apikey", "apiKey", "key"} {
-			if v := strings.TrimSpace(query.Get(name)); v != "" {
-				apiKey = v
-				break
-			}
-		}
-		if apiKey == "" {
-			apiKey = strings.TrimSpace(r.Header.Get("X-API-Key"))
-		}
-		if apiKey == "" {
-			auth := r.Header.Get("Authorization")
-			low := strings.ToLower(auth)
-			if strings.HasPrefix(low, "bearer ") {
-				apiKey = strings.TrimSpace(auth[7:])
-			} else if strings.HasPrefix(low, "apikey ") {
-				apiKey = strings.TrimSpace(auth[7:])
-			}
-		}
-
-		expected := strings.TrimSpace(ds.config.APIKey)
-		provided := strings.TrimSpace(apiKey)
-		if provided != expected {
-			logger.Warnf("WS unauthorized: provided_len=%d expected_len=%d", len(provided), len(expected))
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if !ds.authenticateWebSocketRequest(w, r) {
+		return
 	}
 
 	conn, err := ds.upgrader.Upgrade(w, r, nil)
@@ -1977,6 +2016,8 @@ func (ds *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 			Type      string                `json:"type,omitempty"`
 			SinceSeq  int64                 `json:"since_seq,omitempty"`
 			Streams   []string              `json:"streams,omitempty"`
+			CallID    string                `json:"call_id,omitempty"`
+			Approved  bool                  `json:"approved,omitempty"`
 		}
 
 		conn.SetReadDeadline(time.Now().Add(300 * time.Second)) //nolint:errcheck
@@ -1993,6 +2034,31 @@ func (ds *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 		// Handle ping messages
 		if request.Type == "ping" {
 			_ = connManager.SafeWriteJSON(map[string]string{"type": "pong"})
+			continue
+		}
+		if request.Type == "tool_approval" {
+			callID := strings.TrimSpace(request.CallID)
+			if callID == "" {
+				_ = connManager.SafeWriteJSON(map[string]interface{}{
+					"type":     "error",
+					"error":    "call_id is required",
+					"severity": "warning",
+				})
+				continue
+			}
+			if err := ds.SubmitToolApproval(callID, request.Approved); err != nil {
+				_ = connManager.SafeWriteJSON(map[string]interface{}{
+					"type":    "error",
+					"call_id": callID,
+					"error":   err.Error(),
+				})
+				continue
+			}
+			_ = connManager.SafeWriteJSON(map[string]interface{}{
+				"type":     "tool_approval_ack",
+				"call_id":  callID,
+				"approved": request.Approved,
+			})
 			continue
 		}
 
@@ -2144,6 +2210,42 @@ func (ds *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 			"updated_at": updatedAt,
 		})
 	}
+}
+
+func (ds *Server) authenticateWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
+	if ds.config.APIKey == "" {
+		return true
+	}
+
+	query := r.URL.Query()
+	var apiKey string
+	for _, name := range []string{"api_key", "apikey", "apiKey", "key"} {
+		if v := strings.TrimSpace(query.Get(name)); v != "" {
+			apiKey = v
+			break
+		}
+	}
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(r.Header.Get("X-API-Key"))
+	}
+	if apiKey == "" {
+		auth := r.Header.Get("Authorization")
+		low := strings.ToLower(auth)
+		if strings.HasPrefix(low, "bearer ") {
+			apiKey = strings.TrimSpace(auth[7:])
+		} else if strings.HasPrefix(low, "apikey ") {
+			apiKey = strings.TrimSpace(auth[7:])
+		}
+	}
+
+	expected := strings.TrimSpace(ds.config.APIKey)
+	provided := strings.TrimSpace(apiKey)
+	if provided != expected {
+		logger.Warnf("WS unauthorized: provided_len=%d expected_len=%d", len(provided), len(expected))
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 func (ds *Server) sendCompletionMessage(task *ActiveTask, connManager *ConnectionManager) {
@@ -2569,4 +2671,501 @@ func (ds *Server) commandsHandler(w http.ResponseWriter, _ *http.Request) {
 		out = append(out, entry)
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"commands": out})
+}
+
+// Team-lead session handlers
+
+// CreateTeamLeadSessionRequest represents a request to create a team-lead session
+type CreateTeamLeadSessionRequest struct {
+	SessionID          string `json:"session_id,omitempty"`
+	TeamName           string `json:"team_name"`
+	InteractiveConfirm bool   `json:"interactive_confirm,omitempty"`
+}
+
+// TeamLeadSessionResponse represents a team-lead session response
+type TeamLeadSessionResponse struct {
+	SessionID    string    `json:"session_id"`
+	TeamName     string    `json:"team_name"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastActiveAt time.Time `json:"last_active_at"`
+}
+
+// createTeamLeadSessionHandler creates a new team-lead session
+func (ds *Server) createTeamLeadSessionHandler(w http.ResponseWriter, r *http.Request) {
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req CreateTeamLeadSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.TeamName == "" {
+		req.TeamName = "default"
+	}
+
+	// Generate session ID if not provided
+	if req.SessionID == "" {
+		req.SessionID = fmt.Sprintf("lead-%d-%s", time.Now().Unix(), generateRandomID())
+	}
+
+	// Get agent config
+	cfg := ds.agent.GetConfig()
+
+	// Create approval handler (auto-approve for daemon)
+	approvalHandler := func(*agent.ToolCallInfo) bool {
+		return true
+	}
+
+	// Create or get session
+	session, err := ds.teamLeadRegistry.GetOrCreate(req.SessionID, req.TeamName, cfg, approvalHandler)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create session: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if req.InteractiveConfirm {
+		session.EnableInteractiveApproval()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(TeamLeadSessionResponse{
+		SessionID:    session.ID,
+		TeamName:     session.TeamName,
+		CreatedAt:    session.CreatedAt,
+		LastActiveAt: session.LastActiveAt,
+	})
+}
+
+// listTeamLeadSessionsHandler lists all active team-lead sessions
+func (ds *Server) listTeamLeadSessionsHandler(w http.ResponseWriter, r *http.Request) {
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	sessions := ds.teamLeadRegistry.List()
+	responses := make([]TeamLeadSessionResponse, 0, len(sessions))
+	for _, session := range sessions {
+		responses = append(responses, TeamLeadSessionResponse{
+			SessionID:    session.ID,
+			TeamName:     session.TeamName,
+			CreatedAt:    session.CreatedAt,
+			LastActiveAt: session.LastActiveAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessions": responses,
+		"count":    len(responses),
+	})
+}
+
+// getTeamLeadSessionHandler gets details of a specific team-lead session
+func (ds *Server) getTeamLeadSessionHandler(w http.ResponseWriter, r *http.Request) {
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	vars := mux.Vars(r)
+	sessionID := vars["id"]
+
+	session, exists := ds.teamLeadRegistry.Get(sessionID)
+	if !exists {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(TeamLeadSessionResponse{
+		SessionID:    session.ID,
+		TeamName:     session.TeamName,
+		CreatedAt:    session.CreatedAt,
+		LastActiveAt: session.LastActiveAt,
+	})
+}
+
+// deleteTeamLeadSessionHandler deletes a team-lead session
+func (ds *Server) deleteTeamLeadSessionHandler(w http.ResponseWriter, r *http.Request) {
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	vars := mux.Vars(r)
+	sessionID := vars["id"]
+
+	if err := ds.teamLeadRegistry.Remove(sessionID); err != nil {
+		if errors.Is(err, ErrTeamLeadSessionNotFound) {
+			http.Error(w, "Session not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, fmt.Sprintf("Failed to delete session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Session deleted successfully",
+	})
+}
+
+// ExecuteInTeamLeadSessionRequest represents a request to execute in a team-lead session
+type ExecuteInTeamLeadSessionRequest struct {
+	Command string `json:"command"`
+}
+
+// executeInTeamLeadSessionHandler executes a command in a team-lead session
+func (ds *Server) executeInTeamLeadSessionHandler(w http.ResponseWriter, r *http.Request) {
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	vars := mux.Vars(r)
+	sessionID := vars["id"]
+
+	session, exists := ds.teamLeadRegistry.Get(sessionID)
+	if !exists {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	var req ExecuteInTeamLeadSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.Command == "" {
+		http.Error(w, "Command is required", http.StatusBadRequest)
+		return
+	}
+
+	// Generate task ID
+	taskID := generateTaskID()
+
+	// Create a response channel to collect events
+	events := make([]event.StreamEvent, 0)
+	var mu sync.Mutex
+
+	callback := func(e event.StreamEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	// Execute the command
+	ctx := r.Context()
+	err := session.Execute(ctx, taskID, req.Command, callback)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+			"events":  events,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"events":  events,
+	})
+}
+
+// cancelTeamLeadSessionHandler cancels all currently running turns in a team-lead session.
+func (ds *Server) cancelTeamLeadSessionHandler(w http.ResponseWriter, r *http.Request) {
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	sessionID := mux.Vars(r)["id"]
+	session, exists := ds.teamLeadRegistry.Get(sessionID)
+	if !exists {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	cancelled := session.CancelActiveTasks()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"cancelled_tasks": cancelled,
+	})
+}
+
+// teamLeadSessionEventsHandler returns resumable team-lead events since a sequence number.
+func (ds *Server) teamLeadSessionEventsHandler(w http.ResponseWriter, r *http.Request) {
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	sessionID := mux.Vars(r)["id"]
+	session, exists := ds.teamLeadRegistry.Get(sessionID)
+	if !exists {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	sinceSeq := int64(0)
+	if raw := r.URL.Query().Get("since_seq"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			http.Error(w, "Invalid since_seq", http.StatusBadRequest)
+			return
+		}
+		sinceSeq = parsed
+	}
+
+	events := []event.StreamEvent{}
+	lastSeq := int64(0)
+	if session.Store != nil {
+		lastSeq = session.Store.LastSeq()
+		events = session.Store.Since(sinceSeq, func(event.StreamEvent) bool { return true })
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id": session.ID,
+		"since_seq":  sinceSeq,
+		"last_seq":   lastSeq,
+		"events":     events,
+	})
+}
+
+func (ds *Server) teamLeadSessionStreamHandler(w http.ResponseWriter, r *http.Request) {
+	if !ds.authenticateWebSocketRequest(w, r) {
+		return
+	}
+	if ds.teamLeadRegistry == nil {
+		http.Error(w, "Team-lead sessions not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	sessionID := mux.Vars(r)["id"]
+	session, exists := ds.teamLeadRegistry.Get(sessionID)
+	if !exists {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	conn, err := ds.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logger.Errorf("Failed to upgrade team-lead stream: %v", err)
+		return
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	conn.EnableWriteCompression(false)
+	_ = conn.SetReadDeadline(time.Now().Add(teamLeadStreamReadTimeout))
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	connManager := NewConnectionManager(conn)
+	defer connManager.Close()
+
+	for connManager.IsConnectionAlive() {
+		var req struct {
+			Type     string `json:"type"`
+			Command  string `json:"command,omitempty"`
+			TaskID   string `json:"task_id,omitempty"`
+			SinceSeq int64  `json:"since_seq,omitempty"`
+			CallID   string `json:"call_id,omitempty"`
+			Approved bool   `json:"approved,omitempty"`
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(teamLeadStreamReadTimeout))
+		if err := conn.ReadJSON(&req); err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
+				logger.Errorf("Unexpected team-lead WebSocket close error: %v", err)
+			}
+			break
+		}
+
+		switch strings.TrimSpace(req.Type) {
+		case "ping":
+			_ = connManager.SafeWriteJSON(map[string]string{"type": "pong"})
+		case "subscribe":
+			ds.streamTeamLeadReplayAndLive(session, connManager, req.SinceSeq)
+		case "cancel":
+			cancelled := session.CancelActiveTasks()
+			_ = connManager.SafeWriteJSON(map[string]interface{}{
+				"type":            "cancel_ack",
+				"session_id":      session.ID,
+				"cancelled_tasks": cancelled,
+			})
+		case "tool_approval":
+			callID := strings.TrimSpace(req.CallID)
+			if callID == "" {
+				_ = connManager.SafeWriteJSON(map[string]interface{}{
+					"type":       "error",
+					"session_id": session.ID,
+					"error":      "call_id is required",
+					"severity":   "warning",
+				})
+				continue
+			}
+			if err := session.SubmitToolApproval(callID, req.Approved); err != nil {
+				_ = connManager.SafeWriteJSON(map[string]interface{}{
+					"type":       "error",
+					"session_id": session.ID,
+					"call_id":    callID,
+					"error":      err.Error(),
+				})
+				continue
+			}
+			_ = connManager.SafeWriteJSON(map[string]interface{}{
+				"type":       "tool_approval_ack",
+				"session_id": session.ID,
+				"call_id":    callID,
+				"approved":   req.Approved,
+			})
+		case "lead_input":
+			if strings.TrimSpace(req.Command) == "" {
+				_ = connManager.SafeWriteJSON(map[string]interface{}{
+					"type":       "error",
+					"session_id": session.ID,
+					"error":      "command is required",
+					"severity":   "warning",
+				})
+				continue
+			}
+			if taskID, ok := teamLeadRunningTask(session); ok {
+				_ = connManager.SafeWriteJSON(map[string]interface{}{
+					"type":       "error",
+					"session_id": session.ID,
+					"task_id":    taskID,
+					"error":      "team-lead session is already running; input ignored",
+					"severity":   "warning",
+				})
+				continue
+			}
+			taskID := strings.TrimSpace(req.TaskID)
+			if taskID == "" {
+				taskID = generateTaskID()
+			}
+			_ = connManager.SafeWriteJSON(map[string]interface{}{
+				"type":       "lead_input_ack",
+				"session_id": session.ID,
+				"team_name":  session.TeamName,
+				"task_id":    taskID,
+			})
+			status := "completed"
+			err := session.Execute(context.Background(), taskID, req.Command, func(e event.StreamEvent) {
+				if e.Seq == 0 {
+					e = session.enrichAndRecordEvent(e)
+				}
+				_ = connManager.SafeWriteJSON(e)
+			})
+			if err != nil {
+				status = "error"
+				_ = connManager.SafeWriteJSON(map[string]interface{}{
+					"type":       "error",
+					"session_id": session.ID,
+					"task_id":    taskID,
+					"error":      err.Error(),
+				})
+			}
+			ds.sendTeamLeadCompletion(session, taskID, status, err == nil, connManager)
+		default:
+			_ = connManager.SafeWriteJSON(map[string]interface{}{
+				"type":       "error",
+				"session_id": session.ID,
+				"error":      "unsupported team-lead stream frame type",
+				"severity":   "warning",
+			})
+		}
+	}
+}
+
+func (ds *Server) streamTeamLeadReplayAndLive(session *TeamLeadSession, connManager *ConnectionManager, sinceSeq int64) {
+	_ = connManager.SafeWriteJSON(map[string]interface{}{
+		"type":       "session_start",
+		"session_id": session.ID,
+		"team_name":  session.TeamName,
+	})
+	if session.Store != nil {
+		for _, e := range session.Store.Since(sinceSeq, func(event.StreamEvent) bool { return true }) {
+			_ = connManager.SafeWriteJSON(e)
+		}
+	}
+
+	taskID, running := teamLeadRunningTask(session)
+	if !running {
+		ds.sendTeamLeadCompletion(session, "", "idle", true, connManager)
+		return
+	}
+	sub := session.Broadcaster.Subscribe()
+	defer session.Broadcaster.Unsubscribe(sub)
+	for {
+		select {
+		case e := <-sub:
+			if e.Seq <= sinceSeq {
+				continue
+			}
+			_ = connManager.SafeWriteJSON(e)
+			if e.Type == event.EventTypeTaskCompletion {
+				ds.sendTeamLeadCompletion(session, taskID, "completed", true, connManager)
+				return
+			}
+		case <-time.After(30 * time.Second):
+			if _, stillRunning := teamLeadRunningTask(session); !stillRunning {
+				ds.sendTeamLeadCompletion(session, taskID, "completed", true, connManager)
+				return
+			}
+		}
+	}
+}
+
+func (ds *Server) sendTeamLeadCompletion(session *TeamLeadSession, taskID, status string, success bool, connManager *ConnectionManager) {
+	lastSeq := int64(0)
+	if session.Store != nil {
+		lastSeq = session.Store.LastSeq()
+	}
+	_ = connManager.SafeWriteJSON(map[string]interface{}{
+		"type":         "completion",
+		"session_id":   session.ID,
+		"team_name":    session.TeamName,
+		"task_id":      taskID,
+		"success":      success,
+		"status":       status,
+		"session_done": status != "running",
+		"last_seq":     lastSeq,
+	})
+}
+
+func teamLeadRunningTask(session *TeamLeadSession) (string, bool) {
+	session.tasksMutex.RLock()
+	defer session.tasksMutex.RUnlock()
+	for _, task := range session.activeTasks {
+		if task != nil && task.Status == "running" {
+			return task.ID, true
+		}
+	}
+	return "", false
+}
+
+// generateRandomID generates a random ID for sessions and tasks
+func generateRandomID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func generateTaskID() string {
+	return fmt.Sprintf("task-%d-%s", time.Now().Unix(), generateRandomID())
 }

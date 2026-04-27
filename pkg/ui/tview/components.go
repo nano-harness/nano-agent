@@ -175,6 +175,8 @@ func (sb *StatusBar) GetPrimitive() tview.Primitive {
 // InputField represents the input field component using TextArea for multi-line support
 type InputField struct {
 	*tview.TextArea
+	// placeholder mirrors the current placeholder because tview.TextArea does not expose a getter.
+	placeholder string
 }
 
 // NewInputField creates a new input field component with multi-line support
@@ -184,8 +186,9 @@ func NewInputField() *InputField {
 	input.SetTitle(" ➤ 多行输入 (Enter换行, 双击Enter发送) ")
 	input.SetTitleAlign(tview.AlignLeft)
 	input.SetWrap(true) // Enable word wrapping
+	inputField := &InputField{TextArea: input}
 	// Set placeholder text
-	input.SetPlaceholder("支持多行输入和粘贴，Enter换行，双击Enter发送消息")
+	inputField.SetPlaceholder("支持多行输入和粘贴，Enter换行，双击Enter发送消息")
 
 	// Integrate with OS clipboard for copy/paste support
 	input.SetClipboard(
@@ -200,7 +203,7 @@ func NewInputField() *InputField {
 		},
 	)
 
-	return &InputField{TextArea: input}
+	return inputField
 }
 
 // GetPrimitive returns the underlying tview primitive
@@ -218,9 +221,26 @@ func (i *InputField) SetText(text string) {
 	i.TextArea.SetText(text, true)
 }
 
+// SetPlaceholder sets the placeholder text.
+func (i *InputField) SetPlaceholder(placeholder string) *InputField {
+	i.placeholder = placeholder
+	i.TextArea.SetPlaceholder(placeholder)
+	return i
+}
+
+// GetPlaceholder returns the current placeholder text.
+func (i *InputField) GetPlaceholder() string {
+	return i.placeholder
+}
+
 // SetDisabled sets the disabled state
 func (i *InputField) SetDisabled(disabled bool) {
 	i.TextArea.SetDisabled(disabled)
+}
+
+// IsDisabled returns whether the input field is disabled.
+func (i *InputField) IsDisabled() bool {
+	return i.TextArea.GetDisabled()
 }
 
 // SetTextColor sets the text color

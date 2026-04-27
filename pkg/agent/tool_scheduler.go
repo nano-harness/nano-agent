@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -63,6 +62,15 @@ const (
 // one or more tool calls are still awaiting user approval.
 const approvalWaitExtension = 10 * time.Minute
 
+// ApprovalDecision describes a user's approval response.
+type ApprovalDecision int
+
+const (
+	ApprovalReject ApprovalDecision = iota
+	ApprovalApproveOnce
+	ApprovalApproveAlways
+)
+
 // ToolCallInfo represents detailed information about a tool call
 type ToolCallInfo struct {
 	ID               string                 `json:"id"`
@@ -89,6 +97,7 @@ type ToolScheduler struct {
 	onComplete        func([]*ToolCallInfo)
 	outputHandler     func(string, string)     // callID, output chunk
 	approvalHandler   func(*ToolCallInfo) bool // returns true if approved
+	approvalHandlerV2 func(*ToolCallInfo) ApprovalDecision
 	allowedExact      map[string]struct{}
 	allowedPatterns   []string
 	permissionManager *permission.Manager
@@ -116,6 +125,13 @@ func (ts *ToolScheduler) SetApprovalHandler(handler func(*ToolCallInfo) bool) {
 	ts.approvalHandler = handler
 }
 
+// SetApprovalHandlerV2 sets an approval handler that can approve once or always.
+func (ts *ToolScheduler) SetApprovalHandlerV2(handler func(*ToolCallInfo) ApprovalDecision) {
+	ts.mutex.Lock()
+	defer ts.mutex.Unlock()
+	ts.approvalHandlerV2 = handler
+}
+
 // GetApprovalHandler returns the current approval handler.
 func (ts *ToolScheduler) GetApprovalHandler() func(*ToolCallInfo) bool {
 	ts.mutex.RLock()
@@ -137,15 +153,28 @@ func (ts *ToolScheduler) SetAgentConfig(cfg *config.Config) {
 	ts.agentConfig = cfg
 }
 
+func (ts *ToolScheduler) addAllowlistRules(call *ToolCallInfo) {
+	ts.mutex.RLock()
+	pm := ts.permissionManager
+	ts.mutex.RUnlock()
+	if pm == nil || call == nil {
+		return
+	}
+	for _, rule := range permission.BuildAllowlistRules(call.Name, call.Parameters) {
+		pm.GetSessionAllowlist().AddRule(rule)
+	}
+}
+
 // ToolSchedulerOptions contains configuration options for the tool scheduler
 type ToolSchedulerOptions struct {
-	Toolbox          *tools.Toolbox
-	EventHandler     func(event.StreamEvent)
-	RecoveryStrategy *ToolRecoveryStrategy
-	OnUpdate         func([]*ToolCallInfo)
-	OnComplete       func([]*ToolCallInfo)
-	OutputHandler    func(string, string) // callID, output chunk
-	ApprovalHandler  func(*ToolCallInfo) bool
+	Toolbox           *tools.Toolbox
+	EventHandler      func(event.StreamEvent)
+	RecoveryStrategy  *ToolRecoveryStrategy
+	OnUpdate          func([]*ToolCallInfo)
+	OnComplete        func([]*ToolCallInfo)
+	OutputHandler     func(string, string) // callID, output chunk
+	ApprovalHandler   func(*ToolCallInfo) bool
+	ApprovalHandlerV2 func(*ToolCallInfo) ApprovalDecision
 }
 
 // NewToolScheduler creates a new tool scheduler with enhanced capabilities
@@ -171,6 +200,7 @@ func NewToolSchedulerWithOptions(opts ToolSchedulerOptions) *ToolScheduler {
 		onComplete:        opts.OnComplete,
 		outputHandler:     opts.OutputHandler,
 		approvalHandler:   opts.ApprovalHandler,
+		approvalHandlerV2: opts.ApprovalHandlerV2,
 		allowedExact:      nil,
 		allowedPatterns:   nil,
 		securityDecisions: make(map[string]*middleware.Decision),
@@ -218,7 +248,21 @@ func (ts *ToolScheduler) setStatus(callID string, status ToolCallStatus, result 
 	toolCall, exists := ts.toolCalls[callID]
 	if !exists {
 		ts.mutex.Unlock()
+		logger.Warnf("DEBUG setStatus: toolCall %s not found", callID)
 		return
+	}
+
+	oldStatus := toolCall.Status
+	if status == StatusError {
+		errMsg := "unknown"
+		if result != nil && result.Error != "" {
+			errMsg = result.Error
+		} else if err != nil {
+			errMsg = err.Error()
+		}
+		logger.Infof("DEBUG setStatus: %s %s -> %s (tool: %s, error: %s)", callID, oldStatus, status, toolCall.Name, errMsg)
+	} else {
+		logger.Infof("DEBUG setStatus: %s %s -> %s (tool: %s)", callID, oldStatus, status, toolCall.Name)
 	}
 
 	if (toolCall.Status == StatusSuccess || toolCall.Status == StatusError || toolCall.Status == StatusCancelled) && toolCall.Result != nil {
@@ -411,20 +455,9 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 		}
 
 		// Enforce allowed tools whitelist if set
-		ts.mutex.RLock()
-		_, allowed := ts.allowedExact[tool.Name]
-		hasWhitelist := ts.allowedExact != nil || (ts.allowedPatterns != nil && len(ts.allowedPatterns) > 0) //nolint:staticcheck
-		// pattern match if not exact
-		if !allowed && len(ts.allowedPatterns) > 0 {
-			for _, pat := range ts.allowedPatterns {
-				if ok, _ := filepath.Match(pat, tool.Name); ok {
-					allowed = true
-					break
-				}
-			}
-		}
-		ts.mutex.RUnlock()
-		if hasWhitelist && !allowed {
+		policy := ts.policyEngine()
+		preflight := policy.PreflightTool(ctx, tool.Name, tool.Parameters, toolInstance)
+		if preflight.HasAllowPolicy && !preflight.Allowed {
 			tr := &interfaces.ToolResult{
 				Success:     false,
 				Error:       "tool not allowed",
@@ -476,29 +509,17 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 		}
 
 		// Check if tool requires confirmation.
-		// Permission manager (if set) takes priority; it already incorporates mode,
-		// allowlist, and per-tool RequiresConfirmation logic.
-		ts.mutex.RLock()
-		pm := ts.permissionManager
-		ts.mutex.RUnlock()
-		if pm != nil {
-			toolCall.RequiresApproval = pm.ShouldConfirm(tool.Name, tool.Parameters, toolInstance)
-		} else if contextualTool, ok := toolInstance.(interfaces.ContextualConfirmationTool); ok {
-			// Use dynamic confirmation based on parameters
-			toolCall.RequiresApproval = contextualTool.RequiresConfirmationForParams(tool.Parameters)
-		} else {
-			// Fall back to static confirmation
-			toolCall.RequiresApproval = toolInstance.RequiresConfirmation()
-		}
+		toolCall.RequiresApproval = preflight.RequiresApproval
 
 		// Unified security pre-analysis for tools that support it.
 		// This is the single source of truth: if the tool provides a security
 		// decision here we store it for later context injection, immediately reject
 		// ActionBlock commands, and override RequiresApproval for ActionAllow.
-		if secTool, ok := toolInstance.(interfaces.SecurityAnalyzableTool); ok {
-			action, reason, err := secTool.AnalyzeSecurity(ctx, tool.Parameters)
-			if err != nil {
+		analysis := preflight.SecurityAnalysis
+		if analysis.Supported {
+			if analysis.Err != nil {
 				// Analysis error: treat as a hard failure, do not schedule execution.
+				err := analysis.Err
 				tr := &interfaces.ToolResult{
 					Success:     false,
 					Error:       "command security analysis failed: " + err.Error(),
@@ -541,59 +562,8 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 				ts.setStatus(tool.ID, StatusError, tr, err)
 				continue
 			}
-			// Validate the returned action is within known bounds (fail-closed).
-			validatedAction := middleware.Action(action)
-			switch validatedAction {
-			case middleware.ActionAllow, middleware.ActionConfirm, middleware.ActionBlock:
-				// Valid action.
-			default:
-				err := fmt.Errorf("invalid security action %d returned by tool %s", action, tool.Name)
-				tr := &interfaces.ToolResult{
-					Success:     false,
-					Error:       "command security analysis failed: " + err.Error(),
-					Metadata:    map[string]interface{}{"code": "security_analysis_error", "tool_name": tool.Name},
-					LLMContent:  fmt.Sprintf("Tool '%s' security analysis failed: %v", tool.Name, err),
-					UserContent: fmt.Sprintf("工具 '%s' 安全分析失败: %v", tool.Name, err),
-				}
-				ts.mutex.Lock()
-				ts.toolCalls[tool.ID] = toolCall
-				ts.mutex.Unlock()
-				if ts.eventHandler != nil {
-					ts.eventHandler(event.StreamEvent{
-						Type: event.EventTypeToolCall,
-						ToolCalls: []*tools.ToolCall{{
-							ID:        toolCall.ID,
-							Name:      toolCall.Name,
-							Arguments: toolCall.Parameters,
-						}},
-					})
-					ts.eventHandler(event.StreamEvent{
-						Type: event.EventTypeToolResult,
-						ToolResult: &tools.ToolResult{
-							ID:      toolCall.ID,
-							Content: tr.LLMContent,
-							Error:   tr.Error,
-						},
-					})
-					ts.eventHandler(event.StreamEvent{
-						Type:   event.EventTypeToolUse,
-						Source: "agent_turn",
-						ToolUse: &event.ToolUse{
-							ID:         toolCall.ID,
-							ToolName:   toolCall.Name,
-							Parameters: toolCall.Parameters,
-							Status:     string(StatusError),
-							Result:     tr.UserContent,
-						},
-					})
-				}
-				ts.setStatus(tool.ID, StatusError, tr, err)
-				continue
-			}
-			decision := &middleware.Decision{
-				Action: validatedAction,
-				Reason: reason,
-			}
+
+			decision := analysis.Decision
 			switch decision.Action {
 			case middleware.ActionBlock:
 				// Immediately reject – no confirmation dialog.
@@ -651,7 +621,9 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 				ts.mutex.RLock()
 				pm := ts.permissionManager
 				ts.mutex.RUnlock()
-				if pm != nil && decision.Confidence >= pm.GetConfidenceThreshold() {
+				if pm != nil && pm.GetSessionAllowlist().IsAllowed(tool.Name, tool.Parameters) {
+					toolCall.RequiresApproval = false
+				} else if pm != nil && decision.Confidence >= pm.GetConfidenceThreshold() {
 					// High-confidence confirm → auto-approve, add to session allowlist
 					toolCall.RequiresApproval = false
 					if decision.AutoWhitelist {
@@ -754,7 +726,26 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 
 		// Handle approval flow
 		if toolCall.RequiresApproval {
-			if ts.approvalHandler != nil {
+			if ts.approvalHandlerV2 != nil {
+				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
+				switch ts.approvalHandlerV2(toolCall) {
+				case ApprovalApproveAlways:
+					ts.addAllowlistRules(toolCall)
+					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+				case ApprovalApproveOnce:
+					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+				case ApprovalReject:
+					tr := &interfaces.ToolResult{
+						Success:     false,
+						Error:       "cancelled by user",
+						Metadata:    map[string]interface{}{"status": "cancelled", "reason": "user_declined"},
+						LLMContent:  "Tool execution was cancelled by user.",
+						UserContent: "Tool execution was cancelled by user.",
+					}
+					tr = ts.normalizeToolResultFields(toolCall.Name, tr, nil)
+					ts.setStatus(tool.ID, StatusCancelled, tr, fmt.Errorf("cancelled by user"))
+				}
+			} else if ts.approvalHandler != nil {
 				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
 				// In TUI mode the handler is async; true means sync-approved.
 				if ts.approvalHandler(toolCall) {
@@ -1124,7 +1115,9 @@ func (ts *ToolScheduler) executeScheduledCalls(ctx context.Context) {
 	}
 	ts.mutex.RUnlock()
 
+	logger.Infof("DEBUG executeScheduledCalls: launching %d tool goroutines", len(scheduledCalls))
 	for _, call := range scheduledCalls {
+		logger.Infof("DEBUG executeScheduledCalls: launching goroutine for tool %s (ID: %s)", call.Name, call.ID)
 		go ts.executeSingleToolCall(ctx, call)
 	}
 }

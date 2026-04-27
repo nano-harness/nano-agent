@@ -100,6 +100,35 @@ func (c *Client) streamURL() (string, error) {
 	return parsed.String(), nil
 }
 
+// StreamURL returns the daemon-wide WebSocket stream URL.
+func (c *Client) StreamURL() (string, error) {
+	return c.streamURL()
+}
+
+func (c *Client) teamLeadStreamURL(sessionID string) (string, error) {
+	parsed, err := url.Parse(c.baseURL)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "https" {
+		parsed.Scheme = "wss"
+	} else {
+		parsed.Scheme = "ws"
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/teams/sessions/" + url.PathEscape(sessionID) + "/stream"
+	q := parsed.Query()
+	if strings.TrimSpace(c.apiKey) != "" {
+		q.Set("api_key", strings.TrimSpace(c.apiKey))
+	}
+	parsed.RawQuery = q.Encode()
+	return parsed.String(), nil
+}
+
+// TeamLeadStreamURL returns the WebSocket stream URL for a team-lead session.
+func (c *Client) TeamLeadStreamURL(sessionID string) (string, error) {
+	return c.teamLeadStreamURL(sessionID)
+}
+
 func parseSeqFromMessage(msg map[string]interface{}) int64 {
 	if v, ok := msg["seq"]; ok {
 		switch s := v.(type) {
@@ -144,11 +173,209 @@ func mergeChunks(parts map[int]string, _ int) string {
 
 // SubscribeOptions options for subscribing to a session
 type SubscribeOptions struct {
-	SessionID      string
-	RunID          string
-	SinceSeq       int64
-	Streams        []string
-	ReconnectDelay time.Duration
+	SessionID       string
+	RunID           string
+	SinceSeq        int64
+	Streams         []string
+	ReconnectDelay  time.Duration
+	ApprovalHandler func(ToolApprovalRequest) bool
+}
+
+// LeadInputOptions configures a team-lead WebSocket input frame.
+type LeadInputOptions struct {
+	SessionID       string
+	Command         string
+	TaskID          string
+	SinceSeq        int64
+	ReconnectDelay  time.Duration
+	ApprovalHandler func(ToolApprovalRequest) bool
+}
+
+// ToolApprovalRequest describes an approval prompt emitted by the daemon stream.
+type ToolApprovalRequest struct {
+	CallID     string
+	ToolName   string
+	Parameters map[string]interface{}
+}
+
+// CreateTeamLeadSession creates or resumes a daemon team-lead session.
+func (c *Client) CreateTeamLeadSession(sessionID, teamName string) (*TeamLeadSessionResponse, error) {
+	return c.CreateTeamLeadSessionWithOptions(sessionID, teamName, false)
+}
+
+// CreateTeamLeadSessionWithOptions creates or resumes a daemon team-lead session.
+func (c *Client) CreateTeamLeadSessionWithOptions(sessionID, teamName string, interactiveConfirm bool) (*TeamLeadSessionResponse, error) {
+	req := CreateTeamLeadSessionRequest{
+		SessionID:          strings.TrimSpace(sessionID),
+		TeamName:           strings.TrimSpace(teamName),
+		InteractiveConfirm: interactiveConfirm,
+	}
+	var response TeamLeadSessionResponse
+	err := c.doRequest("POST", "/teams/sessions", req, &response)
+	return &response, err
+}
+
+// SendLeadInputWithResume sends one lead_input WebSocket frame and streams events until completion.
+func (c *Client) SendLeadInputWithResume(ctx context.Context, opts LeadInputOptions, onMessage func(map[string]interface{})) (map[string]interface{}, int64, error) {
+	if strings.TrimSpace(opts.SessionID) == "" {
+		return nil, opts.SinceSeq, fmt.Errorf("session_id is required")
+	}
+	if strings.TrimSpace(opts.Command) == "" {
+		return nil, opts.SinceSeq, fmt.Errorf("command is required")
+	}
+	reconnectDelay := opts.ReconnectDelay
+	if reconnectDelay <= 0 {
+		reconnectDelay = 1500 * time.Millisecond
+	}
+	sinceSeq := opts.SinceSeq
+	streamURL, err := c.teamLeadStreamURL(opts.SessionID)
+	if err != nil {
+		return nil, sinceSeq, err
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	sentInput := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, sinceSeq, err
+		}
+		conn, _, err := dialer.DialContext(ctx, streamURL, nil)
+		if err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, sinceSeq, err
+			}
+			select {
+			case <-ctx.Done():
+				return nil, sinceSeq, ctx.Err()
+			case <-time.After(reconnectDelay):
+				continue
+			}
+		}
+		payload := map[string]interface{}{}
+		if sentInput {
+			payload["type"] = "subscribe"
+			payload["since_seq"] = sinceSeq
+		} else {
+			payload["type"] = "lead_input"
+			payload["command"] = strings.TrimSpace(opts.Command)
+			payload["since_seq"] = sinceSeq
+			if strings.TrimSpace(opts.TaskID) != "" {
+				payload["task_id"] = strings.TrimSpace(opts.TaskID)
+			}
+			sentInput = true
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := conn.WriteJSON(payload); err != nil {
+			_ = conn.Close()
+			if err := ctx.Err(); err != nil {
+				return nil, sinceSeq, err
+			}
+			select {
+			case <-ctx.Done():
+				return nil, sinceSeq, ctx.Err()
+			case <-time.After(reconnectDelay):
+				continue
+			}
+		}
+		_ = conn.SetWriteDeadline(time.Time{})
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			return nil
+		})
+		for {
+			if err := ctx.Err(); err != nil {
+				_ = conn.Close()
+				return nil, sinceSeq, err
+			}
+			var msg map[string]interface{}
+			if err := conn.ReadJSON(&msg); err != nil {
+				_ = conn.Close()
+				if err := ctx.Err(); err != nil {
+					return nil, sinceSeq, err
+				}
+				if !sleepBeforeReconnect(ctx, reconnectDelay) {
+					return nil, sinceSeq, ctx.Err()
+				}
+				break
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			if seq := parseSeqFromMessage(msg); seq > sinceSeq {
+				sinceSeq = seq
+			}
+			if onMessage != nil {
+				onMessage(msg)
+			}
+			if req, ok := toolApprovalRequestFromMessage(msg); ok && opts.ApprovalHandler != nil {
+				approved := opts.ApprovalHandler(req)
+				if err := writeToolApproval(conn, req.CallID, approved); err != nil {
+					_ = conn.Close()
+					return nil, sinceSeq, err
+				}
+				continue
+			}
+			switch parseMessageType(msg) {
+			case "completion":
+				_ = conn.Close()
+				return msg, sinceSeq, nil
+			case "error":
+				errText, _ := msg["error"].(string)
+				if errText != "" {
+					_ = conn.Close()
+					return msg, sinceSeq, errors.New(errText)
+				}
+			}
+		}
+	}
+}
+
+func toolApprovalRequestFromMessage(msg map[string]interface{}) (ToolApprovalRequest, bool) {
+	if parseMessageType(msg) != string(event.EventTypeWaitingForUser) {
+		return ToolApprovalRequest{}, false
+	}
+	metadata, ok := msg["metadata"].(map[string]interface{})
+	if !ok || strings.TrimSpace(stringFromMap(metadata, "kind")) != "tool_approval_request" {
+		return ToolApprovalRequest{}, false
+	}
+	callID := strings.TrimSpace(stringFromMap(metadata, "call_id"))
+	if callID == "" {
+		return ToolApprovalRequest{}, false
+	}
+	params, _ := metadata["parameters"].(map[string]interface{})
+	return ToolApprovalRequest{
+		CallID:     callID,
+		ToolName:   strings.TrimSpace(stringFromMap(metadata, "tool_name")),
+		Parameters: params,
+	}, true
+}
+
+func stringFromMap(m map[string]interface{}, key string) string {
+	v, _ := m[key].(string)
+	return v
+}
+
+func writeToolApproval(conn *websocket.Conn, callID string, approved bool) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	err := conn.WriteJSON(map[string]interface{}{
+		"type":     "tool_approval",
+		"call_id":  callID,
+		"approved": approved,
+	})
+	_ = conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+// SubmitToolApproval writes a tool approval decision on an existing WebSocket.
+func SubmitToolApproval(conn *websocket.Conn, callID string, approved bool) error {
+	return writeToolApproval(conn, callID, approved)
+}
+
+func sleepBeforeReconnect(ctx context.Context, delay time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
 }
 
 // SubscribeSessionWithResume subscribes to a session with resume capability
@@ -291,6 +518,15 @@ func (c *Client) SubscribeSessionWithResume(ctx context.Context, opts SubscribeO
 			}
 			if onMessage != nil {
 				onMessage(msg)
+			}
+			if req, ok := toolApprovalRequestFromMessage(msg); ok && opts.ApprovalHandler != nil {
+				approved := opts.ApprovalHandler(req)
+				if err := writeToolApproval(conn, req.CallID, approved); err != nil {
+					stopConnWatcher()
+					_ = conn.Close()
+					return nil, sinceSeq, err
+				}
+				continue
 			}
 			msgType := parseMessageType(msg)
 			if msgType == "completion" {
@@ -515,6 +751,13 @@ func (c *Client) GetSession(id string) (map[string]any, error) {
 func (c *Client) CancelSession(id string) (map[string]any, error) {
 	var response map[string]any
 	err := c.doRequest("POST", fmt.Sprintf("/sessions/%s/cancel", url.PathEscape(id)), nil, &response)
+	return response, err
+}
+
+// CancelTeamLeadSession cancels a team-lead session.
+func (c *Client) CancelTeamLeadSession(id string) (map[string]any, error) {
+	var response map[string]any
+	err := c.doRequest("POST", fmt.Sprintf("/teams/sessions/%s/cancel", url.PathEscape(id)), nil, &response)
 	return response, err
 }
 

@@ -143,6 +143,18 @@ func (m *EnhancedMockServer) Reset() {
 	m.failureIndex = 0
 }
 
+// GetRecordedRequests returns a copy of the recorded requests in a thread-safe manner.
+// This method should be used instead of accessing RecordedRequests field directly to avoid data races.
+func (m *EnhancedMockServer) GetRecordedRequests() []RecordedRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Return a copy to prevent concurrent access issues
+	result := make([]RecordedRequest, len(m.RecordedRequests))
+	copy(result, m.RecordedRequests)
+	return result
+}
+
+
 // matchTitleRequest checks if the messages contain the title generation prompt
 func matchTitleRequest(messages []map[string]interface{}) bool {
 	const titleKeyword = "请根据以下对话内容，生成一个简短的标题"

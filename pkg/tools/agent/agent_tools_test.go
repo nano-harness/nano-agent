@@ -133,8 +133,11 @@ func TestAgentToolsRegistration(t *testing.T) {
 	// Test GetAgentToolNames
 	toolNames := GetAgentToolNames()
 	assert.Contains(t, toolNames, "main_agent")
-	assert.Contains(t, toolNames, "task")
-	assert.Len(t, toolNames, 2)
+	assert.Contains(t, toolNames, "send_message")
+	assert.Contains(t, toolNames, "spawn_teammate")
+	assert.Contains(t, toolNames, "team_create")
+	assert.Contains(t, toolNames, "team_list")
+	assert.Len(t, toolNames, 5)
 }
 
 // MockToolRegistry is a simple mock implementation for testing

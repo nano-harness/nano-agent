@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
@@ -355,6 +356,49 @@ func TestToolScheduler_ConfirmShellCommand_TriggersApproval(t *testing.T) {
 
 	if !approvalCalled {
 		t.Error("approval handler should have been called for ActionConfirm command")
+	}
+}
+
+func TestToolScheduler_ApproveAlways_AddsToAllowlist(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+	pm := permission.NewManager(permission.ModeDefault, nil)
+
+	approvalCalls := 0
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     func(_ event.StreamEvent) {},
+		RecoveryStrategy: NewToolRecoveryStrategy(nil),
+		ApprovalHandlerV2: func(_ *ToolCallInfo) ApprovalDecision {
+			approvalCalls++
+			return ApprovalApproveAlways
+		},
+	})
+	ts.SetPermissionManager(pm)
+
+	params := map[string]interface{}{"command": "sleep 0 && sleep 0"}
+	if _, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "always-1",
+		Name:       "run_shell_command",
+		Parameters: params,
+	}}); err != nil {
+		t.Fatalf("first ExecuteParallel: %v", err)
+	}
+	if approvalCalls != 1 {
+		t.Fatalf("expected first approval call, got %d", approvalCalls)
+	}
+
+	if _, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "always-2",
+		Name:       "run_shell_command",
+		Parameters: params,
+	}}); err != nil {
+		t.Fatalf("second ExecuteParallel: %v", err)
+	}
+	if approvalCalls != 1 {
+		t.Fatalf("approve-always allowlist should skip second approval, got %d calls", approvalCalls)
 	}
 }
 

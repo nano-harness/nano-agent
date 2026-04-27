@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
 )
 
 // Manager coordinates the global permission mode and the session-scoped
@@ -12,6 +13,7 @@ type Manager struct {
 	mu        sync.RWMutex
 	mode      PermissionMode
 	allowlist *SessionAllowlist
+	workdir   string
 	// ConfidenceThreshold is the minimum confidence level for auto-approval.
 	// Decisions with confidence >= threshold are auto-approved without user confirmation.
 	// Range: 0.0 (strictest, require confirmation for everything) to 1.0 (most permissive).
@@ -28,9 +30,15 @@ type Manager struct {
 // NewManager creates a Manager with the specified initial mode.  Pre-defined
 // rules (from config) can be supplied via initialRules.
 func NewManager(mode PermissionMode, initialRules []PermissionRule) *Manager {
+	return NewManagerWithWorkdir(mode, initialRules, "")
+}
+
+// NewManagerWithWorkdir creates a Manager bound to a trusted workdir.
+func NewManagerWithWorkdir(mode PermissionMode, initialRules []PermissionRule, workdir string) *Manager {
 	m := &Manager{
 		mode:                mode,
 		allowlist:           NewSessionAllowlist(),
+		workdir:             workdir,
 		confidenceThreshold: 0.8,
 	}
 	for _, r := range initialRules {
@@ -66,12 +74,14 @@ func (m *Manager) GetSessionAllowlist() *SessionAllowlist {
 //  1. YOLO mode → never confirm.
 //  2. Session allowlist match → never confirm.
 //  3. AcceptEdits mode + edit tool → never confirm.
-//  4. ContextualConfirmationTool.RequiresConfirmationForParams → use that.
-//  5. Tool.RequiresConfirmation → use that.
-//  6. Default → no confirmation required.
+//  4. Filesystem edit tool path inside trusted workdir → never confirm.
+//  5. ContextualConfirmationTool.RequiresConfirmationForParams → use that.
+//  6. Tool.RequiresConfirmation → use that.
+//  7. Default → no confirmation required.
 func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, tool interfaces.Tool) bool {
 	m.mu.RLock()
 	mode := m.mode
+	workdir := m.workdir
 	m.mu.RUnlock()
 
 	// 1. YOLO – skip everything.
@@ -89,7 +99,14 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 		return false
 	}
 
-	// 4 & 5. Delegate to the tool's own confirmation logic.
+	// 4. Filesystem edit tools inside the trusted workdir are auto-approved.
+	if tool != nil && IsEditTool(tool) && workdir != "" {
+		if path := extractFilesystemPath(toolName, params); path != "" {
+			return !middleware.IsPathWithinWorkdir(workdir, path)
+		}
+	}
+
+	// 5 & 6. Delegate to the tool's own confirmation logic.
 	if tool == nil {
 		return false
 	}
@@ -97,6 +114,19 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 		return ct.RequiresConfirmationForParams(params)
 	}
 	return tool.RequiresConfirmation()
+}
+
+func extractFilesystemPath(toolName string, params map[string]interface{}) string {
+	if len(params) == 0 {
+		return ""
+	}
+	key := "file_path"
+	switch toolName {
+	case "edit_file", "delete_file":
+		key = "path"
+	}
+	path, _ := params[key].(string)
+	return path
 }
 
 // SetConfidenceThreshold sets the minimum confidence for auto-approval.

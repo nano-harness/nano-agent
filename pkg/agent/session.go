@@ -12,6 +12,13 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 )
 
+// SessionMetadata contains structured metadata about a session
+type SessionMetadata struct {
+	TeamName   string `json:"teamName,omitempty"`
+	AgentName  string `json:"agentName,omitempty"` // teammate name; lead is "team-lead"
+	IsTeammate bool   `json:"isTeammate,omitempty"`
+}
+
 // Session represents an isolated conversation session for a user/request.
 // Each session maintains its own conversation history, enabling concurrent
 // requests from different users without interference.

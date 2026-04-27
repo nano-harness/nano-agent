@@ -1,12 +1,15 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/gorilla/mux"
@@ -230,4 +233,222 @@ func TestStreamHandler_SubscribeCompletedSession_WithNilStore(t *testing.T) {
 	assert.Equal(t, "sess_3", resp2["session_id"])
 	assert.Equal(t, "completed", resp2["status"])
 	assert.Equal(t, float64(0), resp2["last_seq"])
+}
+
+func TestTeamLeadSessionStreamHandler_LeadInputExecutesAndStreams(t *testing.T) {
+	session := &TeamLeadSession{
+		ID:          "lead-alpha-chat",
+		TeamName:    "alpha",
+		Store:       NewTaskEventStore(100),
+		Broadcaster: NewEventBroadcaster(),
+		activeTasks: make(map[string]*ActiveTask),
+		executeFunc: func(_ context.Context, taskID, command string, callback func(event.StreamEvent)) error {
+			callback(event.StreamEvent{
+				Type:    event.EventTypeContent,
+				Content: "echo: " + command,
+				TaskID:  taskID,
+			})
+			callback(event.StreamEvent{
+				Type:   event.EventTypeTaskCompletion,
+				TaskID: taskID,
+				Done:   true,
+			})
+			return nil
+		},
+	}
+	server := NewServer(nil, &config.DaemonConfig{
+		Port:       0,
+		Host:       "127.0.0.1",
+		EnableCORS: true,
+		APIKey:     "",
+	})
+	server.teamLeadRegistry = &TeamLeadRegistry{
+		sessions: map[string]*TeamLeadSession{session.ID: session},
+	}
+
+	r := mux.NewRouter()
+	r.HandleFunc("/api/v1/teams/sessions/{id}/stream", server.teamLeadSessionStreamHandler).Methods("GET")
+	ts := httptest.NewServer(r)
+	t.Cleanup(ts.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/teams/sessions/lead-alpha-chat/stream"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	err = conn.WriteJSON(map[string]interface{}{
+		"type":    "lead_input",
+		"command": "hello",
+		"task_id": "task-fixed",
+	})
+	assert.NoError(t, err)
+
+	_, msg1, err := conn.ReadMessage()
+	assert.NoError(t, err)
+	var ack map[string]interface{}
+	assert.NoError(t, json.Unmarshal(msg1, &ack))
+	assert.Equal(t, "lead_input_ack", ack["type"])
+	assert.Equal(t, "lead-alpha-chat", ack["session_id"])
+	assert.Equal(t, "task-fixed", ack["task_id"])
+
+	_, msg2, err := conn.ReadMessage()
+	assert.NoError(t, err)
+	var content map[string]interface{}
+	assert.NoError(t, json.Unmarshal(msg2, &content))
+	assert.Equal(t, "content", content["type"])
+	assert.Equal(t, "echo: hello", content["content"])
+	assert.Equal(t, float64(1), content["seq"])
+
+	_, msg3, err := conn.ReadMessage()
+	assert.NoError(t, err)
+	var done map[string]interface{}
+	assert.NoError(t, json.Unmarshal(msg3, &done))
+	assert.Equal(t, "task_completion", done["type"])
+	assert.Equal(t, float64(2), done["seq"])
+
+	_, msg4, err := conn.ReadMessage()
+	assert.NoError(t, err)
+	var completion map[string]interface{}
+	assert.NoError(t, json.Unmarshal(msg4, &completion))
+	assert.Equal(t, "completion", completion["type"])
+	assert.Equal(t, "completed", completion["status"])
+	assert.Equal(t, float64(2), completion["last_seq"])
+}
+
+func TestTeamLeadSessionInteractiveApprovalPublishesWaitingEvent(t *testing.T) {
+	session := &TeamLeadSession{
+		ID:          "lead-alpha-chat",
+		TeamName:    "alpha",
+		Store:       NewTaskEventStore(100),
+		Broadcaster: NewEventBroadcaster(),
+		activeTasks: make(map[string]*ActiveTask),
+	}
+
+	approvedImmediately := session.requestToolApproval(&agent.ToolCallInfo{
+		ID:         "call-1",
+		Name:       "bash",
+		Parameters: map[string]interface{}{"command": "rm -rf tmp"},
+	})
+
+	assert.False(t, approvedImmediately)
+	events := session.Store.Since(0, func(event.StreamEvent) bool { return true })
+	if assert.Len(t, events, 1) {
+		assert.Equal(t, event.EventTypeWaitingForUser, events[0].Type)
+		assert.Equal(t, "tool_approval_request", events[0].Metadata["kind"])
+		assert.Equal(t, "call-1", events[0].Metadata["call_id"])
+		assert.Equal(t, "bash", events[0].Metadata["tool_name"])
+	}
+}
+
+func TestTeamLeadSessionStreamHandler_ToolApprovalFrame(t *testing.T) {
+	var gotCallID string
+	var gotApproved bool
+	session := &TeamLeadSession{
+		ID:          "lead-alpha-chat",
+		TeamName:    "alpha",
+		Store:       NewTaskEventStore(100),
+		Broadcaster: NewEventBroadcaster(),
+		activeTasks: make(map[string]*ActiveTask),
+		approveFunc: func(callID string, approved bool) error {
+			gotCallID = callID
+			gotApproved = approved
+			return nil
+		},
+	}
+	server := NewServer(nil, &config.DaemonConfig{
+		Port:       0,
+		Host:       "127.0.0.1",
+		EnableCORS: true,
+		APIKey:     "",
+	})
+	server.teamLeadRegistry = &TeamLeadRegistry{
+		sessions: map[string]*TeamLeadSession{session.ID: session},
+	}
+
+	r := mux.NewRouter()
+	r.HandleFunc("/api/v1/teams/sessions/{id}/stream", server.teamLeadSessionStreamHandler).Methods("GET")
+	ts := httptest.NewServer(r)
+	t.Cleanup(ts.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/teams/sessions/lead-alpha-chat/stream"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	err = conn.WriteJSON(map[string]interface{}{
+		"type":     "tool_approval",
+		"call_id":  "call-1",
+		"approved": true,
+	})
+	assert.NoError(t, err)
+
+	_, msg, err := conn.ReadMessage()
+	assert.NoError(t, err)
+	var ack map[string]interface{}
+	assert.NoError(t, json.Unmarshal(msg, &ack))
+	assert.Equal(t, "tool_approval_ack", ack["type"])
+	assert.Equal(t, "call-1", ack["call_id"])
+	assert.Equal(t, true, ack["approved"])
+	assert.Equal(t, "call-1", gotCallID)
+	assert.True(t, gotApproved)
+}
+
+func TestClientSubscribeSessionWithResumeSendsToolApproval(t *testing.T) {
+	var gotSubscribe map[string]interface{}
+	var gotApproval map[string]interface{}
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		assert.NoError(t, conn.ReadJSON(&gotSubscribe))
+		assert.NoError(t, conn.WriteJSON(map[string]interface{}{
+			"type": "waiting_for_user",
+			"seq":  float64(1),
+			"metadata": map[string]interface{}{
+				"kind":       "tool_approval_request",
+				"call_id":    "call-1",
+				"tool_name":  "bash",
+				"parameters": map[string]interface{}{"command": "echo ok"},
+			},
+		}))
+		assert.NoError(t, conn.ReadJSON(&gotApproval))
+		assert.NoError(t, conn.WriteJSON(map[string]interface{}{
+			"type":     "completion",
+			"last_seq": float64(1),
+			"success":  true,
+			"status":   "completed",
+		}))
+	}))
+	t.Cleanup(ts.Close)
+
+	client := &Client{
+		baseURL: strings.TrimRight(ts.URL, "/") + "/api/v1",
+		client:  ts.Client(),
+	}
+	_, lastSeq, err := client.SubscribeSessionWithResume(context.Background(), SubscribeOptions{
+		SessionID: "sess-1",
+		ApprovalHandler: func(req ToolApprovalRequest) bool {
+			assert.Equal(t, "call-1", req.CallID)
+			assert.Equal(t, "bash", req.ToolName)
+			assert.Equal(t, "echo ok", req.Parameters["command"])
+			return true
+		},
+	}, nil)
+
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), lastSeq)
+	assert.Equal(t, "subscribe", gotSubscribe["type"])
+	assert.Equal(t, "sess-1", gotSubscribe["session_id"])
+	assert.Equal(t, "tool_approval", gotApproval["type"])
+	assert.Equal(t, "call-1", gotApproval["call_id"])
+	assert.Equal(t, true, gotApproval["approved"])
 }

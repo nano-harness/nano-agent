@@ -1,24 +1,58 @@
 package ui
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
 )
 
 // TViewAdapter wraps pkg/ui/tview as a ui.Adapter.
 type TViewAdapter struct {
 	integration *tview.Integration
-	submitCh    chan string
-	cancelCh    chan struct{}
 }
 
 // Run starts the tview event loop and blocks until exit.
-func (a *TViewAdapter) Run() error {
-	return a.integration.Run()
+func (a *TViewAdapter) Run(ctx context.Context, src eventsource.EventSource) error {
+	a.integration.BindOutbound(src.Send)
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := src.Start(childCtx); err != nil {
+		return err
+	}
+	go a.pumpInbound(childCtx, src)
+	err := a.integration.Run()
+	_ = src.Close()
+	return err
 }
 
-// SendEvent forwards a StreamEvent to the tview model for rendering.
-func (a *TViewAdapter) SendEvent(e event.StreamEvent) {
+func (a *TViewAdapter) pumpInbound(ctx context.Context, src eventsource.EventSource) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case in, ok := <-src.Inbound():
+			if !ok {
+				return
+			}
+			if in.State != nil {
+				a.integration.SetConnectionStatus(in.State.String(), src.Describe())
+			}
+			if in.Notice != "" {
+				a.integration.AddNotice(in.Notice)
+			} else if in.ResumedFrom > 0 {
+				a.integration.AddNotice(fmt.Sprintf("已重连，自 seq=%d 续传事件", in.ResumedFrom))
+			}
+			if in.Event != nil {
+				a.sendEvent(*in.Event)
+			}
+		}
+	}
+}
+
+func (a *TViewAdapter) sendEvent(e event.StreamEvent) {
 	switch e.Type {
 	case event.EventTypeStreamContent:
 		a.integration.AddMessage("assistant", e.Content)
@@ -36,14 +70,22 @@ func (a *TViewAdapter) SendEvent(e event.StreamEvent) {
 		if e.ToolUse != nil {
 			a.integration.AddToolUse(e.ToolUse)
 		}
+	case event.EventTypeWaitingForUser:
+		if req, ok := approvalFromEvent(e); ok {
+			a.integration.ShowConfirmation(fmt.Sprintf("确认执行工具：%s (ID: %s)？", req.toolName, req.callID), req.toolInfo, func(approved bool) {
+				_ = a.integration.SendOutbound(eventsource.Outbound{
+					Kind: "approval",
+					Approval: &eventsource.ApprovalDecision{
+						CallID: req.callID,
+						Allow:  approved,
+					},
+				})
+			})
+		}
+	case event.EventTypeMailboxSent:
+		a.integration.UpdateSwarmRoster(e.Content)
 	}
 }
-
-// SubmitChannel returns the channel that receives user-submitted text.
-func (a *TViewAdapter) SubmitChannel() <-chan string { return a.submitCh }
-
-// CancelChannel returns the channel that fires on user cancellation.
-func (a *TViewAdapter) CancelChannel() <-chan struct{} { return a.cancelCh }
 
 // Stop stops the tview integration.
 func (a *TViewAdapter) Stop() {

@@ -39,8 +39,6 @@ func TestCriticEvaluator_ShouldEvaluate(t *testing.T) {
 		{"write_file", true},
 		{"delete_file", true},
 		{"read_file", false},
-		{"list_directory", false},
-		{"search_file_content", false},
 	}
 
 	for _, tt := range tests {

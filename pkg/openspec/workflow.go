@@ -383,26 +383,30 @@ func (we *WorkflowEngine) resolveChangeName(name string) (string, error) {
 func (we *WorkflowEngine) buildOpenSpecSystemContext(projConfig *ProjectConfig) string {
 	var sb strings.Builder
 	sb.WriteString("\n## OpenSpec Context\n\n")
-	sb.WriteString("You are working in a project using OpenSpec (spec-driven development).\n")
-	sb.WriteString("OpenSpec organizes changes into structured artifacts: proposal → specs → design → tasks → implementation.\n\n")
 
 	if projConfig != nil && projConfig.Context != "" {
-		sb.WriteString("### Project Context\n")
+		sb.WriteString("**Project**: ")
 		sb.WriteString(projConfig.Context)
 		sb.WriteString("\n\n")
 	}
 
-	// Add active changes summary
+	// Add active changes summary compactly
 	changes, err := we.manager.ListChanges()
 	if err == nil && len(changes) > 0 {
-		sb.WriteString("### Active Changes\n")
+		sb.WriteString("**Active**: ")
+		changeNames := make([]string, 0, len(changes))
 		for _, name := range changes {
 			status, err := we.manager.GetChangeStatus(name)
 			if err != nil {
 				continue
 			}
-			sb.WriteString(formatChangeStatusCompact(status))
+			summary := name
+			if status.TasksTotal > 0 {
+				summary += fmt.Sprintf(" (%d/%d)", status.TasksCompleted, status.TasksTotal)
+			}
+			changeNames = append(changeNames, summary)
 		}
+		sb.WriteString(strings.Join(changeNames, ", "))
 		sb.WriteString("\n")
 	}
 
@@ -412,34 +416,30 @@ func (we *WorkflowEngine) buildOpenSpecSystemContext(projConfig *ProjectConfig) 
 // buildApplySystemContext builds system prompt context for /opsx:apply.
 func (we *WorkflowEngine) buildApplySystemContext(changeName string, _ *Change) string {
 	var sb strings.Builder
-	sb.WriteString("\n## OpenSpec Implementation Mode\n\n")
-	fmt.Fprintf(&sb, "You are implementing tasks for OpenSpec change: %s\n\n", changeName)
+	sb.WriteString("\n## OpenSpec Apply: ")
+	sb.WriteString(changeName)
+	sb.WriteString("\n\n")
 
-	// Read and include design context
+	// Read and include design context (truncated)
 	design, err := we.manager.ReadArtifact(changeName, "design")
 	if err == nil && design != "" {
-		sb.WriteString("### Technical Design\n")
-		// Truncate if too long
-		if len(design) > 2000 {
-			sb.WriteString(design[:2000])
-			sb.WriteString("\n...(truncated)\n")
+		sb.WriteString("**Design**:\n")
+		if len(design) > 1500 {
+			sb.WriteString(design[:1500] + "...(truncated)\n\n")
 		} else {
-			sb.WriteString(design)
+			sb.WriteString(design + "\n\n")
 		}
-		sb.WriteString("\n")
 	}
 
-	// Read and include specs context
+	// Read and include specs context (truncated)
 	specs, err := we.manager.ReadArtifact(changeName, "specs")
 	if err == nil && specs != "" {
-		sb.WriteString("### Specifications\n")
-		if len(specs) > 2000 {
-			sb.WriteString(specs[:2000])
-			sb.WriteString("\n...(truncated)\n")
+		sb.WriteString("**Specs**:\n")
+		if len(specs) > 1500 {
+			sb.WriteString(specs[:1500] + "...(truncated)\n\n")
 		} else {
-			sb.WriteString(specs)
+			sb.WriteString(specs + "\n\n")
 		}
-		sb.WriteString("\n")
 	}
 
 	return sb.String()

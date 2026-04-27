@@ -4,11 +4,13 @@
 // Usage:
 //
 //	adapter := ui.NewFactory(cfg).Create(ui.ModeBubbleTea)
-//	adapter.Run()
+//	adapter.Run(ctx, src)
 package ui
 
 import (
-	"github.com/nano-harness/nano-agent/pkg/event"
+	"context"
+
+	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
 )
 
 // Mode selects which UI backend to use.
@@ -25,17 +27,8 @@ const (
 
 // Adapter is the common interface that every UI backend must implement.
 type Adapter interface {
-	// Run starts the UI event loop. It blocks until the UI exits.
-	Run() error
-
-	// SendEvent forwards a stream event to the UI for display.
-	SendEvent(e event.StreamEvent)
-
-	// SubmitChannel returns a channel that receives user-submitted text.
-	SubmitChannel() <-chan string
-
-	// CancelChannel returns a channel that fires when the user requests cancellation.
-	CancelChannel() <-chan struct{}
+	// Run starts the UI event loop driven by src. It blocks until the UI exits.
+	Run(ctx context.Context, src eventsource.EventSource) error
 
 	// Stop requests the UI to stop.
 	Stop()

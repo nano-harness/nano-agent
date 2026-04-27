@@ -197,6 +197,60 @@ type CriticConfig struct {
 }
 
 // AdvancedConfig holds advanced configuration options.
+// MailboxConfig configures the multi-agent mailbox system for asynchronous communication
+type MailboxConfig struct {
+	// Enabled activates the mailbox system for sub-agent communication (default: false)
+	Enabled bool `mapstructure:"enabled" yaml:"enabled"`
+
+	// Backend specifies the storage backend: "memory" or "file" (default: "memory")
+	Backend string `mapstructure:"backend" yaml:"backend"`
+
+	// RootDir is the root directory for file backend storage (default: ~/.nano/teams/<team>/mailbox)
+	RootDir string `mapstructure:"root_dir" yaml:"root_dir"`
+
+	// TTLDays is the message retention period in days (default: 7)
+	TTLDays int `mapstructure:"ttl_days" yaml:"ttl_days"`
+
+	// MaxPerAgent is the maximum messages per agent inbox (default: 1000)
+	MaxPerAgent int `mapstructure:"max_per_agent" yaml:"max_per_agent"`
+
+	// MaxBodyKB is the maximum message body size in KB (default: 16)
+	MaxBodyKB int `mapstructure:"max_body_kb" yaml:"max_body_kb"`
+
+	// AckTimeoutSec is the timeout in seconds before in-flight messages revert to unread (default: 300, 0 = disabled)
+	AckTimeoutSec int `mapstructure:"ack_timeout_sec" yaml:"ack_timeout_sec"`
+
+	// InjectionLimit is the maximum number of messages to inject per turn (default: 5)
+	InjectionLimit int `mapstructure:"injection_limit" yaml:"injection_limit"`
+
+	// InjectionMaxKB is the maximum total size of injected messages in KB per turn (default: 4)
+	InjectionMaxKB int `mapstructure:"injection_max_kb" yaml:"injection_max_kb"`
+
+	// GuidancePromptEnabled controls whether to show mailbox usage guidance in sub-agent prompts (default: true)
+	GuidancePromptEnabled bool `mapstructure:"guidance_prompt_enabled" yaml:"guidance_prompt_enabled"`
+
+	// JanitorIntervalSec is the interval in seconds for background cleanup (default: 60, 0 = disabled)
+	JanitorIntervalSec int `mapstructure:"janitor_interval_sec" yaml:"janitor_interval_sec"`
+}
+
+// DefaultMailboxConfig returns default mailbox configuration
+func DefaultMailboxConfig() *MailboxConfig {
+	return &MailboxConfig{
+		Enabled:               false, // Disabled by default for gradual rollout
+		Backend:               "memory",
+		RootDir:               "", // Will be set to ~/.nano/teams/<team>/mailbox if needed
+		TTLDays:               7,
+		MaxPerAgent:           1000,
+		MaxBodyKB:             16,
+		AckTimeoutSec:         300, // 5 minutes
+		InjectionLimit:        5,
+		InjectionMaxKB:        4,
+		GuidancePromptEnabled: true,
+		JanitorIntervalSec:    60, // 1 minute
+	}
+}
+
+// AdvancedConfig holds advanced configuration options.
 type AdvancedConfig struct {
 	Fork           *ForkAdvConfig           `yaml:"fork,omitempty"`
 	CircuitBreaker *CircuitBreakerAdvConfig `yaml:"circuit_breaker,omitempty"`
@@ -457,16 +511,15 @@ type Config struct {
 	ImageGenerator *ImageGeneratorConfig `mapstructure:"image_generator" yaml:"image_generator"`
 
 	// Tool configuration - moved from CustomConfig
-	ReadFileMaxLines      int `mapstructure:"read_file_max_lines" yaml:"read_file_max_lines"`
-	SearchMaxResults      int `mapstructure:"search_max_results" yaml:"search_max_results"`
-	WebRequestTimeout     int `mapstructure:"web_request_timeout" yaml:"web_request_timeout"`       // Web fetch timeout in seconds
-	WebSearchTimeout      int `mapstructure:"web_search_timeout" yaml:"web_search_timeout"`         // Web search timeout in seconds
-	WebMaxContentSize     int `mapstructure:"web_max_content_size" yaml:"web_max_content_size"`     // Max web content size in bytes
-	WebSearchMaxResults   int `mapstructure:"web_search_max_results" yaml:"web_search_max_results"` // Max search results
-	FileDiffMaxLines      int `mapstructure:"file_diff_max_lines" yaml:"file_diff_max_lines"`       // Max lines in file diff display
-	GitMaxLogEntries      int `mapstructure:"git_max_log_entries" yaml:"git_max_log_entries"`
-	MemoryMaxEntries      int `mapstructure:"memory_max_entries" yaml:"memory_max_entries"`
-	ListDirectoryMaxDepth int `mapstructure:"list_directory_max_depth" yaml:"list_directory_max_depth"`
+	ReadFileMaxLines    int `mapstructure:"read_file_max_lines" yaml:"read_file_max_lines"`
+	SearchMaxResults    int `mapstructure:"search_max_results" yaml:"search_max_results"`
+	WebRequestTimeout   int `mapstructure:"web_request_timeout" yaml:"web_request_timeout"`       // Web fetch timeout in seconds
+	WebSearchTimeout    int `mapstructure:"web_search_timeout" yaml:"web_search_timeout"`         // Web search timeout in seconds
+	WebMaxContentSize   int `mapstructure:"web_max_content_size" yaml:"web_max_content_size"`     // Max web content size in bytes
+	WebSearchMaxResults int `mapstructure:"web_search_max_results" yaml:"web_search_max_results"` // Max search results
+	FileDiffMaxLines    int `mapstructure:"file_diff_max_lines" yaml:"file_diff_max_lines"`       // Max lines in file diff display
+	GitMaxLogEntries    int `mapstructure:"git_max_log_entries" yaml:"git_max_log_entries"`
+	MemoryMaxEntries    int `mapstructure:"memory_max_entries" yaml:"memory_max_entries"`
 
 	// Tool management
 	EnabledTools  []string `mapstructure:"enabled_tools" yaml:"enabled_tools"`
@@ -550,6 +603,9 @@ type Config struct {
 
 	// Middleware configures the tool execution middleware chain.
 	Middleware *MiddlewareConfig `mapstructure:"middleware" yaml:"middleware"`
+
+	// Mailbox configures the multi-agent mailbox system
+	Mailbox *MailboxConfig `mapstructure:"mailbox" yaml:"mailbox"`
 }
 
 // SchedulerConfig configures the TUI-mode recurring task scheduler.
@@ -757,16 +813,15 @@ func DefaultConfig() *Config {
 		HTTPTimeout:     180 * time.Second,
 
 		// Tool-specific configurations
-		ReadFileMaxLines:      200,
-		SearchMaxResults:      20,
-		WebRequestTimeout:     30,              // 30 seconds
-		WebSearchTimeout:      10,              // 10 seconds
-		WebMaxContentSize:     2 * 1024 * 1024, // 2MB
-		WebSearchMaxResults:   10,
-		FileDiffMaxLines:      20,
-		GitMaxLogEntries:      100,
-		MemoryMaxEntries:      100,
-		ListDirectoryMaxDepth: 3,
+		ReadFileMaxLines:    200,
+		SearchMaxResults:    20,
+		WebRequestTimeout:   30,              // 30 seconds
+		WebSearchTimeout:    10,              // 10 seconds
+		WebMaxContentSize:   2 * 1024 * 1024, // 2MB
+		WebSearchMaxResults: 10,
+		FileDiffMaxLines:    20,
+		GitMaxLogEntries:    100,
+		MemoryMaxEntries:    100,
 
 		// Default context management settings (auto-tuned via model registry)
 		ContextConfig: ContextConfig{
@@ -796,11 +851,9 @@ func DefaultConfig() *Config {
 		// Default enabled tools
 		EnabledTools: []string{
 			// Core filesystem tools
-			"read_file", "write_file", "edit_file", "list_directory",
+			"read_file", "write_file", "edit_file",
 			// System tools
 			"run_shell_command", "task_done",
-			// Search tools
-			"search_file_content", "glob",
 			// Memory tools
 			"save_memory", "search_memory",
 			// Web tools
@@ -1102,7 +1155,6 @@ func LoadConfig(configPath string) (*Config, error) {
 	overrideIntFromEnv(&cfg.FileDiffMaxLines, "NANO_FILE_DIFF_MAX_LINES")
 	overrideIntFromEnv(&cfg.GitMaxLogEntries, "NANO_GIT_MAX_LOG_ENTRIES")
 	overrideIntFromEnv(&cfg.MemoryMaxEntries, "NANO_MEMORY_MAX_ENTRIES")
-	overrideIntFromEnv(&cfg.ListDirectoryMaxDepth, "NANO_LIST_DIRECTORY_MAX_DEPTH")
 
 	// Override with environment variables (boolean values)
 	overrideBoolFromEnv(&cfg.Verbose, "NANO_VERBOSE")
@@ -1442,33 +1494,32 @@ func (c *Config) DeepCopy() *Config {
 
 	// Create a new config with all scalar fields copied
 	copied := &Config{
-		APIKey:                c.APIKey,
-		BaseURL:               c.BaseURL,
-		Model:                 c.Model,
-		Verbose:               c.Verbose,
-		WorkingDir:            c.WorkingDir,
-		IsSubAgent:            c.IsSubAgent,
-		IsDaemon:              c.IsDaemon,
-		MaxFileSize:           c.MaxFileSize,
-		ResponseTimeout:       c.ResponseTimeout,
-		HTTPTimeout:           c.HTTPTimeout,
-		ReadFileMaxLines:      c.ReadFileMaxLines,
-		SearchMaxResults:      c.SearchMaxResults,
-		WebRequestTimeout:     c.WebRequestTimeout,
-		WebSearchTimeout:      c.WebSearchTimeout,
-		WebMaxContentSize:     c.WebMaxContentSize,
-		WebSearchMaxResults:   c.WebSearchMaxResults,
-		FileDiffMaxLines:      c.FileDiffMaxLines,
-		GitMaxLogEntries:      c.GitMaxLogEntries,
-		MemoryMaxEntries:      c.MemoryMaxEntries,
-		ListDirectoryMaxDepth: c.ListDirectoryMaxDepth,
-		EnableMCP:             c.EnableMCP,
-		ConfirmDestructive:    c.ConfirmDestructive,
-		Strict:                c.Strict,
-		CustomSystemPrompt:    c.CustomSystemPrompt,
-		PermissionMode:        c.PermissionMode,
-		EnablePprof:           c.EnablePprof,
-		PprofPort:             c.PprofPort,
+		APIKey:              c.APIKey,
+		BaseURL:             c.BaseURL,
+		Model:               c.Model,
+		Verbose:             c.Verbose,
+		WorkingDir:          c.WorkingDir,
+		IsSubAgent:          c.IsSubAgent,
+		IsDaemon:            c.IsDaemon,
+		MaxFileSize:         c.MaxFileSize,
+		ResponseTimeout:     c.ResponseTimeout,
+		HTTPTimeout:         c.HTTPTimeout,
+		ReadFileMaxLines:    c.ReadFileMaxLines,
+		SearchMaxResults:    c.SearchMaxResults,
+		WebRequestTimeout:   c.WebRequestTimeout,
+		WebSearchTimeout:    c.WebSearchTimeout,
+		WebMaxContentSize:   c.WebMaxContentSize,
+		WebSearchMaxResults: c.WebSearchMaxResults,
+		FileDiffMaxLines:    c.FileDiffMaxLines,
+		GitMaxLogEntries:    c.GitMaxLogEntries,
+		MemoryMaxEntries:    c.MemoryMaxEntries,
+		EnableMCP:           c.EnableMCP,
+		ConfirmDestructive:  c.ConfirmDestructive,
+		Strict:              c.Strict,
+		CustomSystemPrompt:  c.CustomSystemPrompt,
+		PermissionMode:      c.PermissionMode,
+		EnablePprof:         c.EnablePprof,
+		PprofPort:           c.PprofPort,
 	}
 
 	// Deep copy slices

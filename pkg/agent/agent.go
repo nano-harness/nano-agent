@@ -20,8 +20,10 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/mailbox"
 	"github.com/nano-harness/nano-agent/pkg/mcp"
 	"github.com/nano-harness/nano-agent/pkg/memory"
+	agentruntime "github.com/nano-harness/nano-agent/pkg/runtime"
 	"github.com/nano-harness/nano-agent/pkg/skill"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/nano-harness/nano-agent/pkg/tools/builtin"
@@ -37,6 +39,7 @@ const (
 // Agent struct encapsulates the core logic of the AI agent
 type Agent struct {
 	config            *config.Config
+	runtime           *agentruntime.AgentRuntime
 	toolbox           *tools.Toolbox
 	llmClient         llm.LLMClient
 	memoryManager     *memory.Manager
@@ -48,8 +51,6 @@ type Agent struct {
 	cancelFn          context.CancelFunc
 	shutdownOnce      sync.Once
 	isSubAgent        bool                // 标识是否为subagent
-	isForkChild       bool                // marks this agent as a forked child
-	agentType         AgentType           // built-in agent type for fork children
 	sessionManager    *SessionManager     // Manages isolated conversation sessions
 	skillManager      *skill.Manager      // Manages Claude Code compatible skills
 	permissionManager *permission.Manager // Manages tool execution permissions
@@ -75,14 +76,20 @@ type Agent struct {
 	// Default is "default" for backward compatibility
 	activeSessionID string
 
-	// expertRegistry holds all available experts (builtin + custom)
-	expertRegistry *ExpertRegistry
+	// id is the unique identifier for this agent (e.g., "main", "subagent-0-investigator")
+	id string
 
-	// expertRunner executes expert tasks via fork system
-	expertRunner *ExpertRunner
+	// mailbox is this agent's own inbox (nil if mailbox disabled)
+	mailbox mailbox.Mailbox
 
-	// forkManager manages forked child agents for parallel execution
-	forkManager *ForkManager
+	// parentMailbox is the parent agent's inbox for sending messages upward (nil if root agent)
+	parentMailbox mailbox.Mailbox
+
+	// stopHooks are callbacks triggered when a turn completes
+	stopHooks []func(ctx context.Context, reason string)
+
+	// currentTurnID tracks the current turn ID for idle notifications
+	currentTurnID string
 }
 
 // LoopDetector helps detect and prevent infinite loops of tool calls
@@ -190,359 +197,49 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 
-	// Get current working directory; prefer an explicit override from config.
-	var workingDir string
-	if cfg.WorkingDir != "" {
-		expanded := cfg.WorkingDir
-		if strings.HasPrefix(expanded, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return nil, fmt.Errorf("failed to resolve home directory: %w", err)
-			}
-			expanded = filepath.Join(home, expanded[2:])
-		}
-		absDir, err := filepath.Abs(expanded)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve working directory %q: %w", cfg.WorkingDir, err)
-		}
-		workingDir = absDir
-	} else {
-		var err error
-		workingDir, err = os.Getwd()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get working directory: %w", err)
-		}
+	bootstrap, err := buildAgentBootstrap(cfg, approvalHandler)
+	if err != nil {
+		return nil, err
 	}
-
-	// Create toolbox configuration with consolidated MCP config
-	webAPIKeys := make(map[string]string)
-	if cfg.WebSearchAPIKeys.Serper != "" {
-		webAPIKeys["serper"] = cfg.WebSearchAPIKeys.Serper
-	}
-	if cfg.WebSearchAPIKeys.Tavily != "" {
-		webAPIKeys["tavily"] = cfg.WebSearchAPIKeys.Tavily
-	}
-
-	toolboxConfig := &tools.ToolboxConfig{
-		WorkingDirectory: workingDir,
-		Timeout:          cfg.ResponseTimeout,
-		MaxFileSize:      cfg.MaxFileSize,
-		MaxResponseSize:  cfg.MaxFileSize, // Use same limit for now
-		UserAgent:        "nano/1.0",
-		AllowedCommands:  cfg.AllowedCommands, // propagate from global config
-		BlockedCommands:  cfg.BlockedCommands, // propagate from global config
-		WebSearchAPIKeys: webAPIKeys,
-		EnableMCP:        cfg.EnableMCP,
-		MCPConfig:        convertMCPConfig(cfg.MCP), // Convert consolidated config
-
-		// Tool-specific configurations
-		ReadFileMaxLines:    cfg.ReadFileMaxLines,
-		SearchMaxResults:    cfg.SearchMaxResults,
-		WebRequestTimeout:   cfg.WebRequestTimeout,
-		WebSearchTimeout:    cfg.WebSearchTimeout,
-		WebMaxContentSize:   cfg.WebMaxContentSize,
-		WebSearchMaxResults: cfg.WebSearchMaxResults,
-		FileDiffMaxLines:    cfg.FileDiffMaxLines,
-		GitMaxLogEntries:    cfg.GitMaxLogEntries,
-
-		// NEW: propagate env filtering and strict mode from global config
-		AllowedEnvVars: cfg.AllowedEnvVars,
-		BlockedEnvVars: cfg.BlockedEnvVars,
-		Strict:         cfg.Strict,
-
-		// Sandbox configuration
-		Sandbox: cfg.Sandbox,
-	}
-
-	// Wire up OpenSpec configuration
-	if cfg.OpenSpec != nil && cfg.OpenSpec.Enabled {
-		toolboxConfig.EnableOpenSpec = true
-		toolboxConfig.OpenSpecRootDir = cfg.OpenSpec.RootDir
-		toolboxConfig.OpenSpecDefaultSchema = cfg.OpenSpec.DefaultSchema
-		toolboxConfig.OpenSpecMaxArtifact = cfg.OpenSpec.MaxArtifactSize
-	}
-
-	// Create toolbox with new architecture
-	toolbox := tools.NewToolbox(workingDir, toolboxConfig, nil)
-
-	// Create LLM client with streaming and function calling support
-	llmClient := llm.NewClient(
-		cfg.APIKey,
-		cfg.BaseURL,
-		cfg.Model,
-		toolbox.List(),
-	)
-
-	// Create agent context for goroutine lifecycle management
-	agentCtx, agentCancel := context.WithCancel(context.Background())
-
-	// Start goroutine to listen for tools update events
-	go func() {
-		ch := toolbox.GetToolsUpdateChannel()
-		for {
-			select {
-			case event, ok := <-ch:
-				if !ok {
-					return // channel closed
-				}
-				logger.Debugf("Received tools update event: %s", event.Type)
-				llmClient.UpdateTools(event.Tools)
-				logger.Infof("Updated LLM client with %d tools after MCP registration", len(event.Tools))
-			case <-agentCtx.Done():
-				return
-			}
-		}
-	}()
-
-	// Create memory manager (local SQLite, no remote service required).
-	// Memory is enabled whenever a [memory] section appears in config.
-	memoryManager := memory.NewManager(workingDir, "", cfg.Memory != nil)
-
-	// Memory tools are not registered by default for main agent
-	// They will be registered only for sub-agents that have memory enabled
-
-	// Create tool scheduler
-	defaultEventHandler := func(event event.StreamEvent) {
-		// Default event handler - can be overridden later
-		logger.Debugf("Tool scheduler event: %s", event.Type)
-	}
-
-	recovery := NewToolRecoveryStrategy(defaultEventHandler)
-	if cfg.ToolRecovery != nil {
-		maxRetries := cfg.ToolRecovery.Default.MaxRetries
-		if maxRetries <= 0 {
-			maxRetries = 3
-		}
-		retryDelay := cfg.ToolRecovery.Default.RetryDelay
-		if retryDelay <= 0 {
-			retryDelay = time.Second
-		}
-		backoffMultiplier := cfg.ToolRecovery.Default.BackoffMultiplier
-		if backoffMultiplier <= 0 {
-			backoffMultiplier = 2.0
-		}
-		recovery.UpdateStrategy(maxRetries, retryDelay, backoffMultiplier)
-
-		maxDelay := cfg.ToolRecovery.Default.MaxDelay
-		if maxDelay <= 0 {
-			maxDelay = 30 * time.Second
-		}
-		jitterRatio := cfg.ToolRecovery.Default.JitterRatio
-		if jitterRatio < 0 {
-			jitterRatio = 0
-		}
-		recovery.UpdateBackoffOptions(maxDelay, jitterRatio)
-
-		for toolName, p := range cfg.ToolRecovery.PerTool {
-			recovery.SetToolPolicy(toolName, ToolRetryPolicy{
-				MaxRetries:        p.MaxRetries,
-				RetryDelay:        p.RetryDelay,
-				BackoffMultiplier: p.BackoffMultiplier,
-				MaxDelay:          p.MaxDelay,
-				JitterRatio:       p.JitterRatio,
-			})
-		}
-	}
-
-	toolScheduler := NewToolSchedulerWithOptions(ToolSchedulerOptions{
-		Toolbox:          toolbox,
-		EventHandler:     defaultEventHandler,
-		RecoveryStrategy: recovery,
-		ApprovalHandler:  approvalHandler,
-	})
-	// Set agent config for daemon confirm policy
-	toolScheduler.SetAgentConfig(cfg)
-
-	// Initialize session manager options
-	smOpts := []SessionManagerOption{
-		WithSessionTTL(30 * time.Minute),
-	}
-
-	// Initialize StateStore for persistent runtime state (skills, scheduled tasks).
-	// Honour cfg.Scheduler.Enabled and cfg.Scheduler.StateFile when available.
-	var stateStore *config.StateStore
-	schedulerEnabled := true
-	stateFilePath := ""
-	if cfg.Scheduler != nil {
-		schedulerEnabled = cfg.Scheduler.Enabled
-		stateFilePath = cfg.Scheduler.StateFile
-	}
-	if schedulerEnabled {
-		if stateFilePath == "" {
-			if defaultPath, err := config.DefaultStateStorePath(); err == nil {
-				stateFilePath = defaultPath
-			}
-		}
-		if stateFilePath != "" {
-			stateStore = config.NewStateStore(stateFilePath)
-			if err := stateStore.Load(); err != nil {
-				logger.Warnf("Failed to load state store: %v", err)
-			}
-		}
-	}
-
-	var sessionStorage SessionStorage
-
-	// Initialize OSS session storage if enabled
-	if cfg.OSS != nil && cfg.OSS.Enabled {
-		storage, err := NewOSSSessionStorage(cfg.OSS)
-		if err != nil {
-			logger.Errorf("Failed to initialize OSS session storage: %v", err)
-		} else {
-			sessionStorage = storage
-			logger.Info("OSS session storage initialized")
-		}
-	}
-
-	if sessionStorage == nil {
-		// Use ProjectSessionStorage for TUI mode (non-daemon, has working dir)
-		if workingDir != "" && !cfg.IsDaemon {
-			projectStorage, err := NewProjectSessionStorage(workingDir)
-			if err != nil {
-				logger.Warnf("Failed to initialize project session storage: %v, falling back to local storage", err)
-				sessionStorage = NewLocalSessionStorage("")
-				logger.Info("Local session storage initialized (fallback)")
-			} else {
-				sessionStorage = projectStorage
-				logger.Info("Project session storage initialized")
-			}
-		} else {
-			sessionStorage = NewLocalSessionStorage("")
-			logger.Info("Local session storage initialized")
-		}
-	}
-	smOpts = append(smOpts, WithSessionStorage(sessionStorage))
 
 	agent := &Agent{
-		ctx:             agentCtx,
-		cancelFn:        agentCancel,
+		ctx:             bootstrap.agentCtx,
+		cancelFn:        bootstrap.agentCancel,
 		config:          cfg,
-		toolbox:         toolbox,
-		llmClient:       llmClient,
-		memoryManager:   memoryManager,
-		toolScheduler:   toolScheduler,
+		toolbox:         bootstrap.toolbox,
+		llmClient:       bootstrap.llmClient,
+		memoryManager:   bootstrap.memoryManager,
+		toolScheduler:   bootstrap.toolScheduler,
 		loopDetector:    NewLoopDetector(),
 		isSubAgent:      cfg.IsSubAgent,
-		sessionManager:  NewSessionManager(smOpts...),
-		stateStore:      stateStore,
+		sessionManager:  bootstrap.sessionManager,
+		stateStore:      bootstrap.stateStore,
 		activeSessionID: "default", // Default session ID for backward compatibility
 	}
 
-	// Initialise PermissionManager from config.
-	{
-		mode := permission.ModeDefault
-		switch permission.PermissionMode(cfg.PermissionMode) {
-		case permission.ModeAcceptEdits, permission.ModeYOLO:
-			mode = permission.PermissionMode(cfg.PermissionMode)
-		}
-		var rules []permission.PermissionRule
-		for _, raw := range cfg.AllowedRules {
-			rules = append(rules, permission.ParseRule(raw))
-		}
-		agent.permissionManager = permission.NewManager(mode, rules)
-		toolScheduler.SetPermissionManager(agent.permissionManager)
-	}
+	agent.permissionManager = bootstrap.permissionManager
 
 	// Apply functional options
 	for _, opt := range opts {
 		opt(agent)
 	}
 
-	// Initialize SkillManager if skills are enabled
-	if cfg.Skills != nil && cfg.Skills.Enabled {
-		sm := skill.NewManager(
-			workingDir,
-			cfg.Skills.PersonalDir,
-			cfg.Skills.ProjectDir,
-			cfg.Skills.MaxSkillSize,
-			cfg.Skills.MaxSkills,
-			cfg.Skills.MaxActiveSkills,
-			cfg.Skills.AutoInvoke,
-		)
-		if stateStore != nil {
-			sm.SetStateStore(stateStore)
-		}
-		if err := sm.Discover(); err != nil {
-			logger.Warnf("Failed to discover skills: %v", err)
-		} else {
-			agent.skillManager = sm
-			logger.Infof("Skills support initialized: %d skills discovered", sm.Count())
-			// Restore active skills persisted from previous sessions.
-			if stateStore != nil {
-				for _, skillName := range stateStore.GetActiveSkills() {
-					if err := sm.ActivateSkill(skillName); err != nil {
-						logger.Warnf("Failed to restore active skill %q: %v", skillName, err)
-					}
-				}
-			}
-		}
-	}
+	agent.runtime = newAgentRuntime(agent)
+	agent.skillManager = bootstrap.skillManager
 
-	// Initialize Expert system on top-level (non-sub-agent) agents.
-	// Experts replace the old fork tool with explicit @expert-name triggering.
+	// Register conversational configuration management tools.
 	if !cfg.IsSubAgent {
-		// Create expert registry
-		expertRegistry := NewExpertRegistry()
-
-		// Register builtin experts (investigator, help, generalist)
-		if err := RegisterBuiltinExperts(expertRegistry); err != nil {
-			logger.Warnf("Failed to register builtin experts: %v", err)
-		} else {
-			logger.Info("Builtin experts registered successfully")
-		}
-
-		// Load markdown experts from ~/.config/nano/agents/ and .nano/agents/
-		if err := LoadMarkdownExperts(expertRegistry, workingDir); err != nil {
-			logger.Warnf("Failed to load markdown experts: %v", err)
-		}
-
-		// Load YAML sub_agents as experts
-		if err := LoadConfigSubAgents(expertRegistry, cfg); err != nil {
-			logger.Warnf("Failed to load YAML sub-agents as experts: %v", err)
-		}
-
-		agent.expertRegistry = expertRegistry
-
-		// Create expert runner (uses fork manager internally)
-		forkManager := NewForkManager(agent)
-		agent.forkManager = forkManager
-		agent.expertRunner = NewExpertRunner(expertRegistry, forkManager, agent.cachedSystemPromptBuilder)
-
-		logger.Infof("Expert system initialized: %d experts available", expertRegistry.Count())
-
-		// Register conversational configuration management tools.
-		agent.registerBuiltinManagementTools(toolbox, cfg, workingDir)
+		agent.registerBuiltinManagementTools(agent.toolbox, cfg, bootstrap.workingDir)
 	}
 
-	// Start MCP client asynchronously if enabled
-	if cfg.EnableMCP && toolbox.IsMCPEnabled() {
-		go func() {
-			// Create context with timeout for MCP initialization
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-
-			logger.Info("Starting MCP client asynchronously with 60s timeout...")
-			err := toolbox.StartMCP(ctx)
-			if err != nil {
-				logger.Errorf("Failed to start MCP client: %v", err)
-				logger.Warn("Continuing without MCP functionality")
-			} else {
-				logger.Info("MCP client started successfully")
-			}
-		}()
-		logger.Info("MCP client initialization started in background")
-	}
+	maybeStartAgentMCPClient(cfg, agent.toolbox)
 
 	logger.Info("Agent initialized successfully")
 
 	// Preload system info asynchronously to avoid delay on first conversation.
 	// Only preload when auto-detection is enabled and no custom system prompt overrides it
 	// (custom prompt callers often disable detection to avoid subprocess side effects in tests).
-	preloadSPB := NewSystemPromptBuilder(workingDir, toolbox.List(), memoryManager, cfg)
-	if cfg.UserInfo != nil && cfg.UserInfo.AutoDetectUserInfo && cfg.CustomSystemPrompt == "" {
-		preloadSPB.PreloadUserInfo()
-	}
-	agent.cachedSystemPromptBuilder = preloadSPB
+	agent.cachedSystemPromptBuilder = newPreloadedSystemPromptBuilder(cfg, bootstrap.workingDir, agent.toolbox, agent.memoryManager)
 
 	return agent, nil
 }
@@ -568,14 +265,10 @@ func (a *Agent) GetToolbox() *tools.Toolbox {
 	return a.toolbox
 }
 
-// GetForkManager returns the fork manager for parallel sub-agent execution
-func (a *Agent) GetForkManager() *ForkManager {
-	return a.forkManager
-}
-
-// GetExpertRegistry returns the expert registry for accessing available experts
-func (a *Agent) GetExpertRegistry() *ExpertRegistry {
-	return a.expertRegistry
+// Runtime returns the behavior-preserving runtime boundary for core agent
+// dependencies.
+func (a *Agent) Runtime() *agentruntime.AgentRuntime {
+	return a.runtime
 }
 
 // RegisterTool registers an additional tool into the agent's toolbox and
@@ -718,45 +411,6 @@ func (a *Agent) ProcessStreamWithMultimodalAndSession(ctx context.Context, sessi
 func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *Session, userInput string, images []llm.MultimodalImage, onEvent func(event.StreamEvent)) error {
 	logger.Infof("Processing streaming request with session %s: %s", session.ID, userInput)
 
-	// Check for expert trigger (@expert-name) before anything else
-	if a.expertRegistry != nil && a.expertRunner != nil {
-		if trigger := ParseExpertTrigger(userInput, a.expertRegistry); trigger != nil {
-			logger.Infof("Expert trigger detected: @%s", trigger.ExpertName)
-
-			// Run the expert
-			expertResult, err := a.expertRunner.Run(ctx, trigger.ExpertName, trigger.Inputs, onEvent)
-			if err != nil {
-				errMsg := fmt.Sprintf("Expert @%s failed: %v", trigger.ExpertName, err)
-				logger.Errorf(errMsg)
-				if onEvent != nil {
-					onEvent(event.StreamEvent{
-						Type:    event.EventTypeError,
-						Error:   errMsg,
-						Timestamp: time.Now().Unix(),
-					})
-				}
-				return fmt.Errorf("expert execution failed: %w", err)
-			}
-
-			// Send the expert's output as content
-			if onEvent != nil && expertResult.Output != "" {
-				onEvent(event.StreamEvent{
-					Type:    event.EventTypeContent,
-					Content: expertResult.Output,
-					Timestamp: time.Now().Unix(),
-				})
-				onEvent(event.StreamEvent{
-					Type: event.EventTypeDone,
-					Done: true,
-					Timestamp: time.Now().Unix(),
-				})
-			}
-
-			logger.Infof("Expert @%s completed in %v", trigger.ExpertName, expertResult.Duration)
-			return nil
-		}
-	}
-
 	var turnAllowedTools []interfaces.Tool
 	{
 		wd := a.toolbox.GetWorkingDirectory()
@@ -889,6 +543,7 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 		SkillManager:              a.skillManager,
 		CachedSystemPromptBuilder: a.cachedSystemPromptBuilder,
 		SessionID:                 session.ID, // Pass session ID for background task isolation (Phase 2)
+		Agent:                     a,          // Pass agent reference for mailbox injection
 	}
 
 	// Create enhanced turn that uses StreamRenderer
@@ -1287,5 +942,71 @@ func (a *Agent) SetTUIScheduler(ts *TUIScheduler) {
 	a.tuiScheduler = ts
 	if ts != nil && a.manageRoutineTool != nil {
 		a.manageRoutineTool.SetScheduler(ts.Scheduler())
+	}
+}
+
+// ID returns the unique identifier for this agent
+func (a *Agent) ID() string {
+	return a.id
+}
+
+// SetID sets the unique identifier for this agent
+func (a *Agent) SetID(id string) {
+	a.id = id
+}
+
+// Mailbox returns this agent's own inbox
+func (a *Agent) Mailbox() mailbox.Mailbox {
+	return a.mailbox
+}
+
+// SetMailbox sets this agent's own inbox
+func (a *Agent) SetMailbox(mb mailbox.Mailbox) {
+	a.mailbox = mb
+}
+
+// ParentMailbox returns the parent agent's inbox for sending messages upward
+func (a *Agent) ParentMailbox() mailbox.Mailbox {
+	return a.parentMailbox
+}
+
+// SetParentMailbox sets the parent agent's inbox
+func (a *Agent) SetParentMailbox(mb mailbox.Mailbox) {
+	a.parentMailbox = mb
+}
+
+// RegisterStopHook registers a callback to be called when a turn completes
+func (a *Agent) RegisterStopHook(hook func(ctx context.Context, reason string)) {
+	a.stopHooks = append(a.stopHooks, hook)
+}
+
+// StopHooks returns all registered stop hooks
+func (a *Agent) StopHooks() []func(ctx context.Context, reason string) {
+	return a.stopHooks
+}
+
+// CurrentTurnID returns the current turn ID
+func (a *Agent) CurrentTurnID() string {
+	return a.currentTurnID
+}
+
+// SetCurrentTurnID sets the current turn ID
+func (a *Agent) SetCurrentTurnID(id string) {
+	a.currentTurnID = id
+}
+
+// IsSubAgent returns true if this agent was configured as a teammate/sub-agent.
+func (a *Agent) IsSubAgent() bool {
+	return a.isSubAgent
+}
+
+// EmitEvent emits an event through the agent's current active event handler.
+// This allows tools (like send_message) to emit events without directly accessing the turn.
+// If no active turn/handler is available, logs a debug message (non-fatal).
+func (a *Agent) EmitEvent(ev event.StreamEvent) {
+	if a.eventHandler != nil {
+		a.eventHandler(ev)
+	} else {
+		logger.Debugf("EmitEvent called but no active event handler (agent %s)", a.id)
 	}
 }
