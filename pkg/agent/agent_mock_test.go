@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -41,8 +42,11 @@ func TestAgentWithMockLLM(t *testing.T) {
 
 	// Process a stream using the mock client
 	ctx := context.Background()
+	var mu sync.Mutex
 	var events []event.StreamEvent
 	onEvent := func(e event.StreamEvent) {
+		mu.Lock()
+		defer mu.Unlock()
 		events = append(events, e)
 	}
 
@@ -52,6 +56,8 @@ func TestAgentWithMockLLM(t *testing.T) {
 	}
 
 	// Verify we got the expected content from the mock client
+	mu.Lock()
+	defer mu.Unlock()
 	var contentReceived string
 	for _, e := range events {
 		if e.Type == event.EventTypeContent {

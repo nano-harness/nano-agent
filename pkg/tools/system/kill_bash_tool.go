@@ -45,7 +45,8 @@ func (t *KillBashTool) Schema() *interfaces.ToolSchema {
 	return interfaces.CreateSchema(
 		"Terminate a background shell task",
 		map[string]*interfaces.PropertySchema{
-			"task_id": taskIDProp,
+			"task_id":    taskIDProp,
+			"session_id": interfaces.NewStringProperty("Optional session ID to enforce task ownership (defaults to current turn session)"),
 		},
 		[]string{"task_id"},
 	)
@@ -59,6 +60,21 @@ func (t *KillBashTool) Execute(ctx context.Context, params map[string]interface{
 			Error:       "task_id parameter is required",
 			UserContent: "❌ task_id parameter is required",
 			LLMContent:  "kill_bash failed: task_id parameter is required",
+		}, nil
+	}
+
+	sessionID := "default"
+	if v, ok := params["session_id"].(string); ok && v != "" {
+		sessionID = v
+	} else if tc, ok := ctx.Value(interfaces.TurnContextKey{}).(interfaces.TurnContext); ok && tc.SessionID != "" {
+		sessionID = tc.SessionID
+	}
+	if _, ok := t.bgManager.GetForSession(taskID, sessionID); !ok {
+		return &interfaces.ToolResult{
+			Success:     false,
+			Error:       "task_id not found in this session",
+			UserContent: "❌ task_id not found in this session",
+			LLMContent:  "kill_bash failed: task_id not found in this session",
 		}, nil
 	}
 

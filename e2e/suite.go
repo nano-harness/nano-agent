@@ -99,10 +99,12 @@ func (s *AgentTestSuite) SetupTest() {
 		cfg.Advanced = &config.AdvancedConfig{}
 	}
 	cfg.Advanced.CircuitBreaker = &config.CircuitBreakerAdvConfig{
-		MaxRetries:    2,
-		BaseDelayMs:   50,
-		MaxDelayMs:    200,
-		OpenTimeoutMs: 500,
+		MaxRetries:          2,
+		BaseDelayMs:         50,
+		MaxDelayMs:          200,
+		OpenTimeoutMs:       500,
+		ExcludeNonFailback:  true,
+		TruncationDetection: true,
 	}
 
 	// 更新全局配置，确保 llm/client 和其他组件使用一致的配置

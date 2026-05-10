@@ -32,6 +32,11 @@ type Tool interface {
 	ConcurrencySafe() bool
 }
 
+// ToolGate decides whether a tool should be exposed to the LLM schema.
+type ToolGate interface {
+	ShouldExpose(toolName string) bool
+}
+
 // ContextualConfirmationTool represents a tool that can dynamically determine
 // whether confirmation is required based on the specific parameters being used
 type ContextualConfirmationTool interface {

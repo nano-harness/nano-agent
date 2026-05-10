@@ -3,6 +3,7 @@ package backends
 import (
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -50,10 +51,35 @@ end tell
 		return "", 0, fmt.Errorf("iTerm2 did not return a TTY")
 	}
 
-	// For iTerm2, we use the TTY as the "pane ID"
-	// Getting the actual PID is more complex, so we return 0 for now
-	// TODO: Implement PID retrieval for iTerm2
-	return tty, 0, nil
+	// For iTerm2, we use the TTY as the "pane ID".
+	// Also try to retrieve the underlying process ID as a best-effort hint.
+	pid, _ := i.pidForTTY(tty)
+	_ = color
+	return tty, pid, nil
+}
+
+func (i *ITerm2Backend) pidForTTY(tty string) (int, error) {
+	tty = strings.TrimSpace(tty)
+	tty = strings.TrimPrefix(tty, "/dev/")
+	if tty == "" {
+		return 0, fmt.Errorf("tty cannot be empty")
+	}
+	// macOS: ps -t <tty> -o pid= prints PIDs for this TTY.
+	out, err := exec.Command("ps", "-t", tty, "-o", "pid=").Output()
+	if err != nil {
+		return 0, err
+	}
+	lines := strings.Fields(string(out))
+	if len(lines) == 0 {
+		return 0, fmt.Errorf("no pid for tty %s", tty)
+	}
+	// Use the last PID (most recently spawned process on this tty).
+	pidStr := lines[len(lines)-1]
+	pid, err := strconv.Atoi(strings.TrimSpace(pidStr))
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
 }
 
 // KillPane terminates an iTerm2 pane

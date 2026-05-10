@@ -26,8 +26,8 @@ func TestBackgroundTaskManager_Spawn(t *testing.T) {
 	if task.ID == "" {
 		t.Error("Task ID should not be empty")
 	}
-	if task.Status != BgStatusRunning {
-		t.Errorf("Expected status %s, got %s", BgStatusRunning, task.Status)
+	if status := task.GetStatus(); status != BgStatusRunning {
+		t.Errorf("Expected status %s, got %s", BgStatusRunning, status)
 	}
 	if task.SessionID != sessionID {
 		t.Errorf("Expected sessionID %s, got %s", sessionID, task.SessionID)
@@ -223,11 +223,12 @@ func TestBackgroundTaskManager_ExitCode(t *testing.T) {
 	bgTask1 := manager.tasks[task1.ID]
 	manager.mu.RUnlock()
 
-	if bgTask1.ExitCode != 0 {
-		t.Errorf("Expected exit code 0, got %d", bgTask1.ExitCode)
+	status1, exitCode1, _ := bgTask1.snapshot()
+	if exitCode1 != 0 {
+		t.Errorf("Expected exit code 0, got %d", exitCode1)
 	}
-	if bgTask1.Status != BgStatusCompleted {
-		t.Errorf("Expected status %s, got %s", BgStatusCompleted, bgTask1.Status)
+	if status1 != BgStatusCompleted {
+		t.Errorf("Expected status %s, got %s", BgStatusCompleted, status1)
 	}
 
 	// Test failed command (exit 1)
@@ -238,11 +239,12 @@ func TestBackgroundTaskManager_ExitCode(t *testing.T) {
 	bgTask2 := manager.tasks[task2.ID]
 	manager.mu.RUnlock()
 
-	if bgTask2.ExitCode != 1 {
-		t.Errorf("Expected exit code 1, got %d", bgTask2.ExitCode)
+	status2, exitCode2, _ := bgTask2.snapshot()
+	if exitCode2 != 1 {
+		t.Errorf("Expected exit code 1, got %d", exitCode2)
 	}
-	if bgTask2.Status != BgStatusFailed {
-		t.Errorf("Expected status %s, got %s", BgStatusFailed, bgTask2.Status)
+	if status2 != BgStatusFailed {
+		t.Errorf("Expected status %s, got %s", BgStatusFailed, status2)
 	}
 }
 

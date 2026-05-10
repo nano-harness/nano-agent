@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -16,6 +17,10 @@ func init() {
 }
 
 func runDefaultTeammate(ctx context.Context, identity *swarm.TeammateIdentity, initialPrompt string, cfg *config.Config) error {
+	if err := swarm.InitializeTeammate(ctx, identity); err != nil {
+		return err
+	}
+	cfg = configForTeammate(cfg, identity)
 	// Match the hidden teammate CLI path: the lead-authorized spawn controls when
 	// this runner starts, while teammate mode withholds lead-only swarm tools.
 	approvalHandler := func(info *agent.ToolCallInfo) bool {
@@ -36,4 +41,67 @@ func runDefaultTeammate(ctx context.Context, identity *swarm.TeammateIdentity, i
 		IsTeammate: true,
 	})
 	return eng.Agent.ProcessStreamWithMultimodalAndSession(ctx, sessionID, initialPrompt, nil, func(event.StreamEvent) {})
+}
+
+func configForTeammate(cfg *config.Config, identity *swarm.TeammateIdentity) *config.Config {
+	if cfg != nil && identity != nil && identity.PermissionMode != "" {
+		childCfg := cfg.DeepCopy()
+		// Translate legacy teammate modes: auto→yolo (no confirmation),
+		// ask→default (prompt for confirmation).
+		switch identity.PermissionMode {
+		case "auto":
+			childCfg.PermissionMode = "yolo"
+		case "ask":
+			childCfg.PermissionMode = "default"
+		default:
+			childCfg.PermissionMode = identity.PermissionMode
+		}
+		cfg = childCfg
+	}
+	if cfg != nil && identity != nil && len(identity.AllowedTools) > 0 {
+		childCfg := cfg.DeepCopy()
+		childCfg.EnabledTools = append([]string(nil), identity.AllowedTools...)
+		cfg = childCfg
+	}
+	if cfg != nil && identity != nil && identity.Model != "" {
+		childCfg := cfg.DeepCopy()
+		childCfg.Model = identity.Model
+		cfg = childCfg
+	}
+	if cfg != nil && identity != nil && len(identity.Fallbacks) > 0 {
+		childCfg := cfg.DeepCopy()
+		childCfg.Fallbacks = append([]string(nil), identity.Fallbacks...)
+		if childCfg.ModelRouting != nil {
+			childCfg.ModelRouting.Fallbacks = nil
+		}
+		cfg = childCfg
+	}
+	if cfg != nil && identity != nil && len(identity.ContextProviders) > 0 {
+		cfg = configWithContextProviders(cfg, identity.ContextProviders)
+	}
+	return cfg
+}
+
+func configWithContextProviders(cfg *config.Config, providers []string) *config.Config {
+	allowed := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		normalized := strings.ToLower(strings.TrimSpace(provider))
+		if normalized != "" {
+			allowed[normalized] = struct{}{}
+		}
+	}
+	if _, ok := allowed["all"]; ok || len(allowed) == 0 {
+		return cfg
+	}
+	childCfg := cfg.DeepCopy()
+	if _, ok := allowed["memory"]; !ok {
+		childCfg.Memory = nil
+	}
+	if _, ok := allowed["skills"]; !ok && childCfg.Skills != nil {
+		childCfg.Skills.Enabled = false
+	}
+	if _, ok := allowed["openspec"]; !ok && childCfg.OpenSpec != nil {
+		childCfg.OpenSpec.InjectContext = false
+	}
+	return childCfg
 }

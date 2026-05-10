@@ -22,6 +22,10 @@ type ToolSecurityAnalysis struct {
 	Err       error
 }
 
+type securityDecisionAnalyzableTool interface {
+	AnalyzeSecurityDecision(ctx context.Context, params map[string]interface{}) (*middleware.Decision, error)
+}
+
 type ToolPreflightResult struct {
 	HasAllowPolicy   bool
 	Allowed          bool
@@ -94,6 +98,25 @@ func (pe ToolPolicyEngine) RequiresApprovalForTool(toolName string, params map[s
 // AnalyzeSecurity runs optional tool-provided security analysis and validates
 // that the returned action is one of the known middleware actions.
 func (pe ToolPolicyEngine) AnalyzeSecurity(ctx context.Context, toolName string, params map[string]interface{}, tool interfaces.Tool) ToolSecurityAnalysis {
+	if decisionTool, ok := tool.(securityDecisionAnalyzableTool); ok {
+		decision, err := decisionTool.AnalyzeSecurityDecision(ctx, params)
+		if err != nil {
+			return ToolSecurityAnalysis{Supported: true, Err: err}
+		}
+		if decision == nil {
+			return ToolSecurityAnalysis{Supported: true, Err: fmt.Errorf("nil security decision returned by tool %s", toolName)}
+		}
+		switch decision.Action {
+		case middleware.ActionAllow, middleware.ActionConfirm, middleware.ActionBlock:
+			return ToolSecurityAnalysis{Supported: true, Decision: decision}
+		default:
+			return ToolSecurityAnalysis{
+				Supported: true,
+				Err:       fmt.Errorf("invalid security action %d returned by tool %s", decision.Action, toolName),
+			}
+		}
+	}
+
 	secTool, ok := tool.(interfaces.SecurityAnalyzableTool)
 	if !ok {
 		return ToolSecurityAnalysis{}

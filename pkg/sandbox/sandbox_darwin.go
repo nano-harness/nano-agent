@@ -35,6 +35,12 @@ func newSandboxExecSandbox(cfg *config.SandboxConfig, workingDir string) Sandbox
 // IsEnabled always returns true for a SandboxExecSandbox.
 func (s *SandboxExecSandbox) IsEnabled() bool { return true }
 
+// Backend returns the native backend family.
+func (s *SandboxExecSandbox) Backend() Backend { return BackendNative }
+
+// BackendDetail returns the concrete macOS backend.
+func (s *SandboxExecSandbox) BackendDetail() string { return "sandbox-exec" }
+
 // WrapCommand transforms (cmd, args) into a sandbox-exec-wrapped invocation:
 //
 //	sandbox-exec -p <profile> cmd args...

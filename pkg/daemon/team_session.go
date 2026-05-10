@@ -252,6 +252,11 @@ func (s *TeamLeadSession) ListActiveTasks() []*ActiveTask {
 
 // Shutdown gracefully shuts down the session
 func (s *TeamLeadSession) Shutdown() error {
+	return s.ShutdownCtx(context.Background())
+}
+
+// ShutdownCtx gracefully shuts down the session, respecting cancellation while waiting for engine shutdown.
+func (s *TeamLeadSession) ShutdownCtx(ctx context.Context) error {
 	logger.Infof("Shutting down team-lead session %s", s.ID)
 
 	// Cancel all active tasks
@@ -270,7 +275,16 @@ func (s *TeamLeadSession) Shutdown() error {
 
 	// Shutdown the engine
 	if s.Engine != nil {
-		if err := s.Engine.Shutdown(); err != nil {
+		done := make(chan error, 1)
+		go func() { done <- s.Engine.Shutdown() }()
+		select {
+		case <-ctx.Done():
+			logger.Warnf("Timed out shutting down engine for session %s: %v", s.ID, ctx.Err())
+			return ctx.Err()
+		case err := <-done:
+			if err == nil {
+				return nil
+			}
 			logger.Warnf("Error shutting down engine for session %s: %v", s.ID, err)
 			return err
 		}

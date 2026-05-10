@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -43,6 +44,7 @@ type BackgroundTask struct {
 	Workdir    string
 	LogPath    string
 	Pid        int
+	mu         sync.RWMutex
 	Status     BackgroundTaskStatus
 	ExitCode   int
 	StartedAt  time.Time
@@ -51,6 +53,26 @@ type BackgroundTask struct {
 	cancel     context.CancelFunc
 	logFile    *os.File
 	logMu      sync.Mutex
+	waitDone   chan struct{} // closed when the wait goroutine has finished cleanup
+}
+
+// GetStatus returns the task status using the task lock.
+func (t *BackgroundTask) GetStatus() BackgroundTaskStatus {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Status
+}
+
+// snapshot returns a thread-safe copy of status, exit code, and finished time.
+func (t *BackgroundTask) snapshot() (BackgroundTaskStatus, int, *time.Time) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var finishedAt *time.Time
+	if t.FinishedAt != nil {
+		finished := *t.FinishedAt
+		finishedAt = &finished
+	}
+	return t.Status, t.ExitCode, finishedAt
 }
 
 // BackgroundTaskManager manages background shell tasks
@@ -58,6 +80,26 @@ type BackgroundTaskManager struct {
 	mu      sync.RWMutex
 	tasks   map[string]*BackgroundTask
 	rootDir string
+}
+
+// Get returns a task by ID.
+func (m *BackgroundTaskManager) Get(taskID string) (*BackgroundTask, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	task, ok := m.tasks[taskID]
+	return task, ok
+}
+
+// GetForSession returns a task by ID and enforces that it belongs to sessionID.
+func (m *BackgroundTaskManager) GetForSession(taskID, sessionID string) (*BackgroundTask, bool) {
+	task, ok := m.Get(taskID)
+	if !ok {
+		return nil, false
+	}
+	if sessionID != "" && task.SessionID != sessionID {
+		return nil, false
+	}
+	return task, true
 }
 
 // NewBackgroundTaskManager creates a new background task manager
@@ -85,8 +127,10 @@ func (m *BackgroundTaskManager) Spawn(ctx context.Context, sessionID, command, w
 		m.gcSessionLocked(sessionID)
 	}
 
-	// Generate task ID
-	taskID := uuid.New().String()[:8]
+	// Generate task ID with session-derived prefix to avoid cross-session collisions.
+	// Keep it short enough for UI tables and file names.
+	sessionPrefix := sessionIDPrefix(sessionID)
+	taskID := sessionPrefix + "-" + uuid.New().String()[:8]
 
 	// Create session directory if needed
 	sessionDir := filepath.Join(m.rootDir, sessionID)
@@ -150,6 +194,7 @@ func (m *BackgroundTaskManager) Spawn(ctx context.Context, sessionID, command, w
 		cmd:       cmd,
 		cancel:    cancel,
 		logFile:   logFile,
+		waitDone:  make(chan struct{}),
 	}
 
 	m.tasks[taskID] = task
@@ -161,15 +206,29 @@ func (m *BackgroundTaskManager) Spawn(ctx context.Context, sessionID, command, w
 	return task, nil
 }
 
+func sessionIDPrefix(sessionID string) string {
+	if sessionID == "" {
+		return "default"
+	}
+	// Produce a stable, filesystem-safe short prefix.
+	// Use base36 hash of session string to keep it compact.
+	var h uint32 = 2166136261
+	for i := 0; i < len(sessionID); i++ {
+		h ^= uint32(sessionID[i])
+		h *= 16777619
+	}
+	return "s" + strconv.FormatUint(uint64(h), 36)
+}
+
 // waitTask waits for a task to complete and updates its status
 func (m *BackgroundTaskManager) waitTask(task *BackgroundTask) {
+	defer close(task.waitDone)
+
 	err := task.cmd.Wait()
 	now := time.Now()
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	// Only update if not already killed
+	task.mu.Lock()
 	if task.Status != BgStatusKilled {
 		task.FinishedAt = &now
 		if err != nil {
@@ -184,6 +243,8 @@ func (m *BackgroundTaskManager) waitTask(task *BackgroundTask) {
 			task.ExitCode = 0
 		}
 	}
+	status, exitCode := task.Status, task.ExitCode
+	task.mu.Unlock()
 
 	// Close log file
 	task.logMu.Lock()
@@ -193,7 +254,7 @@ func (m *BackgroundTaskManager) waitTask(task *BackgroundTask) {
 	}
 	task.logMu.Unlock()
 
-	logger.Infof("Background task %s finished with status %s (exit code %d)", task.ID, task.Status, task.ExitCode)
+	logger.Infof("Background task %s finished with status %s (exit code %d)", task.ID, status, exitCode)
 }
 
 // ReadOutput reads output from a background task's log file
@@ -214,7 +275,7 @@ func (m *BackgroundTaskManager) ReadOutput(taskID string, fromOffset int64, bloc
 			if err == nil && stat.Size() > fromOffset {
 				break
 			}
-			if task.Status != BgStatusRunning {
+			if task.GetStatus() != BgStatusRunning {
 				break
 			}
 			time.Sleep(100 * time.Millisecond)
@@ -224,19 +285,19 @@ func (m *BackgroundTaskManager) ReadOutput(taskID string, fromOffset int64, bloc
 	// Read log file from offset
 	file, err := os.Open(task.LogPath)
 	if err != nil {
-		return "", fromOffset, task.Status, fmt.Errorf("failed to open log file: %w", err)
+		return "", fromOffset, task.GetStatus(), fmt.Errorf("failed to open log file: %w", err)
 	}
 	defer file.Close()
 
 	// Seek to offset
 	if _, err := file.Seek(fromOffset, io.SeekStart); err != nil {
-		return "", fromOffset, task.Status, fmt.Errorf("failed to seek log file: %w", err)
+		return "", fromOffset, task.GetStatus(), fmt.Errorf("failed to seek log file: %w", err)
 	}
 
 	// Read remaining content
 	data, err := io.ReadAll(file)
 	if err != nil {
-		return "", fromOffset, task.Status, fmt.Errorf("failed to read log file: %w", err)
+		return "", fromOffset, task.GetStatus(), fmt.Errorf("failed to read log file: %w", err)
 	}
 
 	newOffset = fromOffset + int64(len(data))
@@ -251,23 +312,25 @@ func (m *BackgroundTaskManager) ReadOutput(taskID string, fromOffset int64, bloc
 		content = joinLines(lines)
 	}
 
-	return content, newOffset, task.Status, nil
+	return content, newOffset, task.GetStatus(), nil
 }
 
 // Kill terminates a background task
 func (m *BackgroundTaskManager) Kill(taskID string) error {
-	m.mu.Lock()
+	m.mu.RLock()
 	task, exists := m.tasks[taskID]
 	if !exists {
-		m.mu.Unlock()
+		m.mu.RUnlock()
 		return fmt.Errorf("task %s not found", taskID)
 	}
+	m.mu.RUnlock()
 
 	// Mark as killed to prevent status override
+	task.mu.Lock()
 	task.Status = BgStatusKilled
 	now := time.Now()
 	task.FinishedAt = &now
-	m.mu.Unlock()
+	task.mu.Unlock()
 
 	// Try graceful SIGTERM first
 	if task.cmd.Process != nil && runtime.GOOS != "windows" {
@@ -276,25 +339,25 @@ func (m *BackgroundTaskManager) Kill(taskID string) error {
 
 		// Wait for grace period
 		timer := time.NewTimer(BgKillGracePeriod)
-		done := make(chan struct{})
-		go func() {
-			task.cmd.Wait()
-			close(done)
-		}()
 
 		select {
 		case <-timer.C:
 			// Grace period expired, force kill
 			_ = syscall.Kill(pgid, syscall.SIGKILL)
-		case <-done:
+			<-task.waitDone
+		case <-task.waitDone:
 			// Process exited gracefully
 		}
 		timer.Stop()
-	}
-
-	// Cancel context
-	if task.cancel != nil {
-		task.cancel()
+		if task.cancel != nil {
+			task.cancel()
+		}
+	} else {
+		// Cancel context
+		if task.cancel != nil {
+			task.cancel()
+		}
+		<-task.waitDone
 	}
 
 	logger.Infof("Killed background task %s (PID %d)", taskID, task.Pid)
@@ -319,7 +382,8 @@ func (m *BackgroundTaskManager) List(sessionID string) []*BackgroundTask {
 func (m *BackgroundTaskManager) gcSessionLocked(sessionID string) {
 	var toRemove []string
 	for id, t := range m.tasks {
-		if t.SessionID == sessionID && (t.Status == BgStatusCompleted || t.Status == BgStatusFailed) {
+		status := t.GetStatus()
+		if t.SessionID == sessionID && (status == BgStatusCompleted || status == BgStatusFailed) {
 			toRemove = append(toRemove, id)
 		}
 	}

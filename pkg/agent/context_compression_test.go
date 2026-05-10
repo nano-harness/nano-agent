@@ -91,18 +91,24 @@ func TestCompressionStrategy_FormatAndFallbackSummary(t *testing.T) {
 func TestCompressionStrategy_EstimateTokenCount(t *testing.T) {
 	cs := NewCompressionStrategyWithConfig(1000, 0.3, 3)
 
-	msgs := []llm.Message{
-		{Role: "system", Content: "system prompt"},
+	msgsWithoutSystem := []llm.Message{
 		{Role: "user", Content: "short text"},
 		{Role: "assistant", Content: "reply", ToolCalls: []tools.ToolCall{{Name: "tool", Arguments: map[string]interface{}{"k": "v"}}}},
 	}
-	tokens := cs.EstimateTokenCount(msgs)
+	tokens := cs.EstimateTokenCount(msgsWithoutSystem)
 	if tokens <= 0 {
 		t.Fatalf("token estimate should be positive")
 	}
-	total := cs.EstimateTokenCountWithSystemPrompt(msgs, "extra")
+	total := cs.EstimateTokenCountWithSystemPrompt(msgsWithoutSystem, "extra")
 	if total <= tokens {
-		t.Fatalf("token count with system prompt should be greater")
+		t.Fatalf("token count with external system prompt should be greater")
+	}
+
+	msgsWithSystem := append([]llm.Message{{Role: "system", Content: "system prompt"}}, msgsWithoutSystem...)
+	withSystemTokens := cs.EstimateTokenCount(msgsWithSystem)
+	totalWithExistingSystem := cs.EstimateTokenCountWithSystemPrompt(msgsWithSystem, "extra")
+	if totalWithExistingSystem != withSystemTokens {
+		t.Fatalf("token count should not add external system prompt when messages include system: got %d want %d", totalWithExistingSystem, withSystemTokens)
 	}
 }
 

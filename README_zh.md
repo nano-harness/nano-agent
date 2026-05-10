@@ -37,11 +37,11 @@
 
 ## 权限自动免确认
 
-nano-agent 会对 agent 工作目录内的只读 shell 命令（`grep`、`rg`、`ls`、`find` 等）和文件编辑工具（`write_file`、`edit_file`、`delete_file`）自动免确认。路径位于工作目录之外时仍会要求确认。详见 [权限自动免确认](./docs/PERMISSION_AUTO_APPROVAL.md)。
+nano-agent 会对 agent 工作目录内的只读 shell 命令（`grep`、`rg`、`ls`、`find` 等）和文件编辑工具（`write_file`、`edit_file`、`delete_file`）自动免确认。路径位于工作目录之外时仍会要求确认。详见 [权限自动免确认](./docs/development/PERMISSION_AUTO_APPROVAL.md)。
 
 ## Web 客户端集成
 
-Daemon 集成请以 `docs/DAEMON_API.md` 为准。交互式 CLI 渲染统一经过 EventSource 层：`nano chat` 与 `nano lead-chat` 默认使用 BubbleTea，`--ui tview` 可切换到 tview 后端。自动化脚本请使用 `nano daemon execute --json "command"`，不要解析 TUI 输出。
+Daemon 集成请以 [Daemon API](./docs/operations/DAEMON_API.md) 为准。交互式 CLI 渲染统一经过 EventSource 层：`nano chat` 与 `nano lead-chat` 默认使用 BubbleTea，`--ui tview` 可切换到 tview 后端。自动化脚本请使用 `nano daemon execute --json "command"`，不要解析 TUI 输出。
 
 ## 🚀 快速开始
 
@@ -457,15 +457,6 @@ expert_defaults:
   maxTimeMinutes: 10
   temperature: 0.7
 ```
-
-### 与旧版Fork系统的主要区别
-
-> **⚠️ 重大变更**: 专家系统取代了之前的`fork`工具：
->
-> 1. **仅显式触发**: LLM不能自主调用专家。只有用户可以通过`@expert-name`触发它们。
-> 2. **更好的可观测性**: 您始终知道何时调用了专家以及成本是多少。
-> 3. **短横线命名**: 使用`@investigator`而不是`@codebase_investigator`。名称会从YAML配置自动转换。
-> 4. **移除隐式fork**: 旧的`fork`工具已被完全移除 - 所有子代理调用必须由用户显式触发。
 
 ## 🔄 后台任务管理
 

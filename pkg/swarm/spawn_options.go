@@ -30,23 +30,43 @@ func (opts SpawnOptions) newIdentity() spawnIdentity {
 		agentID:   agentID,
 		sessionID: sessionID,
 		teammate: &TeammateIdentity{
-			AgentID:         agentID,
-			AgentName:       opts.Name,
-			TeamName:        opts.TeamName,
-			Color:           opts.Color,
-			ParentSessionID: "",
+			AgentID:          agentID,
+			AgentName:        opts.Name,
+			TeamName:         opts.TeamName,
+			Color:            opts.Color,
+			PermissionMode:   opts.PermissionMode,
+			AllowedTools:     append([]string(nil), opts.AllowedTools...),
+			Model:            opts.Model,
+			Fallbacks:        append([]string(nil), opts.Fallbacks...),
+			ContextProviders: append([]string(nil), opts.ContextProviders...),
+			ParentSessionID:  "",
 		},
 	}
 }
 
 func (opts SpawnOptions) newTeamMember(agentID, sessionID, memberKind string) team.TeamMember {
+	sandboxPolicy := opts.Sandbox
+	if sandboxPolicy.Lifecycle == "" {
+		sandboxPolicy.Lifecycle = "task"
+	}
+	if sandboxPolicy.Scope == "" {
+		sandboxPolicy.Scope = "subagent"
+	}
+	if sandboxPolicy.SessionID == "" {
+		sandboxPolicy.SessionID = sessionID
+	}
 	return team.TeamMember{
-		AgentID:   agentID,
-		Name:      opts.Name,
-		Color:     opts.Color,
-		Mode:      opts.PermissionMode,
-		IsActive:  true,
-		SessionID: sessionID,
-		Kind:      memberKind,
+		AgentID:          agentID,
+		Name:             opts.Name,
+		Color:            opts.Color,
+		Mode:             opts.PermissionMode,
+		IsActive:         true,
+		SessionID:        sessionID,
+		Kind:             memberKind,
+		Model:            opts.Model,
+		Fallbacks:        append([]string(nil), opts.Fallbacks...),
+		ContextProviders: append([]string(nil), opts.ContextProviders...),
+		MaxRuntimeSec:    opts.MaxRuntimeSec,
+		Sandbox:          sandboxPolicy,
 	}
 }

@@ -54,6 +54,8 @@ func (a *TViewAdapter) pumpInbound(ctx context.Context, src eventsource.EventSou
 
 func (a *TViewAdapter) sendEvent(e event.StreamEvent) {
 	switch e.Type {
+	case event.EventTypeCronTaskStarted, event.EventTypeCronTaskFinished, event.EventTypeCronTaskProgress:
+		return
 	case event.EventTypeStreamContent:
 		a.integration.AddMessage("assistant", e.Content)
 	case event.EventTypeContent:
@@ -85,6 +87,10 @@ func (a *TViewAdapter) sendEvent(e event.StreamEvent) {
 	case event.EventTypeMailboxSent:
 		a.integration.UpdateSwarmRoster(e.Content)
 	}
+}
+
+func (a *TViewAdapter) SetCronTracker(t *CronStatusTracker) {
+	a.integration.SetCronTracker(t)
 }
 
 // Stop stops the tview integration.

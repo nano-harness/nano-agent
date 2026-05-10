@@ -40,7 +40,8 @@ func (t *recoverTool) Execute(_ context.Context, _ map[string]interface{}) (*int
 //
 // Expected: Task completes successfully without triggering diminishing-returns termination
 // Bug (before fix): Low-gain samples from error recovery period pollute history,
-//                   causing hasDiminishingReturns() to trigger after recovery.
+//
+//	causing hasDiminishingReturns() to trigger after recovery.
 func TestTurn_RecoverAfterConsecutiveToolFailuresDoesNotTriggerLowGain(t *testing.T) {
 	tempDir, tb, scheduler := setupBestEffortTurn(t)
 

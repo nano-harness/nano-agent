@@ -3,7 +3,9 @@ package swarm
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/team"
 )
 
@@ -16,12 +18,19 @@ type SpawnHandle struct {
 
 // SpawnOptions configures teammate spawn behavior
 type SpawnOptions struct {
-	TeamName       string // Name of the team
-	Name           string // Short name of the teammate
-	Color          string // Optional UI color
-	InitialPrompt  string // Initial prompt to send to the teammate
-	PermissionMode string // Permission mode (e.g., "auto", "ask")
-	Runner         Runner // Optional custom runner (defaults to DefaultRunner)
+	TeamName         string // Name of the team
+	Name             string // Short name of the teammate
+	Color            string // Optional UI color
+	InitialPrompt    string // Initial prompt to send to the teammate
+	PermissionMode   string // Permission mode (e.g., "auto", "ask")
+	AllowedTools     []string
+	Model            string
+	Fallbacks        []string
+	ContextProviders []string
+	MaxRuntimeSec    int
+	Sandbox          team.SandboxPolicy
+	Runner           Runner               // Optional custom runner (defaults to DefaultRunner)
+	HookDispatcher   *SwarmHookDispatcher // Optional dispatcher for SubagentStart/Stop/Idle hooks
 }
 
 // SpawnInProcess spawns a teammate in the same process as a goroutine
@@ -31,8 +40,14 @@ func SpawnInProcess(ctx context.Context, opts SpawnOptions) (*SpawnHandle, error
 	}
 	identity := opts.newIdentity()
 
-	// Create independent context for the teammate (not cancelled when parent turn ends)
-	teammateCtx, cancel := context.WithCancel(context.Background())
+	var teammateCtx context.Context
+	var cancel context.CancelFunc
+	if opts.MaxRuntimeSec > 0 {
+		teammateCtx, cancel = context.WithTimeout(context.Background(), time.Duration(opts.MaxRuntimeSec)*time.Second)
+	} else {
+		// Create independent context for the teammate (not cancelled when parent turn ends)
+		teammateCtx, cancel = context.WithCancel(context.Background())
+	}
 	identity.teammate.AbortCtx = teammateCtx
 	identity.teammate.AbortCancel = cancel
 	lifecycle := NewLifecycle(opts.TeamName, identity.agentID, cancel)
@@ -50,20 +65,34 @@ func SpawnInProcess(ctx context.Context, opts SpawnOptions) (*SpawnHandle, error
 	// Get or create runner
 	runner := opts.Runner
 	if runner == nil {
-		// TODO: Get config from context or global config
-		// For now, return error
-		lifecycle.Cancel()
-		return nil, fmt.Errorf("runner not provided and default runner creation not yet implemented")
+		// Default to the same runner wiring used by the spawn_teammate tool.
+		// The runner itself is configured via swarm.SetDefaultRunFunc (wired in pkg/cli).
+		runner = NewDefaultRunner(config.Get())
 	}
 
 	// Launch teammate goroutine
 	go func() {
-		defer close(done)
-		defer lifecycle.Finish()
+		var err error
+		dispatcher := opts.HookDispatcher
+		// M1F: SubagentStart fires before the teammate begins running.
+		_ = dispatcher.DispatchSubagentStart(teammateCtx, identity.teammate)
+		defer func() {
+			lifecycle.Finish()
+			// M1F: SubagentStop fires regardless of success/failure with status.
+			status := "success"
+			if err != nil {
+				status = "failed"
+			}
+			_ = dispatcher.DispatchSubagentStop(teammateCtx, identity.teammate, status)
+			if err != nil {
+				done <- err
+			}
+			close(done)
+		}()
 
-		err := runner.Run(teammateCtx, identity.teammate, opts.InitialPrompt)
+		err = runner.Run(teammateCtx, identity.teammate, opts.InitialPrompt)
 		if err != nil {
-			done <- err
+			return
 		}
 
 	}()

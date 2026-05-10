@@ -120,3 +120,38 @@ func TestTUIScheduler_WithStateStore(t *testing.T) {
 		t.Errorf("expected command 'persist-me', got %q", tasks[0].Command)
 	}
 }
+
+func TestTUIScheduler_AddPauseResumeRemove(t *testing.T) {
+	ts := NewTUIScheduler(nil, func(cmd string) error { return nil })
+	if err := ts.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Stop()
+
+	id, err := ts.AddRoutineFromDescription("每5分钟运行 echo hello")
+	if err != nil {
+		t.Fatalf("AddRoutineFromDescription: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected task id")
+	}
+	if len(ts.ListTasks()) != 1 {
+		t.Fatalf("expected one task after add")
+	}
+	if err := ts.PauseTask(id); err != nil {
+		t.Fatalf("PauseTask: %v", err)
+	}
+	if len(ts.ListTasks()) != 0 {
+		t.Fatalf("expected no live tasks after pause")
+	}
+	if err := ts.ResumeTask(id); err != nil {
+		t.Fatalf("ResumeTask: %v", err)
+	}
+	tasks := ts.ListTasks()
+	if len(tasks) != 1 || tasks[0].Command != "echo hello" {
+		t.Fatalf("expected resumed task, got %+v", tasks)
+	}
+	if err := ts.RemoveTask(tasks[0].ID); err != nil {
+		t.Fatalf("RemoveTask: %v", err)
+	}
+}

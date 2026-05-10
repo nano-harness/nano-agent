@@ -339,11 +339,11 @@ func testAgentIDValidation(t *testing.T, backend Backend) {
 
 	// Invalid IDs should be rejected
 	invalidIDs := []string{
-		"",                // empty
-		"agent/with/slash", // slash
+		"",                       // empty
+		"agent/with/slash",       // slash
 		"agent\\with\\backslash", // backslash
-		"agent..path",     // double dot
-		"agent\x00null",   // null byte
+		"agent..path",            // double dot
+		"agent\x00null",          // null byte
 	}
 	for _, id := range invalidIDs {
 		_, err := backend.Open(id)

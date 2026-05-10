@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nano-harness/nano-agent/e2e/shared"
 	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/daemon"
 	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/llm"
-	"github.com/nano-harness/nano-agent/e2e/shared"
 	"github.com/stretchr/testify/suite"
 )
 

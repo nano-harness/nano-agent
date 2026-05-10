@@ -17,8 +17,8 @@ type WorkdirRules struct {
 
 // PersistentAllowlistData holds all workdir-scoped allowlist rules.
 type PersistentAllowlistData struct {
-	Version  int                      `json:"version"`
-	Workdirs map[string]WorkdirRules  `json:"workdirs"`
+	Version  int                     `json:"version"`
+	Workdirs map[string]WorkdirRules `json:"workdirs"`
 }
 
 const persistentAllowlistVersion = 1

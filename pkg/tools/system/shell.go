@@ -50,7 +50,7 @@ type ShellTool struct {
 	allowedEnvVars []string
 	blockedEnvVars []string
 	strict         bool
-	sandbox        sandbox.Sandbox
+	sandboxRuntime sandbox.Runtime
 	guard          *middleware.CommandGuard
 	bgManager      *BackgroundTaskManager // Optional: for background task support
 }
@@ -64,9 +64,9 @@ func NewShellTool(workingDir string, cfg map[string]interface{}, sandboxCfg *con
 	}
 
 	tool := &ShellTool{
-		workingDir: workingDir,
-		config:     cfg,
-		sandbox:    sandbox.New(sandboxCfg, workingDir),
+		workingDir:     workingDir,
+		config:         cfg,
+		sandboxRuntime: sandbox.NewRuntime(sandboxCfg, workingDir),
 	}
 
 	// Load env var filters and strict mode from tool config.
@@ -88,7 +88,14 @@ func NewShellTool(workingDir string, cfg map[string]interface{}, sandboxCfg *con
 	if dr, ok := cfg["deny_rules"].([]string); ok {
 		denyRules = dr
 	}
-	tool.guard = middleware.NewCommandGuardWithWorkdir(allowRules, denyRules, nil, workingDir)
+	var sensitiveReadPaths, arbitraryExecCommands []string
+	if paths, ok := cfg["sensitive_read_paths"].([]string); ok {
+		sensitiveReadPaths = paths
+	}
+	if commands, ok := cfg["arbitrary_exec_commands"].([]string); ok {
+		arbitraryExecCommands = commands
+	}
+	tool.guard = middleware.NewCommandGuardWithConfig(allowRules, denyRules, nil, workingDir, sensitiveReadPaths, arbitraryExecCommands)
 
 	return tool
 }
@@ -152,6 +159,16 @@ func (t *ShellTool) AnalyzeCommand(ctx context.Context, command string) (*middle
 		return &middleware.Decision{Action: middleware.ActionAllow, Reason: "no guard configured"}, nil
 	}
 	return t.guard.Analyze(ctx, command)
+}
+
+// AnalyzeSecurityDecision returns the full security decision, including any
+// hook-proposed parameter modifications that should be applied before execution.
+func (t *ShellTool) AnalyzeSecurityDecision(ctx context.Context, params map[string]interface{}) (*middleware.Decision, error) {
+	command, ok := params["command"].(string)
+	if !ok {
+		return &middleware.Decision{Action: middleware.ActionConfirm, Reason: "command parameter missing"}, nil
+	}
+	return t.AnalyzeCommand(ctx, command)
 }
 
 // AnalyzeSecurity implements interfaces.SecurityAnalyzableTool.
@@ -259,6 +276,10 @@ type CommandResult struct { //nolint:revive
 }
 
 func (t *ShellTool) Execute(ctx context.Context, params map[string]interface{}) (*interfaces.ToolResult, error) { //nolint:revive
+	if decision, ok := middleware.GetSecurityDecision(ctx); ok && len(decision.ModifiedParams) > 0 {
+		params = middleware.MergeDecisionParams(params, decision.ModifiedParams)
+	}
+
 	// Extract parameters
 	command, ok := params["command"].(string)
 	if !ok {
@@ -369,10 +390,11 @@ func (t *ShellTool) spawnBackground(ctx context.Context, command, directory, des
 		}, nil
 	}
 
-	// Get session ID from Turn context (added in Phase 2)
+	// Get session ID from Turn context (added in Phase 2).
 	sessionID := "default"
-	// Try to get from agent Turn struct via context if available
-	// For now, use default - will be enhanced when context propagation is complete
+	if tc, ok := ctx.Value(interfaces.TurnContextKey{}).(interfaces.TurnContext); ok && tc.SessionID != "" {
+		sessionID = tc.SessionID
+	}
 
 	task, err := t.bgManager.Spawn(ctx, sessionID, command, directory)
 	if err != nil {
@@ -532,70 +554,31 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 		rawArgs = []string{"-c", command}
 	}
 
-	// Wrap the command with the sandbox (bwrap / sandbox-exec / noop).
-	finalCmd, finalArgs, err := t.sandbox.WrapCommand(directory, rawCmd, rawArgs)
+	cmdEnv := t.buildEnvironment(environment)
+
+	// Prepare the command through SandboxRuntime. The initial implementation
+	// adapts existing bwrap / sandbox-exec / noop behavior behind a stable API.
+	sandboxEnv, err := t.sandboxRuntime.PrepareCommand(ctx, sandbox.SandboxRequest{
+		Command:        rawCmd,
+		Args:           rawArgs,
+		WorkingDir:     directory,
+		Env:            cmdEnv,
+		ResourceLimits: sandbox.ResourceLimits{Timeout: timeout},
+		Metadata: map[string]interface{}{
+			"tool": "run_shell_command",
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("sandbox wrap failed: %w", err)
 	}
 
-	cmd := exec.CommandContext(cmdCtx, finalCmd, finalArgs...)
+	cmd := exec.CommandContext(cmdCtx, sandboxEnv.Command, sandboxEnv.Args...)
+	sandboxPublisher := sandbox.EventPublisherFromContext(ctx)
 
 	// Set working directory
 	cmd.Dir = directory
 
-	// Build sanitized environment
-	baseEnv := os.Environ()
-	// Convert base env to map for easier filtering/overrides
-	envMap := make(map[string]string, len(baseEnv))
-	for _, kv := range baseEnv {
-		if eq := strings.IndexByte(kv, '='); eq > 0 {
-			key := kv[:eq]
-			val := kv[eq+1:]
-			// If strict mode and key not explicitly allowed, drop from base
-			if t.strict && len(t.allowedEnvVars) > 0 && !containsInsensitive(t.allowedEnvVars, key) {
-				continue
-			}
-			// Drop blocked keys from base
-			if containsInsensitive(t.blockedEnvVars, key) {
-				continue
-			}
-			envMap[key] = val
-		}
-	}
-
-	// Apply user-provided environment entries
-	if environment != "" {
-		envVars := strings.Split(environment, ";")
-		for _, pair := range envVars {
-			kv := strings.TrimSpace(pair)
-			if kv == "" {
-				continue
-			}
-			if !strings.Contains(kv, "=") {
-				continue
-			}
-			eq := strings.IndexByte(kv, '=')
-			key := strings.TrimSpace(kv[:eq])
-			val := strings.TrimSpace(kv[eq+1:])
-
-			// Enforce filtering
-			if containsInsensitive(t.blockedEnvVars, key) {
-				// skip blocked
-				continue
-			}
-			if t.strict && len(t.allowedEnvVars) > 0 && !containsInsensitive(t.allowedEnvVars, key) {
-				// not allowed under strict
-				continue
-			}
-			envMap[key] = val
-		}
-	}
-
-	// Convert env map back to slice
-	cmd.Env = make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = cmdEnv
 
 	// Set process group for better process management
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -608,6 +591,9 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 		Duration:  0,
 		Success:   false,
 		TimedOut:  false,
+		Metadata: map[string]interface{}{
+			"sandbox": sandboxEnv.AuditMetadata(),
+		},
 	}
 
 	if captureOutput {
@@ -628,6 +614,7 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 		}
 
 		result.PID = cmd.Process.Pid
+		publishCommandStarted(sandboxPublisher, sandboxEnv, result.PID)
 
 		// Enhanced process cleanup with graceful shutdown (Unix only)
 		// waitedCh signals when cmd.Wait() returns
@@ -711,7 +698,13 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 		}
 	} else {
 		// Run without capturing output
-		err := cmd.Run()
+		err := cmd.Start()
+		if err != nil {
+			return nil, fmt.Errorf("failed to start command: %v", err)
+		}
+		result.PID = cmd.Process.Pid
+		publishCommandStarted(sandboxPublisher, sandboxEnv, result.PID)
+		err = cmd.Wait()
 		result.Duration = time.Since(start)
 
 		if cmdCtx.Err() == context.DeadlineExceeded {
@@ -729,8 +722,88 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 			result.Success = true
 		}
 	}
+	publishCommandFinished(sandboxPublisher, sandboxEnv, result)
+
+	if cleanupErr := t.sandboxRuntime.Cleanup(ctx, sandboxEnv); cleanupErr != nil && result.Metadata != nil {
+		result.Metadata["sandbox_cleanup_error"] = cleanupErr.Error()
+	}
 
 	return result, nil
+}
+
+func publishCommandStarted(publisher sandbox.EventPublisher, env *sandbox.SandboxEnvironment, pid int) {
+	sandbox.PublishEvent(publisher, sandbox.EventTypeSandboxCommandStarted, env, "sandbox command started", map[string]interface{}{
+		"pid": pid,
+	})
+}
+
+func publishCommandFinished(publisher sandbox.EventPublisher, env *sandbox.SandboxEnvironment, result *CommandResult) {
+	if result == nil {
+		return
+	}
+	sandbox.PublishEvent(publisher, sandbox.EventTypeSandboxCommandFinished, env, "sandbox command finished", map[string]interface{}{
+		"pid":         result.PID,
+		"exit_code":   result.ExitCode,
+		"duration_ms": result.Duration.Milliseconds(),
+		"timed_out":   result.TimedOut,
+		"success":     result.Success,
+	})
+}
+
+func (t *ShellTool) buildEnvironment(environment string) []string {
+	baseEnv := os.Environ()
+	// Convert base env to map for easier filtering/overrides
+	envMap := make(map[string]string, len(baseEnv))
+	for _, kv := range baseEnv {
+		if eq := strings.IndexByte(kv, '='); eq > 0 {
+			key := kv[:eq]
+			val := kv[eq+1:]
+			// If strict mode and key not explicitly allowed, drop from base
+			if t.strict && len(t.allowedEnvVars) > 0 && !containsInsensitive(t.allowedEnvVars, key) {
+				continue
+			}
+			// Drop blocked keys from base
+			if containsInsensitive(t.blockedEnvVars, key) {
+				continue
+			}
+			envMap[key] = val
+		}
+	}
+
+	// Apply user-provided environment entries
+	if environment != "" {
+		envVars := strings.Split(environment, ";")
+		for _, pair := range envVars {
+			kv := strings.TrimSpace(pair)
+			if kv == "" {
+				continue
+			}
+			if !strings.Contains(kv, "=") {
+				continue
+			}
+			eq := strings.IndexByte(kv, '=')
+			key := strings.TrimSpace(kv[:eq])
+			val := strings.TrimSpace(kv[eq+1:])
+
+			// Enforce filtering
+			if containsInsensitive(t.blockedEnvVars, key) {
+				// skip blocked
+				continue
+			}
+			if t.strict && len(t.allowedEnvVars) > 0 && !containsInsensitive(t.allowedEnvVars, key) {
+				// not allowed under strict
+				continue
+			}
+			envMap[key] = val
+		}
+	}
+
+	// Convert env map back to slice
+	env := make([]string, 0, len(envMap))
+	for k, v := range envMap {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+	return env
 }
 
 func (t *ShellTool) formatForUser(result *CommandResult, metadata map[string]interface{}) string {

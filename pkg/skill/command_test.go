@@ -37,6 +37,7 @@ func TestNewCommandManager_LoadsCommand(t *testing.T) {
 	cwd := createTempCommand(t, "greet", `---
 description: Say hello
 allowed-tools: [run_shell_command]
+permission-profile: acceptEdits
 ---
 Hello $ARGUMENTS!
 `)
@@ -54,6 +55,9 @@ Hello $ARGUMENTS!
 	}
 	if len(cmd.AllowedTools) != 1 || cmd.AllowedTools[0] != "run_shell_command" {
 		t.Errorf("AllowedTools = %v, want [run_shell_command]", cmd.AllowedTools)
+	}
+	if cmd.PermissionProfile != "acceptEdits" {
+		t.Errorf("PermissionProfile = %q, want acceptEdits", cmd.PermissionProfile)
 	}
 }
 

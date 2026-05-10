@@ -253,6 +253,32 @@ func GetSessionID() string {
 	return getSessionID()
 }
 
+// InitFileLogger initializes logging to a specific file with a given level
+// This is useful for ACP server mode where stdout/stderr must be reserved for JSON-RPC
+func InitFileLogger(logFile, logLevel string) error {
+	// Parse log level
+	var level zapcore.Level
+	switch logLevel {
+	case "trace", "debug":
+		level = zap.DebugLevel
+	case "info":
+		level = zap.InfoLevel
+	case "warn":
+		level = zap.WarnLevel
+	case "error":
+		level = zap.ErrorLevel
+	default:
+		level = zap.InfoLevel
+	}
+
+	atomicLevel.SetLevel(level)
+
+	// Configure for daemon mode (file only, no console)
+	ConfigureForDaemon(logFile, false)
+
+	return nil
+}
+
 func Close() error { //nolint:revive
 	if globalLogger != nil {
 		return globalLogger.Sync()

@@ -12,6 +12,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/memory"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/skill"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 )
@@ -151,6 +152,13 @@ type Turn struct {
 
 	// Agent reference for mailbox injection
 	agent *Agent
+
+	// hookEngine for lifecycle event dispatch
+	hookEngine *middleware.HookEngine
+
+	ralphContext       *RalphContext
+	transcript         *TranscriptWriter
+	continuationReason string
 }
 
 // TurnConfig holds configuration for Turn creation
@@ -165,10 +173,13 @@ type TurnConfig struct {
 	IsSubAgent                bool
 	AgentConfig               *config.Config
 	SkillManager              *skill.Manager
-	TUIScheduler              *TUIScheduler        // optional: enables /loop and /schedule commands
-	CachedSystemPromptBuilder *SystemPromptBuilder // optional: reuse preloaded user info
-	SessionID                 string               // optional: session ID for task isolation (Phase 2)
-	Agent                     *Agent               // optional: agent reference for mailbox injection
+	TUIScheduler              *TUIScheduler          // optional: enables /loop and /schedule commands
+	CachedSystemPromptBuilder *SystemPromptBuilder   // optional: reuse preloaded user info
+	SessionID                 string                 // optional: session ID for task isolation (Phase 2)
+	Agent                     *Agent                 // optional: agent reference for mailbox injection
+	HookEngine                *middleware.HookEngine // optional: hook engine for lifecycle events
+	RalphContext              *RalphContext
+	Transcript                *TranscriptWriter
 }
 
 // NewTurn creates a new Turn instance
@@ -218,35 +229,16 @@ func NewTurnWithMultimodal(userInput string, images []llm.MultimodalImage, confi
 		completionCriteria.LoopDetectionEnabled = true
 	}
 
-	// Use correct SystemPromptBuilder constructor with proper arguments
 	tools := configInput.Tools
 	if tools == nil {
 		tools = []interfaces.Tool{}
 	}
-	spb := NewSystemPromptBuilder(configInput.WorkingDir, tools, configInput.MemoryManager, cfg)
-
-	// Reuse preloaded user info from agent if available, avoiding redundant detection.
-	// Only enter this path when PreloadUserInfo() was actually called; otherwise the
-	// userInfoReady channel is never closed and we would block for the full timeout
-	// on every turn creation (e.g. when AutoDetectUserInfo=false in tests).
-	if configInput.CachedSystemPromptBuilder != nil && configInput.CachedSystemPromptBuilder.preloadStarted.Load() {
-		cached := configInput.CachedSystemPromptBuilder
-		// Wait briefly for the preload to finish before copying the result.
-		// Only copy cachedUserInfo after observing userInfoReady closed to avoid a
-		// data race with the writer goroutine in cached.loadUserInfo().
-		select {
-		case <-cached.userInfoReady:
-			// Pre-populate the cache only after synchronization with the writer.
-			// loadUserInfo() will see it's already set and skip detection.
-			spb.cachedUserInfo = cached.cachedUserInfo
-			spb.preloadStarted.Store(true)
-			// Start a goroutine that will fast-path through loadUserInfo (cachedUserInfo != nil)
-			// and close userInfoReady, unblocking any concurrent getUserInfo() calls.
-			go spb.loadUserInfo()
-		case <-time.After(5 * time.Second):
-			// Preload timed out; let the new builder run its own detection when needed.
-			logger.Warn("Timed out waiting for cached system prompt builder preload; proceeding without cached user info")
-		}
+	spb := configInput.CachedSystemPromptBuilder
+	if spb != nil {
+		spb.UpdateContext(configInput.WorkingDir, configInput.MemoryManager, cfg)
+		spb.UpdateTools(tools)
+	} else {
+		spb = NewSystemPromptBuilder(configInput.WorkingDir, tools, configInput.MemoryManager, cfg)
 	}
 
 	// Wire skill manager into the system prompt builder
@@ -273,6 +265,9 @@ func NewTurnWithMultimodal(userInput string, images []llm.MultimodalImage, confi
 		agentConfig:         cfg,
 		images:              images,
 		agent:               configInput.Agent,
+		hookEngine:          configInput.HookEngine,
+		ralphContext:        configInput.RalphContext,
+		transcript:          configInput.Transcript,
 
 		Goals:       make([]TaskGoal, 0),
 		Status:      CompletionStatus{IsComplete: false, Progress: 0.0},
@@ -281,6 +276,16 @@ func NewTurnWithMultimodal(userInput string, images []llm.MultimodalImage, confi
 		ToolResults: make([]interfaces.ToolResult, 0),
 		TokenStats:  &event.TokenStats{},
 	}
+}
+
+func (t *Turn) ContinuationReason() string {
+	if t == nil {
+		return ""
+	}
+	if t.continuationReason != "" {
+		return t.continuationReason
+	}
+	return "Continue the task."
 }
 
 // CompressMessages compresses conversation history when needed
@@ -303,6 +308,22 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 	// Snapshot messages before compression to build event previews
 	beforeMessages := make([]llm.Message, len(t.Messages))
 	copy(beforeMessages, t.Messages)
+
+	// M1F: PreCompact hook — allow user-defined hooks to observe or block
+	// compaction before it happens.
+	if t.hookEngine != nil {
+		preParams := map[string]interface{}{
+			"session_id":             t.SessionID,
+			"turn_id":                t.ID,
+			"original_message_count": len(t.Messages),
+			"force":                  force,
+		}
+		if dec, herr := t.hookEngine.Execute(ctx, middleware.HookPreCompact, "context_compaction", preParams); herr != nil {
+			logger.Warnf("PreCompact hook execution error: %v", herr)
+		} else if dec != nil && dec.Action == middleware.ActionBlock {
+			return fmt.Errorf("compaction blocked by hook: %s", dec.Reason)
+		}
+	}
 
 	compressedMessages, compressionInfo, err := compressionStrategy.CompressMessages(ctx, t.LLMClient, t.Messages, force)
 	if err != nil {
@@ -374,6 +395,24 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 				WithMetadata("after_full", afterFull)
 			t.eventHandler(compressionEvent)
 		}
+
+		// M1F: PostCompact hook — fired after a successful compaction, with stats.
+		if t.hookEngine != nil {
+			postParams := map[string]interface{}{
+				"session_id":               t.SessionID,
+				"turn_id":                  t.ID,
+				"original_tokens":          compressionInfo.OriginalTokens,
+				"compressed_tokens":        compressionInfo.CompressedTokens,
+				"compressed_message_count": compressionInfo.MessagesAfter,
+				"messages_before":          compressionInfo.MessagesBefore,
+				"tokens_saved":             compressionInfo.TokensSaved,
+				"compression_ratio":        compressionInfo.CompressionRatio,
+				"triggered_by":             compressionInfo.TriggeredBy,
+			}
+			if _, herr := t.hookEngine.Execute(ctx, middleware.HookPostCompact, "context_compaction", postParams); herr != nil {
+				logger.Warnf("PostCompact hook execution error: %v", herr)
+			}
+		}
 	} else {
 		logger.Info("No compression performed - messages or info is nil")
 	}
@@ -382,6 +421,11 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 
 // ShouldCompress determines if compression is needed
 func (t *Turn) ShouldCompress() bool {
+	if t.agentConfig != nil && !t.agentConfig.ContextConfig.EnableCompression {
+		logger.Info("Skipping compression: disabled in config")
+		return false
+	}
+
 	compressionStrategy := t.compressionStrategy
 	if compressionStrategy == nil {
 		logger.Warn("Compression strategy is nil in ShouldCompress, creating new one")
@@ -684,6 +728,16 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 	var toolCalls []*tools.ToolCall
 	var reasoning string
 
+	wrappedHandler := func(streamEvent event.StreamEvent) {
+		if streamEvent.Type == event.EventTypeTokenStats &&
+			streamEvent.TokenStats != nil {
+			t.populateContextUsage(streamEvent.TokenStats)
+		}
+		if t.eventHandler != nil {
+			t.eventHandler(streamEvent)
+		}
+	}
+
 	err := t.LLMClient.StreamCompletion(ctx, t.Messages, func(streamEvent event.StreamEvent) {
 		// Handle streaming events
 		switch streamEvent.Type {
@@ -691,17 +745,19 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 			response = streamEvent.Content
 			toolCalls = streamEvent.ToolCalls
 			reasoning = streamEvent.Reasoning
+		case event.EventTypeToolCall:
+			toolCalls = streamEvent.ToolCalls
 		case event.EventTypeTokenStats:
 			if streamEvent.TokenStats != nil {
 				// Directly use event-provided TokenStats for accuracy
 				t.TokenStats = streamEvent.TokenStats
+				t.populateContextUsage(t.TokenStats)
+				streamEvent.TokenStats = t.TokenStats
 			}
 		}
 
-		// Forward events to turn's event handler if available
-		if t.eventHandler != nil {
-			t.eventHandler(streamEvent)
-		}
+		// Forward events to turn's event handler after lifecycle metadata is filled.
+		wrappedHandler(streamEvent)
 	})
 
 	if err != nil {
@@ -731,6 +787,7 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 	// Append assistant message to conversation
 	if response != "" || len(toolCalls) > 0 {
 		t.Messages = append(t.Messages, assistantMsg)
+		t.appendTranscriptMessage("assistant", assistantMsg)
 	}
 	if response != "" {
 		t.Response.WriteString(response)
@@ -742,6 +799,38 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 	t.CompletionCriteria.CurrentIteration++
 
 	return response, toolCalls, nil
+}
+
+func (t *Turn) populateContextUsage(stats *event.TokenStats) {
+	if stats == nil {
+		return
+	}
+	if t.compressionStrategy != nil {
+		ctxStatus := t.compressionStrategy.Status(t.Messages, t.systemPrompt, t.lastCompressionInfo)
+		stats.ContextWindowMax = ctxStatus.MaxTokens
+		stats.ContextUsedTokens = ctxStatus.EstimatedTokens
+		return
+	}
+	if max := t.deriveContextWindowMaxFallback(); max > 0 {
+		stats.ContextWindowMax = max
+		stats.ContextUsedTokens = stats.InputTokens
+	}
+}
+
+func (t *Turn) deriveContextWindowMaxFallback() int {
+	if t.agentConfig == nil {
+		return 0
+	}
+	if max := t.agentConfig.ContextConfig.MaxTokens; max > 0 {
+		return max
+	}
+	if window := t.agentConfig.ContextConfig.ModelContextWindow; window > 0 {
+		return window
+	}
+	if t.agentConfig.Model == "" {
+		return 0
+	}
+	return llm.InferModelProfile(t.agentConfig.Model).ContextWindow
 }
 
 // buildUnifiedSystemPrompt builds the system prompt using the SystemPromptBuilder
@@ -841,6 +930,7 @@ func (t *Turn) addToolResultsToContext(toolResults map[string]*interfaces.ToolRe
 		}
 
 		t.Messages = append(t.Messages, toolMessage)
+		t.appendTranscriptMessage("tool_result", toolMessage)
 		delete(pendingCallIDs, toolID)
 
 		// Add to tool results tracking
@@ -873,11 +963,13 @@ func (t *Turn) addToolResultsToContext(toolResults map[string]*interfaces.ToolRe
 	// synthetic "tool unavailable" message so the conversation stays well-formed.
 	for callID := range pendingCallIDs {
 		logger.Warnf("No tool result found for tool_call_id %s – injecting placeholder to keep context consistent", callID)
-		t.Messages = append(t.Messages, llm.Message{
+		placeholder := llm.Message{
 			Role:       "tool",
 			Content:    "Tool execution result unavailable.",
 			ToolCallID: callID,
-		})
+		}
+		t.Messages = append(t.Messages, placeholder)
+		t.appendTranscriptMessage("tool_result", placeholder)
 	}
 
 	logger.Debugf("Added %d tool results to conversation context", len(toolResults))

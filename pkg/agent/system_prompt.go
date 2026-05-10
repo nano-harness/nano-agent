@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/logger"
@@ -32,11 +34,16 @@ type SystemPromptBuilder struct {
 	config            *config.Config
 	skillManager      *skill.Manager
 	instructionLoader *InstructionLoader
+	permissionManager *permission.Manager
+	contextAnalyzer   *ContextAnalyzer
 
 	cachedUserInfo *config.UserInfoConfig
 	userInfoOnce   sync.Once
 	userInfoReady  chan struct{}
 	preloadStarted atomic.Bool
+
+	promptCache      sync.Map
+	toolsFingerprint string
 }
 
 // NewSystemPromptBuilder creates a new system prompt builder.
@@ -49,6 +56,8 @@ func NewSystemPromptBuilder(workingDir string, tools []interfaces.Tool, memoryMa
 		config:            cfg,
 		userInfoReady:     make(chan struct{}),
 		instructionLoader: NewInstructionLoader(workingDir),
+		contextAnalyzer:   NewContextAnalyzer(),
+		toolsFingerprint:  toolFingerprint(tools),
 	}
 }
 
@@ -74,12 +83,85 @@ func (spb *SystemPromptBuilder) loadUserInfo() {
 
 // SetSkillManager sets the skill manager for skills-aware prompt building.
 func (spb *SystemPromptBuilder) SetSkillManager(sm *skill.Manager) {
+	if spb.skillManager == sm {
+		return
+	}
 	spb.skillManager = sm
+	spb.InvalidatePromptCache()
+}
+
+// SetPermissionManager sets the permission manager for mode-aware prompt building.
+func (spb *SystemPromptBuilder) SetPermissionManager(pm *permission.Manager) {
+	if spb.permissionManager == pm {
+		return
+	}
+	spb.permissionManager = pm
+	spb.InvalidatePromptCache()
+}
+
+// SetContextAnalyzer sets the context analyzer for work-context prompt hints.
+func (spb *SystemPromptBuilder) SetContextAnalyzer(ca *ContextAnalyzer) {
+	if spb.contextAnalyzer == ca {
+		return
+	}
+	spb.contextAnalyzer = ca
+	spb.InvalidatePromptCache()
 }
 
 // SetInstructionLoader sets the instruction loader for NANO.md-aware prompt building.
 func (spb *SystemPromptBuilder) SetInstructionLoader(il *InstructionLoader) {
+	if spb.instructionLoader == il {
+		return
+	}
 	spb.instructionLoader = il
+	spb.InvalidatePromptCache()
+}
+
+// InvalidatePromptCache clears all cached enhanced system prompts.
+func (spb *SystemPromptBuilder) InvalidatePromptCache() {
+	if spb == nil {
+		return
+	}
+	spb.promptCache.Range(func(key, _ any) bool {
+		spb.promptCache.Delete(key)
+		return true
+	})
+}
+
+// promptCacheKey derives a stable key from inputs that affect prompt content.
+func (spb *SystemPromptBuilder) promptCacheKey(ctx context.Context, goals []string) string {
+	type key struct {
+		WorkingDir    string
+		Goals         []string
+		IsSubAgent    bool
+		ConfigHash    string
+		MemorySummary string
+		Teammate      string
+	}
+	k := key{
+		WorkingDir: spb.workingDir,
+		Goals:      append([]string(nil), goals...),
+	}
+	if spb.config != nil {
+		k.IsSubAgent = spb.config.IsSubAgent
+		if data, err := json.Marshal(spb.config); err == nil {
+			sum := sha256.Sum256(data)
+			k.ConfigHash = fmt.Sprintf("%x", sum)
+		}
+	}
+	if spb.memoryManager != nil {
+		k.MemorySummary = spb.memoryManager.ProjectSummary()
+	}
+	if ctx != nil && swarm.IsTeammate(ctx) {
+		if identity, ok := swarm.FromContext(ctx); ok && identity != nil {
+			k.Teammate = identity.TeamName + "/" + identity.AgentName
+		} else {
+			k.Teammate = "teammate"
+		}
+	}
+	data, _ := json.Marshal(k)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
 }
 
 // isGitRepository checks if the current directory is a git repository
@@ -1100,10 +1182,69 @@ func (spb *SystemPromptBuilder) buildSwarmToolsSection(ctx context.Context) stri
 	return sb.String()
 }
 
+// buildPermissionModeGuidance builds permission mode specific guidance.
+func (spb *SystemPromptBuilder) buildPermissionModeGuidance() string {
+	if spb.permissionManager == nil {
+		return ""
+	}
+
+	mode := spb.permissionManager.GetMode()
+	if mode != permission.ModePlan {
+		// Only add guidance for Plan mode; other modes work as expected
+		return ""
+	}
+
+	return `
+
+# PLAN MODE RESTRICTIONS
+
+**CRITICAL**: You are currently operating in **Plan Mode** - a read-only analysis mode.
+
+## Allowed Tools (Read-Only Operations)
+You may ONLY use the following tools:
+- **File reading**: read_file, list_directory, codebase_search
+- **Code search**: search_files, grep_files
+- **Web research**: web_search, web_fetch
+- **Git inspection**: git log, git show, git diff, git status (read-only git commands)
+- **Shell inspection**: Only read-only shell commands (ls, cat, grep, find, etc.)
+
+## Prohibited Actions
+You MUST NOT attempt to:
+- Write, edit, or delete files
+- Execute shell commands that modify state
+- Run builds, tests, or compilation
+- Create, modify, or delete git commits
+- Install packages or dependencies
+- Modify any system state
+
+## Your Role in Plan Mode
+- **Analyze**: Read and understand the codebase thoroughly
+- **Plan**: Design implementation strategies and document approaches
+- **Research**: Gather information and explore alternatives
+- **Document**: Create detailed plans and recommendations
+- **Report**: Provide comprehensive analysis to the user
+
+## Transitioning Out of Plan Mode
+When the user is ready to proceed with implementation:
+- Use the /permission default command to exit Plan mode
+- The user can also use /yolo or /permission acceptEdits for different permission levels
+
+**Remember**: Plan mode is for safe code analysis and planning. All modification tools are blocked to prevent accidental changes.
+`
+}
+
 // BuildEnhancedSystemPrompt builds an enhanced system prompt with goals.
 // The prompt is assembled via PromptAssembler: cacheable (stable) sections come first,
 // then a cache boundary marker, then dynamic (per-session) sections.
 func (spb *SystemPromptBuilder) BuildEnhancedSystemPrompt(ctx context.Context, goals []string) string {
+	key := spb.promptCacheKey(ctx, goals)
+	if cached, ok := spb.promptCache.Load(key); ok {
+		if prompt, ok := cached.(string); ok {
+			return prompt
+		}
+		spb.promptCache.Delete(key)
+	}
+
 	pa := NewPromptAssembler()
 
 	// ── Cacheable (stable) sections ─────────────────────────────────────────
@@ -1138,6 +1279,15 @@ func (spb *SystemPromptBuilder) BuildEnhancedSystemPrompt(ctx context.Context, g
 	})
 
 	// ── Dynamic (per-session) sections ──────────────────────────────────────
+	// Permission mode guidance (e.g., Plan mode restrictions)
+	pa.AddComponent(&PromptComponent{
+		Name:      "PermissionModeGuidance",
+		Priority:  65,
+		Cacheable: false,
+		Condition: func() bool { return spb.permissionManager != nil },
+		Builder:   spb.buildPermissionModeGuidance,
+	})
+
 	pa.AddComponent(&PromptComponent{
 		Name:      "ProjectMemory",
 		Priority:  70,
@@ -1199,7 +1349,9 @@ func (spb *SystemPromptBuilder) BuildEnhancedSystemPrompt(ctx context.Context, g
 		})
 	}
 
-	return pa.Build()
+	result := pa.Build()
+	spb.promptCache.Store(key, result)
+	return result
 }
 
 // BuildSubAgentDispatchPrompt builds the parallel sub-agent dispatch guidance.
@@ -1356,6 +1508,7 @@ func (spb *SystemPromptBuilder) buildToolsSection() string {
 	prompt.WriteString("- You can call multiple tools in a single response. If you intend to call multiple tools ")
 	prompt.WriteString("and there are no dependencies between them, make all independent tool calls in parallel for maximum efficiency.\n")
 	prompt.WriteString("- Batch independent operations rather than running them sequentially.\n")
+	prompt.WriteString("- Before using non-core tools, you MUST call `discover_tools` first to fetch the full schema.\n")
 
 	// Tool selection priority
 	prompt.WriteString("\n## Tool Selection Priority\n\n")
@@ -1449,6 +1602,23 @@ func (spb *SystemPromptBuilder) buildToolsSection() string {
 			b.WriteString(ex)
 		}
 	}
+	shouldRenderFullSchema := func(tool interfaces.Tool) bool {
+		if tool == nil {
+			return false
+		}
+		if alwaysSystemPromptTool(tool.Name()) {
+			return true
+		}
+		if strings.HasPrefix(tool.Name(), "mcp_") {
+			return false
+		}
+		switch tool.Category() {
+		case interfaces.CategoryFileSystem, interfaces.CategoryShell, interfaces.CategoryAgent:
+			return true
+		default:
+			return false
+		}
+	}
 
 	// Add built-in tools
 	if len(builtInTools) > 0 {
@@ -1457,6 +1627,9 @@ func (spb *SystemPromptBuilder) buildToolsSection() string {
 			fmt.Fprintf(&prompt, "\n\n%s:", strings.Title(string(category))) //nolint:staticcheck
 			for _, tool := range categoryTools {
 				fmt.Fprintf(&prompt, "\n- %s: %s", tool.Name(), tool.Description())
+				if !shouldRenderFullSchema(tool) {
+					continue
+				}
 				fmt.Fprintf(&prompt, "\n  Call name: %s", tool.Name())
 				appendSchema(&prompt, tool.Schema())
 			}
@@ -1472,6 +1645,9 @@ func (spb *SystemPromptBuilder) buildToolsSection() string {
 				// Remove mcp_ prefix for display
 				displayName := strings.TrimPrefix(tool.Name(), fmt.Sprintf("mcp_%s_", serverName))
 				fmt.Fprintf(&prompt, "\n- %s: %s", displayName, tool.Description())
+				if !shouldRenderFullSchema(tool) {
+					continue
+				}
 				fmt.Fprintf(&prompt, "\n  Call name: %s", tool.Name())
 				appendSchema(&prompt, tool.Schema())
 			}
@@ -1479,6 +1655,10 @@ func (spb *SystemPromptBuilder) buildToolsSection() string {
 	}
 
 	return prompt.String()
+}
+
+func alwaysSystemPromptTool(name string) bool {
+	return name == "discover_tools" || name == "discover_skills"
 }
 
 // buildImageToolGuidelines adds specialized guidance for image generation/editing
@@ -1650,6 +1830,9 @@ func (spb *SystemPromptBuilder) buildEnvironmentContext() string {
 	context.WriteString("\n\n# ENVIRONMENT\n\n")
 	fmt.Fprintf(&context, "**Working Directory**: %s\n", spb.workingDir)
 	fmt.Fprintf(&context, "**System Info**: %s (read for OS/timezone/tools details)\n", spb.systemInfoFilePath())
+	if workContext := spb.buildWorkContextLines(); workContext != "" {
+		context.WriteString(workContext)
+	}
 
 	if isGit {
 		context.WriteString("**Git**: Repository detected - git operations available\n")
@@ -1661,6 +1844,24 @@ func (spb *SystemPromptBuilder) buildEnvironmentContext() string {
 		context.WriteString("**Environment**: Local development (full access, shell commands available)\n")
 	}
 
+	return context.String()
+}
+
+func (spb *SystemPromptBuilder) buildWorkContextLines() string {
+	if spb.contextAnalyzer == nil {
+		return ""
+	}
+	wc, err := spb.contextAnalyzer.AnalyzeContext(spb.workingDir)
+	if err != nil || wc == nil {
+		return ""
+	}
+	var context strings.Builder
+	if wc.ProjectType != "" {
+		fmt.Fprintf(&context, "Project type: %s\n", wc.ProjectType)
+	}
+	if wc.GitStatus != nil && wc.GitStatus.Branch != "" {
+		fmt.Fprintf(&context, "Git branch: %s (%d modified)\n", wc.GitStatus.Branch, wc.GitStatus.ModifiedCount)
+	}
 	return context.String()
 }
 
@@ -1728,7 +1929,55 @@ Direct response: single-file reads, conceptual questions, quick answers
 
 // UpdateTools updates the available tools
 func (spb *SystemPromptBuilder) UpdateTools(tools []interfaces.Tool) {
+	nextFingerprint := toolFingerprint(tools)
+	if spb.toolsFingerprint == nextFingerprint {
+		spb.tools = tools
+		return
+	}
 	spb.tools = tools
+	spb.toolsFingerprint = nextFingerprint
+	spb.InvalidatePromptCache()
+}
+
+// UpdateContext updates per-session prompt inputs. Prompt cache keys also
+// include config and memory content fingerprints so in-place mutations do not
+// reuse stale prompts.
+func (spb *SystemPromptBuilder) UpdateContext(workingDir string, memoryManager *memory.Manager, cfg *config.Config) {
+	if spb == nil {
+		return
+	}
+	changed := spb.workingDir != workingDir || spb.memoryManager != memoryManager || spb.config != cfg
+	spb.workingDir = workingDir
+	spb.memoryManager = memoryManager
+	spb.config = cfg
+	if changed {
+		spb.InvalidatePromptCache()
+	}
+}
+
+func toolFingerprint(tools []interfaces.Tool) string {
+	type toolInfo struct {
+		Name        string
+		Description string
+		Category    interfaces.ToolCategory
+		Schema      *interfaces.ToolSchema
+	}
+	infos := make([]toolInfo, 0, len(tools))
+	for _, tool := range tools {
+		if tool == nil {
+			continue
+		}
+		infos = append(infos, toolInfo{
+			Name:        tool.Name(),
+			Description: tool.Description(),
+			Category:    tool.Category(),
+			Schema:      tool.Schema(),
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
+	data, _ := json.Marshal(infos)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
 }
 
 // BuildSynthesisPrompt creates the system prompt for final response synthesis
@@ -1862,7 +2111,7 @@ func escapeMarkdownTableCell(text string) string {
 	return text
 }
 
-// buildActiveSkillsSection injects the full instructions of currently active skills.
+// buildActiveSkillsSection injects metadata for currently active skills.
 func (spb *SystemPromptBuilder) buildActiveSkillsSection() string {
 	if spb.skillManager == nil {
 		return ""
@@ -1874,13 +2123,13 @@ func (spb *SystemPromptBuilder) buildActiveSkillsSection() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("\n## Active Skill Instructions\n\n")
-	sb.WriteString("Follow the instructions from these activated skills:\n\n")
+	sb.WriteString("\n## Active Skills\n\n")
+	sb.WriteString("The following skills are active for this session. ")
+	sb.WriteString("Their full Instructions are NOT included in this prompt to save context. ")
+	sb.WriteString("Before acting on an active skill, you MUST call `discover_skills` to fetch its full content.\n\n")
 
 	for _, s := range activeSkills {
-		fmt.Fprintf(&sb, "### [%s] %s\n\n", s.Name, s.Description)
-		sb.WriteString(s.Instructions)
-		sb.WriteString("\n\n")
+		fmt.Fprintf(&sb, "- **%s**: %s\n", s.Name, s.Description)
 	}
 
 	return sb.String()

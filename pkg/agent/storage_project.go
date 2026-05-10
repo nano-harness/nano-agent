@@ -104,51 +104,78 @@ func (s *ProjectSessionStorage) SaveSession(session *Session) error {
 
 	// Convert session history to events
 	events := MessagesToSessionEvents(session.GetConversationHistory())
+	lastDiskSeq, persistedMessages, err := s.getJournalStatsLocked(session.ID)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to get journal stats: %w", err)
+	}
+	if len(events) < persistedMessages {
+		logger.Warnf("Session %s has fewer in-memory messages (%d) than persisted message events (%d); rewriting journal", session.ID, len(events), persistedMessages)
+		lastDiskSeq = 0
+		persistedMessages = 0
+	}
+	for i := range events {
+		if lastDiskSeq == 0 {
+			events[i].Seq = int64(i + 1)
+			continue
+		}
+		events[i].Seq = lastDiskSeq + int64(i-persistedMessages+1)
+	}
 
-	// Write to JSONL file
 	sessionPath := filepath.Join(s.sessionsDir, session.ID+".jsonl")
-	tmpPath := sessionPath + ".tmp"
-
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+	var f *os.File
+	if lastDiskSeq == 0 {
+		tmpPath := sessionPath + ".tmp"
+		f, err = os.Create(tmpPath)
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+		defer func() { _ = os.Remove(tmpPath) }()
+		defer func() { _ = f.Close() }()
+	} else {
+		f, err = os.OpenFile(sessionPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open session file for append: %w", err)
+		}
+		defer func() { _ = f.Close() }()
 	}
 
 	for _, event := range events {
+		if lastDiskSeq > 0 && event.Seq <= lastDiskSeq {
+			continue
+		}
 		line, err := event.ToJSONL()
 		if err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmpPath)
 			return fmt.Errorf("failed to marshal event: %w", err)
 		}
 		if _, err := f.Write(line); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmpPath)
 			return fmt.Errorf("failed to write event: %w", err)
 		}
 	}
 
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, sessionPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("failed to rename temp file: %w", err)
+	if lastDiskSeq == 0 {
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("failed to close temp file: %w", err)
+		}
+		if err := os.Rename(sessionPath+".tmp", sessionPath); err != nil {
+			return fmt.Errorf("failed to rename temp file: %w", err)
+		}
 	}
 
 	// Update index
 	summary := extractSummary(session)
 
 	entry := SessionIndexEntry{
-		ID:           session.ID,
-		Summary:      summary,
-		MessageCount: len(session.GetConversationHistory()),
-		CreatedAt:    session.CreatedAt.Unix(),
-		ModifiedAt:   time.Now().Unix(),
-		WorkingDir:   s.workingDir,
+		ID:                session.ID,
+		Summary:           summary,
+		MessageCount:      len(session.GetConversationHistory()),
+		CreatedAt:         session.CreatedAt.Unix(),
+		ModifiedAt:        time.Now().Unix(),
+		WorkingDir:        s.workingDir,
+		LastSeq:           maxSeqFromEvents(events, lastDiskSeq),
+		State:             string(session.GetState()),
+		LastCompactionSeq: session.LastCompactionSeq,
 	}
+	session.LastPersistedSeq = maxSeqFromEvents(events, lastDiskSeq)
 
 	return s.updateIndex(entry)
 }
@@ -174,29 +201,9 @@ func (s *ProjectSessionStorage) LoadSession(id string) (*Session, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	// Read JSONL events with increased buffer size for large events
-	var events []SessionEvent
-	scanner := bufio.NewScanner(f)
-	// Increase buffer size to 1MB to handle large events (e.g., with images)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		event, err := ParseJSONL(line)
-		if err != nil {
-			logger.Warnf("Failed to parse JSONL line in session %s: %v", id, err)
-			continue
-		}
-		events = append(events, *event)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read session file: %w", err)
+	events, maxSeq, lastCompactionSeq, err := readSessionEvents(f, id)
+	if err != nil {
+		return nil, err
 	}
 
 	// Convert events to messages
@@ -213,7 +220,22 @@ func (s *ProjectSessionStorage) LoadSession(id string) (*Session, error) {
 		if entry.Summary != "" {
 			session.SetMetadata("title", entry.Summary)
 		}
+		session.LastCompactionSeq = entry.LastCompactionSeq
+		if entry.State != "" {
+			session.State = SessionState(entry.State)
+		}
 	}
+	if session.State == "" {
+		session.State = SessionStateIdle
+	}
+	if session.StateChangedAt.IsZero() {
+		session.StateChangedAt = session.LastActiveAt
+	}
+	session.LastPersistedSeq = maxSeq
+	if lastCompactionSeq > session.LastCompactionSeq {
+		session.LastCompactionSeq = lastCompactionSeq
+	}
+	session.SanitizeMessageSequence()
 
 	return session, nil
 }
@@ -253,6 +275,8 @@ func (s *ProjectSessionStorage) ListSessionInfos() ([]SessionInfo, error) {
 			Title:        entry.Summary,
 			MessageCount: entry.MessageCount,
 			WorkingDir:   entry.WorkingDir,
+			State:        entry.State,
+			LastSeq:      entry.LastSeq,
 			CreatedAt:    time.Unix(entry.CreatedAt, 0).Format(time.RFC3339),
 			UpdatedAt:    time.Unix(entry.ModifiedAt, 0).Format(time.RFC3339),
 		}
@@ -302,8 +326,8 @@ func (s *ProjectSessionStorage) GetLatestSessionID() (string, error) {
 	return infos[0].ID, nil
 }
 
-// AppendEvent appends a single event to a session's JSONL file (real-time writing)
-func (s *ProjectSessionStorage) AppendEvent(sessionID string, event SessionEvent) error {
+// AppendSessionEvent appends a single event to a session's JSONL file (real-time writing)
+func (s *ProjectSessionStorage) AppendSessionEvent(sessionID string, event SessionEvent) error {
 	// Validate session ID
 	if err := validateSessionID(sessionID); err != nil {
 		return fmt.Errorf("invalid session ID: %w", err)
@@ -311,6 +335,9 @@ func (s *ProjectSessionStorage) AppendEvent(sessionID string, event SessionEvent
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if event.Timestamp == 0 {
+		event.Timestamp = time.Now().Unix()
+	}
 
 	sessionPath := filepath.Join(s.sessionsDir, sessionID+".jsonl")
 
@@ -328,6 +355,11 @@ func (s *ProjectSessionStorage) AppendEvent(sessionID string, event SessionEvent
 	if _, err := f.Write(line); err != nil {
 		return fmt.Errorf("failed to write event: %w", err)
 	}
+	if event.Type == SessionEventTypeCheckpoint || event.Type == SessionEventTypeCompactionMarker {
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("failed to fsync checkpoint event: %w", err)
+		}
+	}
 
 	// Update index to reflect the change
 	entry, err := s.getIndexEntry(sessionID)
@@ -343,9 +375,157 @@ func (s *ProjectSessionStorage) AppendEvent(sessionID string, event SessionEvent
 
 	// Update modification time and message count
 	entry.ModifiedAt = event.Timestamp
-	entry.MessageCount++
+	if event.Role != "" {
+		entry.MessageCount++
+	}
+	if event.Seq > entry.LastSeq {
+		entry.LastSeq = event.Seq
+	}
+	if event.Type == SessionEventTypeCompactionMarker {
+		entry.LastCompactionSeq = event.Seq
+	}
+	if event.Type == SessionEventTypeStateTransition && event.StateTransition != nil {
+		entry.State = event.StateTransition.To
+	}
 
 	return s.updateIndex(*entry)
+}
+
+// AppendEvent is kept for compatibility with existing callers.
+func (s *ProjectSessionStorage) AppendEvent(sessionID string, event SessionEvent) error {
+	return s.AppendSessionEvent(sessionID, event)
+}
+
+// LoadEventsFromSeq loads events with Seq greater than fromSeq.
+func (s *ProjectSessionStorage) LoadEventsFromSeq(sessionID string, fromSeq int64) ([]SessionEvent, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return nil, fmt.Errorf("invalid session ID: %w", err)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	f, err := os.Open(filepath.Join(s.sessionsDir, sessionID+".jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	events, _, _, err := readSessionEvents(f, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]SessionEvent, 0, len(events))
+	for _, ev := range events {
+		if ev.Seq > fromSeq {
+			filtered = append(filtered, ev)
+		}
+	}
+	return filtered, nil
+}
+
+// WriteCheckpoint writes a durable compaction marker event.
+func (s *ProjectSessionStorage) WriteCheckpoint(sessionID string, marker CompactionMarker) error {
+	lastSeq, err := s.GetLastSeq(sessionID)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return s.AppendSessionEvent(sessionID, SessionEvent{
+		Type:       SessionEventTypeCompactionMarker,
+		Seq:        lastSeq + 1,
+		Compaction: &marker,
+		Timestamp:  time.Now().Unix(),
+	})
+}
+
+// GetLastSeq returns the highest sequence number in a session journal.
+func (s *ProjectSessionStorage) GetLastSeq(sessionID string) (int64, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return 0, fmt.Errorf("invalid session ID: %w", err)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getLastSeqLocked(sessionID)
+}
+
+func (s *ProjectSessionStorage) getLastSeqLocked(sessionID string) (int64, error) {
+	lastSeq, _, err := s.getJournalStatsLocked(sessionID)
+	return lastSeq, err
+}
+
+func (s *ProjectSessionStorage) getJournalStatsLocked(sessionID string) (int64, int, error) {
+	f, err := os.Open(filepath.Join(s.sessionsDir, sessionID+".jsonl"))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = f.Close() }()
+	events, maxSeq, _, err := readSessionEvents(f, sessionID)
+	if err != nil {
+		return 0, 0, err
+	}
+	messageCount := 0
+	for _, ev := range events {
+		if ev.Role != "" {
+			messageCount++
+		}
+	}
+	return maxSeq, messageCount, nil
+}
+
+func maxSeqFromEvents(events []SessionEvent, fallback int64) int64 {
+	maxSeq := fallback
+	for _, ev := range events {
+		if ev.Seq > maxSeq {
+			maxSeq = ev.Seq
+		}
+	}
+	return maxSeq
+}
+
+func readSessionEvents(r *os.File, sessionID string) ([]SessionEvent, int64, int64, error) {
+	var events []SessionEvent
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	var maxSeq int64
+	var lastCompactionSeq int64
+	var afterCompaction []SessionEvent
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		event, err := ParseJSONL(line)
+		if err != nil {
+			logger.Warnf("Failed to parse JSONL line in session %s: %v", sessionID, err)
+			continue
+		}
+		if event.Seq == 0 {
+			maxSeq++
+			event.Seq = maxSeq
+		} else if event.Seq > maxSeq {
+			maxSeq = event.Seq
+		}
+		if event.Type == SessionEventTypeCompactionMarker {
+			lastCompactionSeq = event.Seq
+			afterCompaction = afterCompaction[:0]
+			if len(events) > 0 {
+				prev := events[len(events)-1]
+				if prev.Role != "" {
+					afterCompaction = append(afterCompaction, prev)
+				}
+			}
+			events = append(events, *event)
+			continue
+		}
+		afterCompaction = append(afterCompaction, *event)
+		events = append(events, *event)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to read session file: %w", err)
+	}
+	if lastCompactionSeq > 0 {
+		events = afterCompaction
+	}
+	return events, maxSeq, lastCompactionSeq, nil
 }
 
 // loadIndex loads the sessions index

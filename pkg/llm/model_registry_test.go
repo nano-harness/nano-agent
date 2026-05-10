@@ -53,6 +53,27 @@ func TestInferModelProfile_VendorPrefix(t *testing.T) {
 	}
 }
 
+func TestInferModelProfile_AliyunDashVendorPrefix(t *testing.T) {
+	p := InferModelProfile("aliyun-glm-5.1")
+	if p.ContextWindow != modelRegistry["glm-5.1"].ContextWindow {
+		t.Fatalf("ContextWindow = %d, want glm-5.1 profile", p.ContextWindow)
+	}
+}
+
+func TestInferModelProfile_MultiLayerDashVendorPrefix(t *testing.T) {
+	p := InferModelProfile("provider-org-glm-4.6")
+	if p.ContextWindow != modelRegistry["glm-4.6"].ContextWindow {
+		t.Fatalf("ContextWindow = %d, want glm-4.6 profile", p.ContextWindow)
+	}
+}
+
+func TestInferModelProfile_DoesNotSplitLettersForVendorPrefix(t *testing.T) {
+	p := InferModelProfile("xglm-5.1")
+	if p.ContextWindow == modelRegistry["glm-5.1"].ContextWindow {
+		t.Fatalf("xglm-5.1 should not match glm-5.1 profile: %+v", p)
+	}
+}
+
 func TestInferModelProfile_PrefixMatch(t *testing.T) {
 	cases := []struct {
 		model       string

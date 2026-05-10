@@ -29,6 +29,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/nano-harness/nano-agent/pkg/sandbox"
 	"github.com/nano-harness/nano-agent/pkg/slash"
 	"github.com/nano-harness/nano-agent/pkg/version"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
@@ -53,12 +54,17 @@ type Server struct {
 	activeTasks map[string]*ActiveTask
 	tasksMutex  sync.RWMutex
 	draining    bool
+	deleted     map[string]struct{}
 
 	// engineManaged indicates that scheduler lifecycle is managed by Engine
 	engineManaged bool
 
 	// teamLeadRegistry manages team-lead sessions (optional, nil if not using teams)
 	teamLeadRegistry *TeamLeadRegistry
+}
+
+type routeHealthSnapshotProvider interface {
+	HealthSnapshot() map[string]map[string]any
 }
 
 // ActiveTask represents a running task that can be cancelled
@@ -148,7 +154,6 @@ func NewServer(agentInstance *agent.Agent, daemonConfig *config.DaemonConfig) *S
 		agent:         agentInstance,
 		config:        daemonConfig,
 		systemMonitor: systemMonitor,
-		activeTasks:   make(map[string]*ActiveTask),
 		startTime:     time.Now(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool {
@@ -157,6 +162,7 @@ func NewServer(agentInstance *agent.Agent, daemonConfig *config.DaemonConfig) *S
 			EnableCompression: false, // Disable compression to avoid RSV bit issues
 		},
 	}
+	server.initTaskStateLocked()
 
 	server.scheduler = cron.New(func(command string) error {
 		sessionID := fmt.Sprintf("scheduled-%d", time.Now().Unix())
@@ -169,10 +175,57 @@ func NewServer(agentInstance *agent.Agent, daemonConfig *config.DaemonConfig) *S
 	// This can be disabled by setting NANO_DISABLE_TEAM_SESSIONS=true
 	if os.Getenv("NANO_DISABLE_TEAM_SESSIONS") != "true" {
 		server.teamLeadRegistry = NewTeamLeadRegistry(30 * time.Minute)
+		if agentInstance != nil && agentInstance.GetSessionManager() != nil {
+			server.teamLeadRegistry.SetSessionManager(agentInstance.GetSessionManager())
+			agentInstance.GetSessionManager().AddLifecycleHook(server.teamLeadRegistry)
+		}
 		logger.Info("Team-lead session registry initialized")
+	}
+	if agentInstance != nil && agentInstance.GetSessionManager() != nil {
+		agentInstance.GetSessionManager().AddLifecycleHook(server)
 	}
 
 	return server
+}
+
+// OnSessionLifecycle links agent session lifecycle events to daemon active tasks and scribes.
+func (ds *Server) OnSessionLifecycle(ctx context.Context, sessionID string, ev agent.SessionLifecycleEvent, meta map[string]interface{}) error {
+	if ds == nil {
+		return nil
+	}
+	switch ev {
+	case agent.SessionLifecycleBeforeShutdown, agent.SessionLifecycleBeforeCleanup:
+		ds.tasksMutex.RLock()
+		task := ds.activeTasks[sessionID]
+		ds.tasksMutex.RUnlock()
+		if task == nil {
+			return nil
+		}
+		if task.Cancel != nil && ev == agent.SessionLifecycleBeforeCleanup {
+			task.Cancel()
+		}
+		if task.Scribe != nil {
+			done := make(chan struct{})
+			go func() {
+				task.Scribe.Sync()
+				close(done)
+			}()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-done:
+			}
+		}
+	case agent.SessionLifecycleCleaned:
+		ds.tasksMutex.Lock()
+		task := ds.activeTasks[sessionID]
+		delete(ds.activeTasks, sessionID)
+		ds.tasksMutex.Unlock()
+		if task != nil && task.Scribe != nil {
+			task.Scribe.Close()
+		}
+	}
+	return nil
 }
 
 func (ds *Server) EnableInteractiveApproval() {
@@ -180,6 +233,15 @@ func (ds *Server) EnableInteractiveApproval() {
 		return
 	}
 	ds.agent.SetApprovalHandler(ds.requestToolApproval)
+}
+
+func (ds *Server) initTaskStateLocked() {
+	if ds.activeTasks == nil {
+		ds.activeTasks = make(map[string]*ActiveTask)
+	}
+	if ds.deleted == nil {
+		ds.deleted = make(map[string]struct{})
+	}
 }
 
 func (ds *Server) requestToolApproval(info *agent.ToolCallInfo) bool {
@@ -382,10 +444,15 @@ func (ds *Server) Start() error {
 	defer cancel()
 
 	logger.Info("Shutting down daemon server...")
+	if ds.agent != nil && ds.agent.GetSessionManager() != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), drainTimeout)
+		ds.agent.GetSessionManager().BroadcastShutdown(shutdownCtx)
+		shutdownCancel()
+	}
 
 	// Shutdown team-lead registry if initialized
 	if ds.teamLeadRegistry != nil {
-		if err := ds.teamLeadRegistry.Shutdown(); err != nil {
+		if err := ds.teamLeadRegistry.ShutdownWithTimeout(drainTimeout); err != nil {
 			logger.Warnf("Error shutting down team-lead registry: %v", err)
 		}
 	}
@@ -428,6 +495,11 @@ func (ds *Server) setupRoutes() *mux.Router {
 
 	// Agent status
 	authenticatedAPI.HandleFunc("/status", ds.statusHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/models", ds.modelsHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/models/doctor", ds.modelDoctorHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/model/routes", ds.modelRoutesHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/events", ds.eventsHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/audit", ds.auditHandler).Methods("GET")
 
 	// MCP endpoints
 	authenticatedAPI.HandleFunc("/mcp/status", ds.mcpStatusHandler).Methods("GET")
@@ -448,9 +520,14 @@ func (ds *Server) setupRoutes() *mux.Router {
 
 	// Session management endpoints
 	authenticatedAPI.HandleFunc("/sessions", ds.sessionsHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/sessions/stats", ds.sessionsStatsHandler).Methods("GET")
 	authenticatedAPI.HandleFunc("/sessions/reset", ds.resetSessionHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/sessions/{id}", ds.getSessionHandler).Methods("GET")
 	authenticatedAPI.HandleFunc("/sessions/{id}", ds.deleteSessionHandler).Methods("DELETE")
+	authenticatedAPI.HandleFunc("/sessions/{id}/context/status", ds.sessionContextStatusHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/sessions/{id}/state", ds.sessionStateHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/sessions/{id}/state", ds.setSessionStateHandler).Methods("PUT")
+	authenticatedAPI.HandleFunc("/sessions/{id}/resume", ds.sessionResumeHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/sessions/{id}/execute", ds.sessionExecuteHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/sessions/{id}/cancel", ds.cancelSessionPostHandler).Methods("POST")
 
@@ -567,6 +644,318 @@ func (ds *Server) statusHandler(w http.ResponseWriter, _ *http.Request) {
 		"memory_size":  0,
 		"active_tools": activeTools,
 	})
+}
+
+func (ds *Server) sessionContextStatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if ds.agent == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "agent unavailable"})
+		return
+	}
+	sessionID := mux.Vars(r)["id"]
+	status, ok := ds.agent.GetContextStatus(sessionID)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "session not found", "session_id": sessionID})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id": sessionID,
+		"context":    status,
+	})
+}
+
+func (ds *Server) sessionsStatsHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if ds.agent == nil || ds.agent.GetSessionManager() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "session manager unavailable"})
+		return
+	}
+	snapshot := ds.agent.GetSessionManager().MetricsSnapshot()
+	response := map[string]interface{}{
+		"active":                      snapshot.CountByState[string(agent.SessionStateActive)],
+		"idle":                        snapshot.CountByState[string(agent.SessionStateIdle)],
+		"awaiting_input":              snapshot.CountByState[string(agent.SessionStateAwaitingInput)],
+		"suspended":                   snapshot.CountByState[string(agent.SessionStateSuspended)],
+		"terminated":                  snapshot.CountByState[string(agent.SessionStateTerminated)],
+		"cleanup_reasons":             snapshot.CleanupByReason,
+		"total_loaded":                snapshot.TotalLoaded,
+		"total_persisted_seq_lag_p99": snapshot.TotalPersistedSeqLagP99,
+		"avg_session_lifetime_ms":     snapshot.AvgSessionLifetime.Milliseconds(),
+	}
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (ds *Server) sessionStateHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if ds.agent == nil || ds.agent.GetSessionManager() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "session manager unavailable"})
+		return
+	}
+	sessionID := mux.Vars(r)["id"]
+	session, ok := ds.agent.GetSessionManager().GetSession(sessionID)
+	if !ok || session == nil {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "session not found"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":       sessionID,
+		"state":            session.GetState(),
+		"state_changed_at": session.StateChangedAt,
+	})
+}
+
+func (ds *Server) setSessionStateHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if ds.agent == nil || ds.agent.GetSessionManager() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "session manager unavailable"})
+		return
+	}
+	var req struct {
+		State  agent.SessionState `json:"state"`
+		Reason string             `json:"reason,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "invalid request body"})
+		return
+	}
+	sessionID := mux.Vars(r)["id"]
+	if err := ds.agent.GetSessionManager().TransitionSessionState(sessionID, req.State, req.Reason); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"session_id": sessionID, "state": req.State, "success": true})
+}
+
+func (ds *Server) sessionResumeHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if ds.agent == nil || ds.agent.GetSessionManager() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "session manager unavailable"})
+		return
+	}
+	var req struct {
+		FromSeq int64 `json:"from_seq"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "invalid request body"})
+			return
+		}
+	}
+	sessionID := mux.Vars(r)["id"]
+	storage, ok := ds.agent.GetSessionManager().GetStorage().(agent.IncrementalSessionStorage)
+	if !ok {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "incremental storage unavailable"})
+		return
+	}
+	events, err := storage.LoadEventsFromSeq(sessionID, req.FromSeq)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"session_id": sessionID, "from_seq": req.FromSeq, "events": events})
+}
+
+func (ds *Server) modelsHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"providers": llm.KnownProviderPresets(),
+	})
+}
+
+func (ds *Server) modelDoctorHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	model := ""
+	baseURL := ""
+	if ds.agent != nil && ds.agent.GetConfig() != nil {
+		cfg := ds.agent.GetConfig()
+		model = cfg.Model
+		baseURL = cfg.BaseURL
+	}
+
+	descriptor := llm.DescribeConfiguredModel(baseURL, model)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"configured_model": descriptor,
+		"provider":         descriptor.ProviderID,
+		"base_url":         baseURL,
+		"known":            descriptor.Known,
+	})
+}
+
+func (ds *Server) modelRoutesHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if ds.agent == nil || ds.agent.GetConfig() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "agent config unavailable"})
+		return
+	}
+	routes, err := llm.ResolveRouteList(ds.agent.GetConfig())
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+	breakers := map[string]map[string]any(nil)
+	if routed, ok := ds.agent.GetLLMClient().(routeHealthSnapshotProvider); ok {
+		breakers = routed.HealthSnapshot()
+	}
+	out := make([]map[string]any, 0, len(routes))
+	for _, route := range routes {
+		item := map[string]any{
+			"name":     route.Name,
+			"provider": route.ProviderID,
+			"model":    route.Model,
+			"base_url": route.BaseURL,
+			"profile":  route.Profile,
+			"metrics":  map[string]any{},
+		}
+		if stats, ok := breakers[route.Name]; ok {
+			item["breaker_state"] = stats["state"]
+			item["metrics"] = stats
+		} else {
+			item["breaker_state"] = "unavailable"
+		}
+		out = append(out, item)
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (ds *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
+	ds.queryEventsHandler(w, r, false)
+}
+
+func (ds *Server) auditHandler(w http.ResponseWriter, r *http.Request) {
+	ds.queryEventsHandler(w, r, true)
+}
+
+func (ds *Server) queryEventsHandler(w http.ResponseWriter, r *http.Request, auditOnly bool) {
+	w.Header().Set("Content-Type", "application/json")
+
+	query := r.URL.Query()
+	sinceSeq := parseQueryInt64(query.Get("since_seq"), 0)
+	if sinceSeq == 0 {
+		sinceSeq = parseQueryInt64(query.Get("since"), 0)
+	}
+	limit := parseQueryInt(query.Get("limit"), 200, 1000)
+	sessionID := strings.TrimSpace(query.Get("session_id"))
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(query.Get("session"))
+	}
+	runID := strings.TrimSpace(query.Get("run_id"))
+	eventType := strings.TrimSpace(query.Get("type"))
+	sandboxOnly := strings.EqualFold(query.Get("sandbox"), "true")
+
+	filter := func(ev event.StreamEvent) bool {
+		if sessionID != "" && ev.SessionID != sessionID {
+			return false
+		}
+		if runID != "" && ev.RunID != runID {
+			return false
+		}
+		if eventType != "" && string(ev.Type) != eventType {
+			return false
+		}
+		if sandboxOnly && !sandbox.IsSandboxEventType(string(ev.Type)) {
+			return false
+		}
+		if auditOnly && !isAuditEvent(ev) {
+			return false
+		}
+		return true
+	}
+
+	events := ds.collectStoredEvents(sinceSeq, filter)
+	if len(events) > limit {
+		events = events[len(events)-limit:]
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"events":     events,
+		"count":      len(events),
+		"since_seq":  sinceSeq,
+		"limit":      limit,
+		"audit_only": auditOnly,
+	})
+}
+
+func (ds *Server) collectStoredEvents(sinceSeq int64, filter func(event.StreamEvent) bool) []event.StreamEvent {
+	if ds == nil {
+		return nil
+	}
+	var events []event.StreamEvent
+	ds.tasksMutex.RLock()
+	for _, task := range ds.activeTasks {
+		if task != nil && task.Store != nil {
+			events = append(events, task.Store.Since(sinceSeq, filter)...)
+		}
+	}
+	ds.tasksMutex.RUnlock()
+	if ds.teamLeadRegistry != nil {
+		for _, session := range ds.teamLeadRegistry.List() {
+			if session != nil && session.Store != nil {
+				events = append(events, session.Store.Since(sinceSeq, filter)...)
+			}
+		}
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].Timestamp != events[j].Timestamp {
+			return events[i].Timestamp < events[j].Timestamp
+		}
+		return events[i].Seq < events[j].Seq
+	})
+	return events
+}
+
+func isAuditEvent(ev event.StreamEvent) bool {
+	if sandbox.IsSandboxEventType(string(ev.Type)) || ev.Type == event.EventTypeError {
+		return true
+	}
+	if ev.Type == event.EventTypeWaitingForUser {
+		kind, _ := ev.Metadata["kind"].(string)
+		return strings.Contains(kind, "approval")
+	}
+	if ev.Type == event.EventTypeToolResult || ev.Type == event.EventTypeToolCall {
+		if kind, _ := ev.Metadata["kind"].(string); strings.Contains(kind, "approval") || strings.Contains(kind, "permission") {
+			return true
+		}
+		if decision, ok := ev.Metadata["decision"]; ok && decision != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func parseQueryInt64(value string, fallback int64) int64 {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseQueryInt(value string, fallback, max int) int {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 || parsed > max {
+		return fallback
+	}
+	return parsed
 }
 
 func (ds *Server) generateRunID() string {
@@ -828,12 +1217,16 @@ func (ds *Server) getSessionHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		metadata["type"] = "session"
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":             session.ID,
-			"created_at":     session.CreatedAt,
-			"last_active_at": session.LastActiveAt,
-			"metadata":       metadata,
-			"history":        history,
-			"success":        true,
+			"id":                  session.ID,
+			"created_at":          session.CreatedAt,
+			"last_active_at":      session.LastActiveAt,
+			"state":               session.GetState(),
+			"state_changed_at":    session.StateChangedAt,
+			"last_persisted_seq":  session.LastPersistedSeq,
+			"last_compaction_seq": session.LastCompactionSeq,
+			"metadata":            metadata,
+			"history":             history,
+			"success":             true,
 		})
 		return
 	}
@@ -1121,6 +1514,7 @@ func (ds *Server) cancelSessionHandler(w http.ResponseWriter, r *http.Request) {
 	if ds.agent != nil && ds.agent.GetSessionManager() != nil {
 		sm := ds.agent.GetSessionManager()
 		if _, exists := sm.GetSession(id); exists {
+			_ = sm.TransitionSessionState(id, agent.SessionStateIdle, "user_cancelled")
 			_ = sm.SaveSession(id)
 		}
 	}
@@ -1144,6 +1538,8 @@ func (ds *Server) deleteSessionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ds.tasksMutex.Lock()
+	ds.initTaskStateLocked()
+	ds.deleted[id] = struct{}{}
 	if t, ok := ds.activeTasks[id]; ok && t != nil {
 		if t.Status == "running" && t.Cancel != nil {
 			t.Cancel()
@@ -1155,7 +1551,11 @@ func (ds *Server) deleteSessionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	ds.tasksMutex.Unlock()
 
-	_ = os.RemoveAll(filepath.Join(getRuntimeSessionsDir(), id))
+	if sessionDir, err := runtimeSessionDirForID(id); err == nil {
+		if err := os.RemoveAll(sessionDir); err != nil {
+			logger.Warnf("Failed to remove runtime session directory %q: %v", sessionDir, err)
+		}
+	}
 
 	if ds.agent != nil && ds.agent.GetSessionManager() != nil {
 		if _, err := ds.agent.GetSessionManager().DeleteSession(id); err != nil {
@@ -1174,6 +1574,20 @@ func (ds *Server) deleteSessionHandler(w http.ResponseWriter, r *http.Request) {
 		"message": "session deleted",
 		"id":      id,
 	})
+}
+
+func runtimeSessionDirForID(sessionID string) (string, error) {
+	clean := strings.TrimSpace(sessionID)
+	if clean == "" {
+		return "", fmt.Errorf("invalid session id: empty")
+	}
+	for _, r := range clean {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return "", fmt.Errorf("invalid session id: contains invalid character %q", r)
+	}
+	return filepath.Join(getRuntimeSessionsDir(), clean), nil
 }
 
 func (ds *Server) loadSessionsFromDisk() {
@@ -1440,6 +1854,7 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 
 	// Register task
 	ds.tasksMutex.Lock()
+	delete(ds.deleted, sessionID)
 	if existing, ok := ds.activeTasks[sessionID]; ok && existing != nil && existing.Status == "running" {
 		ds.tasksMutex.Unlock()
 		if cancel != nil {
@@ -1476,6 +1891,9 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 			taskStartEvent.Metadata = map[string]interface{}{
 				"images": sanitizeImages(images),
 			}
+		}
+		if task.Store != nil {
+			taskStartEvent = task.Store.Add(taskStartEvent)
 		}
 		_ = scribe.WriteEvent(taskStartEvent)
 	}
@@ -1582,6 +2000,9 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 		taskKey := sessionID
 		var taskCompleted bool
 		var seq int64
+		if task.Store != nil {
+			seq = task.Store.LastSeq()
+		}
 
 		handler := func(streamEvent event.StreamEvent) {
 			// Augment event
@@ -1659,6 +2080,7 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 
 		// Finalize Task Status
 		ds.tasksMutex.Lock()
+		_, sessionDeleted := ds.deleted[taskKey]
 		if t, exists := ds.activeTasks[taskKey]; exists {
 			t.EndTime = time.Now()
 			t.TokenUsage = lastTokenStats
@@ -1697,7 +2119,7 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 			}
 
 			// Save final metadata
-			if scribe != nil {
+			if scribe != nil && !sessionDeleted {
 				finalMeta := map[string]interface{}{
 					"id":          currentSessionID,
 					"command":     command,
@@ -1716,15 +2138,21 @@ func (ds *Server) startUnifiedTask(command, sessionID string, timeout int, image
 		ds.tasksMutex.Unlock()
 
 		// Ensure session persistence consistency at completion
-		if ds.agent != nil && ds.agent.GetSessionManager() != nil {
+		if !sessionDeleted && ds.agent != nil && ds.agent.GetSessionManager() != nil {
 			sm := ds.agent.GetSessionManager()
-			// Only save if session still exists - don't resurrect deleted sessions
-			if session, exists := sm.GetSession(currentSessionID); exists {
-				// Make sure we save it to disk/OSS
-				_ = sm.SaveSession(currentSessionID)
-				logger.Infof("Saved session %s history to storage upon completion (history length: %d)",
-					currentSessionID, len(session.GetConversationHistory()))
+			ds.tasksMutex.Lock()
+			_, deletedAfterFinalize := ds.deleted[taskKey]
+			if !deletedAfterFinalize {
+				// Only save if session still exists - don't resurrect deleted sessions.
+				// Hold tasksMutex through SaveSession so DELETE cannot race between
+				// the deleted check and the write, then remove files before the save.
+				if session, exists := sm.GetSession(currentSessionID); exists {
+					_ = sm.SaveSession(currentSessionID)
+					logger.Infof("Saved session %s history to storage upon completion (history length: %d)",
+						currentSessionID, len(session.GetConversationHistory()))
+				}
 			}
+			ds.tasksMutex.Unlock()
 		}
 
 		// Schedule cleanup of finished task entry from memory
@@ -2416,34 +2844,31 @@ func (ds *Server) memoryHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// Actually retrieve memory entries
-		ctx := context.Background()
-		result, err := memoryManager.SearchMemory(ctx, "", "", "", 100)
+		entries, err := memoryManager.ListKnowledge(100)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to retrieve memory entries: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		var entries []interface{}
-		count := 0
-
-		if result != "" {
-			// Handle the search result data
-			entries = append(entries, map[string]interface{}{
-				"message": result,
+		responseEntries := make([]interface{}, 0, len(entries))
+		for _, entry := range entries {
+			responseEntries = append(responseEntries, map[string]interface{}{
+				"key":        entry.Key,
+				"content":    entry.Value,
+				"tags":       entry.Tags,
+				"created_at": entry.CreatedAt,
+				"updated_at": entry.UpdatedAt,
 			})
-			count = 1
 		}
 
 		response := map[string]interface{}{
-			"entries": entries,
-			"count":   count,
+			"entries": responseEntries,
+			"count":   len(responseEntries),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(response)
 
 	case "POST":
-		// Actually save memory entry
 		var request struct {
 			Key      string   `json:"key"`
 			Content  string   `json:"content"`
@@ -2456,33 +2881,17 @@ func (ds *Server) memoryHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
-
-		// Set defaults
-		if request.Category == "" {
-			request.Category = "General"
+		if strings.TrimSpace(request.Key) == "" {
+			http.Error(w, "Memory key is required", http.StatusBadRequest)
+			return
 		}
-		if request.Priority == "" {
-			request.Priority = "medium"
-		}
-
-		ctx := context.Background()
-		metadata := map[string]interface{}{
-			"category": request.Category,
-			"tags":     strings.Join(request.Tags, ","),
-			"priority": request.Priority,
+		if strings.TrimSpace(request.Content) == "" {
+			http.Error(w, "Memory content is required", http.StatusBadRequest)
+			return
 		}
 
-		// Convert string content directly to mem0 message format
-		messages := []llm.Message{
-			{
-				Role:    "user",
-				Content: request.Content,
-			},
-		}
-
-		err := memoryManager.SaveMemory(ctx, messages, request.Category, "", metadata)
-
-		if err != nil {
+		tags := memoryRequestTags(request.Tags, request.Category, request.Priority)
+		if err := memoryManager.SetKnowledge(request.Key, request.Content, strings.Join(tags, ",")); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to save memory entry: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -2515,43 +2924,62 @@ func (ds *Server) memoryItemHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// Get memory entry by searching for the key
-		ctx := context.Background()
-		result, err := memoryManager.SearchMemory(ctx, key, "", "", 10)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to retrieve memory entry: %v", err), http.StatusInternalServerError)
+		entry, err := memoryManager.GetKnowledge(key)
+		if err != nil || entry == nil {
+			response := map[string]interface{}{
+				"key":     key,
+				"content": "",
+				"found":   false,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(response)
 			return
-		}
-
-		var found bool
-		var content string
-
-		if result != "" {
-			found = true
-			content = result
 		}
 
 		response := map[string]interface{}{
 			"key":     key,
-			"content": content,
-			"found":   found,
+			"content": entry.Value,
+			"found":   true,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(response)
 
 	case "DELETE":
-		// Note: Current Memory Manager doesn't have a direct delete by ID method
+		if err := memoryManager.DeleteKnowledge(key); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to delete memory entry: %v", err), http.StatusInternalServerError)
+			return
+		}
 		response := map[string]interface{}{
-			"success": false,
+			"success": true,
 			"key":     key,
-			"error":   "Delete operation not yet implemented in Memory Manager",
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotImplemented)
 		_ = json.NewEncoder(w).Encode(response)
 	}
+}
+
+func memoryRequestTags(tags []string, category, priority string) []string {
+	cleaned := make([]string, 0, len(tags)+2)
+	appendClean := func(tag string) {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			return
+		}
+		tag = strings.NewReplacer(",", " ", "\n", " ", "\r", " ").Replace(tag)
+		cleaned = append(cleaned, tag)
+	}
+	for _, tag := range tags {
+		appendClean(tag)
+	}
+	if category != "" {
+		appendClean("category=" + category)
+	}
+	if priority != "" {
+		appendClean("priority=" + priority)
+	}
+	return cleaned
 }
 
 // Utility functions
@@ -2667,6 +3095,15 @@ func (ds *Server) commandsHandler(w http.ResponseWriter, _ *http.Request) {
 		}
 		if len(cmd.AllowedTools) > 0 {
 			entry["allowedTools"] = cmd.AllowedTools
+		}
+		if cmd.PermissionProfile != "" {
+			entry["permissionProfile"] = cmd.PermissionProfile
+		}
+		if len(cmd.Prelude) > 0 {
+			entry["prelude"] = cmd.Prelude
+			entry["preludeTimeoutSeconds"] = cmd.PreludeTimeoutSeconds
+			entry["preludeOnError"] = cmd.PreludeOnError
+			entry["preludeOutput"] = cmd.PreludeOutput
 		}
 		out = append(out, entry)
 	}
@@ -2996,11 +3433,14 @@ func (ds *Server) teamLeadSessionStreamHandler(w http.ResponseWriter, r *http.Re
 			break
 		}
 
-		switch strings.TrimSpace(req.Type) {
+		frameType := strings.TrimSpace(req.Type)
+		switch frameType {
 		case "ping":
 			_ = connManager.SafeWriteJSON(map[string]string{"type": "pong"})
 		case "subscribe":
 			ds.streamTeamLeadReplayAndLive(session, connManager, req.SinceSeq)
+		case "replay":
+			ds.streamTeamLeadReplayOnly(session, connManager, req.SinceSeq)
 		case "cancel":
 			cancelled := session.CancelActiveTasks()
 			_ = connManager.SafeWriteJSON(map[string]interface{}{
@@ -3008,7 +3448,7 @@ func (ds *Server) teamLeadSessionStreamHandler(w http.ResponseWriter, r *http.Re
 				"session_id":      session.ID,
 				"cancelled_tasks": cancelled,
 			})
-		case "tool_approval":
+		case "approve", "reject", "tool_approval":
 			callID := strings.TrimSpace(req.CallID)
 			if callID == "" {
 				_ = connManager.SafeWriteJSON(map[string]interface{}{
@@ -3019,7 +3459,9 @@ func (ds *Server) teamLeadSessionStreamHandler(w http.ResponseWriter, r *http.Re
 				})
 				continue
 			}
-			if err := session.SubmitToolApproval(callID, req.Approved); err != nil {
+			// "reject" intentionally falls through to false.
+			approved := frameType == "approve" || (frameType == "tool_approval" && req.Approved)
+			if err := session.SubmitToolApproval(callID, approved); err != nil {
 				_ = connManager.SafeWriteJSON(map[string]interface{}{
 					"type":       "error",
 					"session_id": session.ID,
@@ -3032,7 +3474,7 @@ func (ds *Server) teamLeadSessionStreamHandler(w http.ResponseWriter, r *http.Re
 				"type":       "tool_approval_ack",
 				"session_id": session.ID,
 				"call_id":    callID,
-				"approved":   req.Approved,
+				"approved":   approved,
 			})
 		case "lead_input":
 			if strings.TrimSpace(req.Command) == "" {
@@ -3090,6 +3532,27 @@ func (ds *Server) teamLeadSessionStreamHandler(w http.ResponseWriter, r *http.Re
 			})
 		}
 	}
+}
+
+// streamTeamLeadReplayOnly writes stored events after sinceSeq and then returns
+// a replay_complete frame without subscribing the connection to live events.
+func (ds *Server) streamTeamLeadReplayOnly(session *TeamLeadSession, connManager *ConnectionManager, sinceSeq int64) {
+	lastSeq := int64(0)
+	var events []event.StreamEvent
+	if session.Store != nil {
+		lastSeq = session.Store.LastSeq()
+		events = session.Store.Since(sinceSeq, func(event.StreamEvent) bool { return true })
+		for _, e := range events {
+			_ = connManager.SafeWriteJSON(e)
+		}
+	}
+	_ = connManager.SafeWriteJSON(map[string]interface{}{
+		"type":       "replay_complete",
+		"session_id": session.ID,
+		"since_seq":  sinceSeq,
+		"last_seq":   lastSeq,
+		"count":      len(events),
+	})
 }
 
 func (ds *Server) streamTeamLeadReplayAndLive(session *TeamLeadSession, connManager *ConnectionManager, sinceSeq int64) {

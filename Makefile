@@ -2,8 +2,10 @@
 # A lightweight AI-powered code generation and modification agent
 
 .PHONY: build clean test lint fmt install help dev run deps check release docker tui-test \
-        test-coverage test-coverage-html test-race benchmark \
-        e2e e2e-daemon e2e-client e2e-tui e2e-binary e2e-expert e2e-coverage \
+         test-coverage test-coverage-html test-race benchmark \
+         test-tui test-e2e test-all \
+         e2e e2e-daemon e2e-client e2e-tui e2e-binary e2e-expert e2e-coverage \
+        smoke smoke-tui \
         lint-check fmt-check vet check-all \
         deps-update deps-check \
         install-local uninstall \
@@ -84,6 +86,16 @@ test-race: ## Run unit tests with race condition detection
 	@echo "Running unit tests with race detection..."
 	@go test -v -race $(shell go list ./... | grep -v /e2e)
 
+test-tui: ## Run Bubble Tea TUI component tests
+	@echo "Running Bubble Tea TUI tests..."
+	@go test -race ./pkg/ui/bubbletea/...
+
+test-e2e: ## Run real PTY TUI e2e tests
+	@echo "Running TUI PTY e2e tests..."
+	@go test -race -tags=e2e -timeout=5m ./e2e/tui/...
+
+test-all: test test-tui test-e2e ## Run unit, TUI, and e2e tests
+
 benchmark: ## Run benchmarks
 	@echo "Running benchmarks..."
 	@go test -bench=. -benchmem ./...
@@ -111,6 +123,16 @@ e2e-expert: ## Run only sub-agent / expert e2e tests
 
 e2e-coverage: ## Run e2e tests with coverage
 	@go test -v -tags=e2e -timeout 10m -coverprofile=e2e-coverage.out -coverpkg=./pkg/... ./e2e/...
+
+# ==================== Smoke Testing ====================
+
+smoke: dev ## Run PTY smoke tests (requires nano binary)
+	@echo "Running PTY smoke tests..."
+	@go test -v -tags=smoke -timeout 5m ./smoke/...
+
+smoke-tui: dev ## Run only TUI smoke tests
+	@echo "Running TUI smoke tests..."
+	@go test -v -tags=smoke -timeout 3m -run "TestSmoke_TUI" ./smoke/...
 
 # ==================== Code Quality ====================
 

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
+	"github.com/nano-harness/nano-agent/pkg/patternutil"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
@@ -59,6 +61,11 @@ type Decision struct {
 	Suggestions []string
 	// AutoWhitelist indicates this operation should be added to session allowlist.
 	AutoWhitelist bool
+	// ModifiedParams contains hook-proposed tool parameter overrides that should
+	// be applied before execution after the final security decision permits it.
+	ModifiedParams map[string]interface{}
+	// AuditMetadata carries structured hook metadata for UI/status integrations.
+	AuditMetadata map[string]interface{}
 }
 
 // ── Read-only auto-approval list ─────────────────────────────────────────────
@@ -108,8 +115,10 @@ var readOnlySubcommands = map[string]map[string]bool{
 		"ps": true, "images": true, "inspect": true, "logs": true,
 		"version": true, "info": true, "stats": true,
 	},
-	"node":   {"--version": true, "-v": true},
-	"python": {"--version": true, "-V": true, "-c": true},
+	"node":    {"--version": true, "-v": true},
+	"nodejs":  {"--version": true, "-v": true},
+	"python":  {"--version": true, "-V": true},
+	"python3": {"--version": true, "-V": true},
 	"make": {
 		"test": true, "check": true, "lint": true,
 	},
@@ -155,6 +164,42 @@ func GetSecurityDecision(ctx context.Context) (*Decision, bool) {
 func HasSecurityDecision(ctx context.Context) bool {
 	d, ok := ctx.Value(securityDecisionKey{}).(*Decision)
 	return ok && d != nil
+}
+
+func copyDecisionParams(in map[string]interface{}) map[string]interface{} {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// MergeDecisionParams returns a shallow copy of base with override entries
+// applied. It is used to apply hook-approved parameter rewrites safely without
+// mutating the original tool call map.
+func MergeDecisionParams(base, override map[string]interface{}) map[string]interface{} {
+	if len(override) == 0 {
+		return copyDecisionParams(base)
+	}
+	out := copyDecisionParams(base)
+	if out == nil {
+		out = make(map[string]interface{}, len(override))
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
+}
+
+func middlewareCommandFromParams(params map[string]interface{}) (string, bool) {
+	if len(params) == 0 {
+		return "", false
+	}
+	command, ok := params["command"].(string)
+	return command, ok && command != ""
 }
 
 // ── Config Rule Engine ────────────────────────────────────────────────────────
@@ -274,7 +319,7 @@ func (e *ConfigRuleEngine) matches(pattern, toolName, command string) bool {
 			exact := strings.TrimSuffix(inner, ":exact")
 			return command == exact
 		}
-		return matchGlob(inner, command)
+		return patternutil.MatchGlob(inner, command)
 	}
 	// Pattern format 2: plain command name (no parentheses, no "/" in pattern).
 	// Treat as a prefix/glob match against the first word of the shell command.
@@ -285,9 +330,9 @@ func (e *ConfigRuleEngine) matches(pattern, toolName, command string) bool {
 			firstWord = command[:idx]
 		}
 		firstWord = filepath.Base(firstWord) // strip any path prefix
-		return matchGlob(pattern, firstWord)
+		return patternutil.MatchGlob(pattern, firstWord)
 	}
-	return matchGlob(pattern, toolName)
+	return patternutil.MatchGlob(pattern, toolName)
 }
 
 // ── Security checkers ─────────────────────────────────────────────────────────
@@ -577,6 +622,166 @@ func (c *protectedPathChecker) Check(pc *ParsedCommand) *Decision {
 	return nil
 }
 
+var defaultSensitiveReadPaths = []string{
+	"/etc/shadow",
+	"/etc/sudoers",
+	"/etc/passwd-",
+	".env",
+	".env.local",
+	".env.production",
+	".env.development",
+	".nano.yaml",
+	".nano.local.yaml",
+	"NANO.local.md",
+	"~/.ssh",
+	"~/.aws",
+	"~/.gcp",
+	"~/.azure",
+	"~/.gnupg",
+	"~/.nano",
+	"~/.config/nano",
+}
+
+// sensitiveReadPathChecker confirms reads of known credential/config paths even
+// when the command itself is otherwise read-only.
+type sensitiveReadPathChecker struct {
+	paths []string
+}
+
+func newSensitiveReadPathChecker(extraPaths []string) *sensitiveReadPathChecker {
+	paths := append([]string{}, defaultSensitiveReadPaths...)
+	paths = append(paths, extraPaths...)
+	return &sensitiveReadPathChecker{paths: normalizeSensitivePaths(paths)}
+}
+
+func normalizeSensitivePaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		normalized := normalizeShellPathArg(p)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func normalizeShellPathArg(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return ""
+	}
+	return filepath.Clean(expandEnvVars(expandTilde(arg)))
+}
+
+func (c *sensitiveReadPathChecker) Name() string { return "SensitiveReadPath" }
+
+func (c *sensitiveReadPathChecker) Check(pc *ParsedCommand) *Decision {
+	for _, stmt := range pc.AllStatements() {
+		for _, arg := range stmt.Args {
+			if arg == "" {
+				continue
+			}
+			candidate := arg
+			if strings.HasPrefix(arg, "-") {
+				_, value, ok := strings.Cut(arg, "=")
+				if !ok || value == "" {
+					continue
+				}
+				candidate = value
+			}
+			if c.matches(candidate) {
+				return &Decision{
+					Action: ActionConfirm,
+					Reason: fmt.Sprintf("read of sensitive path %q requires confirmation", candidate),
+					Rule:   c.Name(),
+					Layer:  LayerAnalyzer,
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (c *sensitiveReadPathChecker) matches(arg string) bool {
+	expanded := normalizeShellPathArg(arg)
+	for _, sensitivePath := range c.paths {
+		if expanded == sensitivePath ||
+			strings.HasPrefix(expanded, sensitivePath+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+var defaultArbitraryExecCommands = []string{
+	"python:-c",
+	"python3:-c",
+	"node:-e",
+	"node:--eval",
+	"nodejs:-e",
+	"bash:-c",
+	"sh:-c",
+	"zsh:-c",
+	"perl:-e",
+	"ruby:-e",
+}
+
+// arbitraryExecChecker confirms one-liner/eval-style interpreter execution.
+type arbitraryExecChecker struct {
+	commands map[string]map[string]bool
+}
+
+func newArbitraryExecChecker(extraPatterns []string) *arbitraryExecChecker {
+	patterns := append([]string{}, defaultArbitraryExecCommands...)
+	patterns = append(patterns, extraPatterns...)
+	commands := make(map[string]map[string]bool)
+	for _, pattern := range patterns {
+		cmd, flag, ok := strings.Cut(strings.TrimSpace(pattern), ":")
+		if !ok {
+			continue
+		}
+		cmd = strings.TrimSpace(cmdBase(cmd))
+		flag = strings.TrimSpace(flag)
+		if cmd == "" || flag == "" {
+			continue
+		}
+		if commands[cmd] == nil {
+			commands[cmd] = make(map[string]bool)
+		}
+		commands[cmd][flag] = true
+	}
+	return &arbitraryExecChecker{commands: commands}
+}
+
+func (c *arbitraryExecChecker) Name() string { return "ArbitraryExec" }
+
+func (c *arbitraryExecChecker) Check(pc *ParsedCommand) *Decision {
+	for _, stmt := range pc.AllStatements() {
+		cmd := cmdBase(stmt.Command)
+		flags := c.commands[cmd]
+		if len(flags) == 0 {
+			continue
+		}
+		for _, arg := range stmt.Args {
+			if flags[arg] {
+				return &Decision{
+					Action: ActionConfirm,
+					Reason: fmt.Sprintf("arbitrary code execution via %s %s requires confirmation", cmd, arg),
+					Rule:   c.Name(),
+					Layer:  LayerAnalyzer,
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func isDestructiveCmd(cmd string) bool {
 	switch cmd {
 	case "rm", "rmdir", "chmod", "chown", "dd", "mkfs", "shred":
@@ -806,8 +1011,8 @@ type SemanticAnalyzer struct {
 }
 
 // DefaultSemanticAnalyzer creates an analyzer with all built-in checkers.
-// Checkers run in order; the first non-nil decision wins, except ReadOnlyAutoApprover
-// which runs first as a fast-path allow.
+// Checkers run in order; the first non-nil decision wins. Confirmation and
+// blocking checks intentionally run before read-only auto-approval.
 func DefaultSemanticAnalyzer() *SemanticAnalyzer {
 	return DefaultSemanticAnalyzerWithWorkdir("")
 }
@@ -815,23 +1020,31 @@ func DefaultSemanticAnalyzer() *SemanticAnalyzer {
 // DefaultSemanticAnalyzerWithWorkdir creates an analyzer with path-aware
 // read-only auto-approval when workdir is non-empty.
 func DefaultSemanticAnalyzerWithWorkdir(workdir string) *SemanticAnalyzer {
+	return DefaultSemanticAnalyzerWithConfig(workdir, nil, nil)
+}
+
+// DefaultSemanticAnalyzerWithConfig creates an analyzer with built-in semantic
+// checks plus caller-provided extensions for sensitive reads and arbitrary exec.
+func DefaultSemanticAnalyzerWithConfig(workdir string, sensitivePaths, arbitraryExec []string) *SemanticAnalyzer {
 	return &SemanticAnalyzer{
 		workdir: workdir,
 		checkers: []SecurityChecker{
-			&readOnlyAutoApprover{workdir: workdir}, // Fast-path allow
-			&safeWriteAutoApprover{},                // Auto-approve safe development commands
-			&unicodeWhitespaceChecker{},             // Block immediately
-			&controlCharChecker{},                   // Block immediately
-			&ifsInjectionChecker{},                  // Block
-			&pipelineInjectionChecker{},             // Block
-			&obfuscationChecker{},                   // Block / Confirm
-			&protectedPathChecker{},                 // Block
-			&broadDeletionChecker{},                 // Block: broad recursive deletion
-			&envVarChecker{},                        // Confirm
-			&envVarPathInjectionChecker{},           // Confirm: env vars in destructive args
-			&destructiveCommandChecker{},            // Confirm
-			&sedValidator{},                         // Block / Confirm
-			&commandSubstitutionChecker{},           // Confirm
+			&unicodeWhitespaceChecker{},                 // Block immediately
+			&controlCharChecker{},                       // Block immediately
+			&ifsInjectionChecker{},                      // Block
+			&pipelineInjectionChecker{},                 // Block
+			&obfuscationChecker{},                       // Block / Confirm
+			newArbitraryExecChecker(arbitraryExec),      // Confirm
+			&protectedPathChecker{},                     // Block
+			newSensitiveReadPathChecker(sensitivePaths), // Confirm
+			&broadDeletionChecker{},                     // Block: broad recursive deletion
+			&envVarChecker{},                            // Confirm
+			&envVarPathInjectionChecker{},               // Confirm: env vars in destructive args
+			&destructiveCommandChecker{},                // Confirm
+			&sedValidator{},                             // Block / Confirm
+			&commandSubstitutionChecker{},               // Confirm
+			&readOnlyAutoApprover{workdir: workdir},     // Auto-approve read-only commands after confirm checks
+			&safeWriteAutoApprover{},                    // Auto-approve safe development commands
 		},
 	}
 }
@@ -879,7 +1092,7 @@ func (a *SemanticAnalyzer) Analyze(command string) (*Decision, error) {
 // CommandGuard is the four-layer command security middleware for shell tool.
 type CommandGuard struct {
 	configRules *ConfigRuleEngine
-	hooks       *HookEngine
+	hooks       *hookservice.Service
 	analyzer    *SemanticAnalyzer
 }
 
@@ -890,10 +1103,27 @@ func NewCommandGuard(allowRules, denyRules []string, hooks []Hook) *CommandGuard
 
 // NewCommandGuardWithWorkdir creates a CommandGuard with path-aware semantic analysis.
 func NewCommandGuardWithWorkdir(allowRules, denyRules []string, hooks []Hook, workdir string) *CommandGuard {
+	return NewCommandGuardWithHookService(allowRules, denyRules, hookservice.New(hooks), workdir)
+}
+
+// NewCommandGuardWithConfig creates a CommandGuard with path-aware semantic
+// analysis and caller-provided security checker extensions.
+func NewCommandGuardWithConfig(allowRules, denyRules []string, hooks []Hook, workdir string, sensitivePaths, arbitraryExec []string) *CommandGuard {
+	return NewCommandGuardWithHookServiceAndConfig(allowRules, denyRules, hookservice.New(hooks), workdir, sensitivePaths, arbitraryExec)
+}
+
+// NewCommandGuardWithHookService creates a CommandGuard with an explicit HookService.
+func NewCommandGuardWithHookService(allowRules, denyRules []string, hooks *hookservice.Service, workdir string) *CommandGuard {
+	return NewCommandGuardWithHookServiceAndConfig(allowRules, denyRules, hooks, workdir, nil, nil)
+}
+
+// NewCommandGuardWithHookServiceAndConfig creates a CommandGuard with an
+// explicit HookService and semantic checker extensions.
+func NewCommandGuardWithHookServiceAndConfig(allowRules, denyRules []string, hooks *hookservice.Service, workdir string, sensitivePaths, arbitraryExec []string) *CommandGuard {
 	return &CommandGuard{
 		configRules: NewConfigRuleEngine(allowRules, denyRules),
-		hooks:       NewHookEngine(hooks),
-		analyzer:    DefaultSemanticAnalyzerWithWorkdir(workdir),
+		hooks:       hooks,
+		analyzer:    DefaultSemanticAnalyzerWithConfig(workdir, sensitivePaths, arbitraryExec),
 	}
 }
 
@@ -906,16 +1136,32 @@ func (g *CommandGuard) Analyze(ctx context.Context, command string) (*Decision, 
 	}
 
 	// Layer 2: Hooks
-	hookDecision, err := g.hooks.Execute(ctx, HookPreToolUse, "run_shell_command", map[string]interface{}{"command": command})
+	hookDecision, err := g.hooks.Execute(ctx, hookservice.EventPreToolUse, "run_shell_command", map[string]interface{}{"command": command})
 	if err != nil {
 		return nil, fmt.Errorf("hook engine error: %w", err)
 	}
-	if hookDecision.Action != ActionAllow {
-		return hookDecision, nil
+	middlewareDecision := hookDecisionToMiddleware(hookDecision)
+	middlewareDecision.Layer = LayerHook
+	if middlewareDecision.Action != ActionAllow {
+		return middlewareDecision, nil
 	}
 
 	// Layer 3: Semantic analyzer (AST + checkers)
-	return g.analyzer.Analyze(command)
+	analyzedCommand := command
+	if nextCommand, ok := middlewareCommandFromParams(hookDecision.ModifiedParams); ok {
+		analyzedCommand = nextCommand
+	}
+	decision, err := g.analyzer.Analyze(analyzedCommand)
+	if err != nil {
+		return nil, err
+	}
+	if len(hookDecision.ModifiedParams) > 0 && decision.Action == ActionAllow {
+		decision.ModifiedParams = copyDecisionParams(hookDecision.ModifiedParams)
+		if decision.Rule == "" {
+			decision.Rule = hookDecision.Rule
+		}
+	}
+	return decision, nil
 }
 
 // ── SecurityMiddleware ────────────────────────────────────────────────────────

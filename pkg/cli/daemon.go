@@ -85,7 +85,7 @@ func newDaemonStartCommand() *cobra.Command {
 		Use:   "start",
 		Short: "Start nano daemon in background",
 		Long:  `Start the nano agent as a background daemon process.`,
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			manager := daemon.NewManager()
 
 			// Load configuration
@@ -96,7 +96,7 @@ func newDaemonStartCommand() *cobra.Command {
 			// Start daemon
 			if err := manager.Start(true); err != nil {
 				color.Red("❌ Failed to start daemon: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to start daemon: %w", err)
 			}
 
 			config := manager.GetConfig()
@@ -106,6 +106,7 @@ func newDaemonStartCommand() *cobra.Command {
 			if config.LogFile != "" {
 				color.Blue("   Log file: %s", config.LogFile)
 			}
+			return nil
 		},
 	}
 
@@ -118,7 +119,7 @@ func newDaemonStopCommand() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop nano daemon",
 		Long:  `Stop the running nano daemon process.`,
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			manager := daemon.NewManager()
 
 			// Load configuration to respect custom pid_file/log_file
@@ -128,15 +129,16 @@ func newDaemonStopCommand() *cobra.Command {
 
 			if !manager.IsRunning() {
 				color.Yellow("⚠️  Daemon is not running")
-				return
+				return nil
 			}
 
 			if err := manager.Stop(); err != nil {
 				color.Red("❌ Failed to stop daemon: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to stop daemon: %w", err)
 			}
 
 			color.Green("✅ Nano daemon stopped successfully")
+			return nil
 		},
 	}
 
@@ -149,7 +151,7 @@ func newDaemonRestartCommand() *cobra.Command {
 		Use:   "restart",
 		Short: "Restart nano daemon",
 		Long:  `Restart the nano daemon process.`,
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			manager := daemon.NewManager()
 
 			// Load configuration
@@ -159,12 +161,13 @@ func newDaemonRestartCommand() *cobra.Command {
 
 			if err := manager.Restart(); err != nil {
 				color.Red("❌ Failed to restart daemon: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to restart daemon: %w", err)
 			}
 
 			config := manager.GetConfig()
 			color.Green("✅ Nano daemon restarted successfully")
 			color.Blue("   Listen address: %s:%d", config.Host, config.Port)
+			return nil
 		},
 	}
 
@@ -177,7 +180,7 @@ func newDaemonStatusCommand() *cobra.Command {
 		Use:   "status",
 		Short: "Show daemon status",
 		Long:  `Display status information about the nano daemon process.`,
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			manager := daemon.NewManager()
 
 			// Load configuration to ensure correct pid_file is used
@@ -188,7 +191,7 @@ func newDaemonStatusCommand() *cobra.Command {
 			status, err := manager.Status()
 			if err != nil {
 				color.Red("❌ Failed to get daemon status: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get daemon status: %w", err)
 			}
 
 			fmt.Println("=== Nano Daemon Status ===")
@@ -222,6 +225,7 @@ func newDaemonStatusCommand() *cobra.Command {
 			}
 
 			logger.Infof("Last Check: %s", status.Timestamp.Format("2006-01-02 15:04:05"))
+			return nil
 		},
 	}
 
@@ -237,7 +241,7 @@ func newDaemonLogsCommand() *cobra.Command {
 		Use:   "logs",
 		Short: "Show daemon logs",
 		Long:  `Display recent logs from the nano daemon process.`,
-		Run: func(cmd *cobra.Command, _ []string) {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			manager := daemon.NewManager()
 
 			// Load configuration to read from configured log_file
@@ -249,24 +253,35 @@ func newDaemonLogsCommand() *cobra.Command {
 			follow, _ := cmd.Flags().GetBool("follow")
 
 			if follow {
-				color.Yellow("⚠️  Follow mode not implemented yet, showing recent logs")
+				cfg := manager.GetConfig()
+				if cfg == nil || cfg.LogFile == "" {
+					color.Red("❌ Daemon log file not configured")
+					return fmt.Errorf("daemon log file not configured")
+				}
+				logger.Infof("=== Following daemon log: %s (Ctrl+C to stop) ===", cfg.LogFile)
+				if err := tailFollow(cmd.Context(), cfg.LogFile, lines, cmd.OutOrStdout()); err != nil {
+					color.Red("❌ Failed to follow daemon logs: %v", err)
+					return fmt.Errorf("failed to follow daemon logs: %w", err)
+				}
+				return nil
 			}
 
 			logs, err := manager.Logs(lines)
 			if err != nil {
 				color.Red("❌ Failed to get daemon logs: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get daemon logs: %w", err)
 			}
 
 			if len(logs) == 0 {
 				color.Yellow("📝 No logs available")
-				return
+				return nil
 			}
 
 			logger.Infof("=== Recent Daemon Logs (last %d lines) ===", len(logs))
 			for _, line := range logs {
 				logger.Info(strings.TrimSuffix(line, "\n"))
 			}
+			return nil
 		},
 	}
 
@@ -288,16 +303,17 @@ func newDaemonConfigCommand() *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "show",
 		Short: "Show current daemon configuration",
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			manager := daemon.NewManager()
 			if err := manager.LoadConfig(); err != nil {
 				color.Red("❌ Failed to load daemon config: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to load daemon config: %w", err)
 			}
 
 			config := manager.GetConfig()
 			data, _ := json.MarshalIndent(config, "", "  ")
 			fmt.Println(string(data))
+			return nil
 		},
 	})
 
@@ -305,11 +321,11 @@ func newDaemonConfigCommand() *cobra.Command {
 		Use:   "set [key] [value]",
 		Short: "Set daemon configuration value",
 		Args:  cobra.ExactArgs(2),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			manager := daemon.NewManager()
 			if err := manager.LoadConfig(); err != nil {
 				color.Red("❌ Failed to load daemon config: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to load daemon config: %w", err)
 			}
 
 			key := args[0]
@@ -323,7 +339,7 @@ func newDaemonConfigCommand() *cobra.Command {
 					config.Port = port
 				} else {
 					color.Red("❌ Invalid port number: %s", value)
-					os.Exit(1)
+					return fmt.Errorf("invalid port number: %s", value)
 				}
 			case "host":
 				config.Host = value
@@ -341,15 +357,16 @@ func newDaemonConfigCommand() *cobra.Command {
 				config.PidFile = value
 			default:
 				color.Red("❌ Unknown configuration key: %s", key)
-				os.Exit(1)
+				return fmt.Errorf("unknown configuration key: %s", key)
 			}
 
 			if err := manager.UpdateConfig(config); err != nil {
 				color.Red("❌ Failed to save daemon config: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to save daemon config: %w", err)
 			}
 
 			color.Green("✅ Configuration updated: %s = %s", key, value)
+			return nil
 		},
 	})
 
@@ -365,7 +382,7 @@ func newDaemonCleanupLegacyCommand() *cobra.Command {
 		Use:   "cleanup-legacy",
 		Short: "Clean legacy task data",
 		Long:  "Clean legacy local/OSS task artifacts left from older task-based implementations. Defaults to dry-run.",
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			cfg := config.Get()
 
 			if local {
@@ -391,7 +408,7 @@ func newDaemonCleanupLegacyCommand() *cobra.Command {
 						for _, p := range existing {
 							if err := os.RemoveAll(p); err != nil {
 								color.Red("❌ Failed to delete %s: %v", p, err)
-								os.Exit(1)
+								return fmt.Errorf("failed to delete %s: %w", p, err)
 							}
 						}
 						color.Green("✅ Local legacy task directories deleted")
@@ -404,23 +421,23 @@ func newDaemonCleanupLegacyCommand() *cobra.Command {
 			if includeOSS {
 				if cfg == nil || cfg.OSS == nil || !cfg.OSS.Enabled {
 					color.Blue("OSS: not enabled, skipping")
-					return
+					return nil
 				}
 				ossCfg := cfg.OSS
 				if strings.TrimSpace(ossCfg.DefaultBucket) == "" {
 					color.Blue("OSS: default bucket not configured, skipping")
-					return
+					return nil
 				}
 
 				client, err := oss.New(ossCfg.NormalizedEndpoint(), ossCfg.AccessKeyID, ossCfg.AccessKeySecret)
 				if err != nil {
 					color.Red("❌ OSS: failed to create client: %v", err)
-					os.Exit(1)
+					return fmt.Errorf("OSS: failed to create client: %w", err)
 				}
 				bucket, err := client.Bucket(ossCfg.DefaultBucket)
 				if err != nil {
 					color.Red("❌ OSS: failed to get bucket: %v", err)
-					os.Exit(1)
+					return fmt.Errorf("OSS: failed to get bucket: %w", err)
 				}
 
 				prefix := "tasks/"
@@ -430,7 +447,7 @@ func newDaemonCleanupLegacyCommand() *cobra.Command {
 					lor, err := bucket.ListObjects(oss.Prefix(prefix), oss.Marker(marker), oss.MaxKeys(1000))
 					if err != nil {
 						color.Red("❌ OSS: list objects failed: %v", err)
-						os.Exit(1)
+						return fmt.Errorf("OSS: list objects failed: %w", err)
 					}
 					for _, obj := range lor.Objects {
 						if obj.Key != "" {
@@ -445,7 +462,7 @@ func newDaemonCleanupLegacyCommand() *cobra.Command {
 
 				if len(keys) == 0 {
 					color.Blue("OSS: no legacy task objects found")
-					return
+					return nil
 				}
 
 				color.Yellow("OSS legacy task objects: %d", len(keys))
@@ -462,19 +479,20 @@ func newDaemonCleanupLegacyCommand() *cobra.Command {
 
 				if !apply {
 					color.Blue("OSS: dry-run (use --apply to delete)")
-					return
+					return nil
 				}
 
 				deleted := 0
 				for _, k := range keys {
 					if err := bucket.DeleteObject(k); err != nil {
 						color.Red("❌ OSS: failed to delete %s: %v", k, err)
-						os.Exit(1)
+						return fmt.Errorf("OSS: failed to delete %s: %w", k, err)
 					}
 					deleted++
 				}
 				color.Green("✅ OSS legacy task objects deleted: %d", deleted)
 			}
+			return nil
 		},
 	}
 
@@ -506,8 +524,8 @@ func newDaemonForegroundCommand() *cobra.Command {
 		Use:    "foreground",
 		Hidden: true, // Hide from help, used internally
 		Short:  "Run daemon in foreground (internal use)",
-		Run: func(_ *cobra.Command, _ []string) {
-			runDaemonForeground()
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runDaemonForeground()
 		},
 	}
 
@@ -515,12 +533,12 @@ func newDaemonForegroundCommand() *cobra.Command {
 }
 
 // runDaemonForeground runs the daemon server in foreground mode
-func runDaemonForeground() {
+func runDaemonForeground() error {
 	// Initialize config
 	cfg := config.Get()
 	if cfg == nil {
 		logger.Errorf("Configuration not initialized")
-		os.Exit(1)
+		return fmt.Errorf("configuration not initialized")
 	}
 
 	// Create daemon manager to get config (includes daemon log_file)
@@ -655,7 +673,7 @@ func runDaemonForeground() {
 	eng, err := engine.New(cfg, nil)
 	if err != nil {
 		logger.Errorf("Failed to create engine: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to create engine: %w", err)
 	}
 
 	defer func() {
@@ -676,6 +694,7 @@ func runDaemonForeground() {
 
 	if err := server.Start(); err != nil {
 		logger.Errorf("Daemon server error: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("daemon server error: %w", err)
 	}
+	return nil
 }

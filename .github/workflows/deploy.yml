@@ -107,5 +107,5 @@ jobs:
           NANO_MCP_HEALTH_CHECK_INTERVAL: ${{ secrets.NANO_MCP_HEALTH_CHECK_INTERVAL }}
           NANO_MCP_HEALTH_CHECK_TIMEOUT: ${{ secrets.NANO_MCP_HEALTH_CHECK_TIMEOUT }}
         run: |
-          chmod +x deployment/unified-deploy.sh
-          bash deployment/unified-deploy.sh deploy
+          chmod +x docs/operations/deployment/unified-deploy.sh
+          bash docs/operations/deployment/unified-deploy.sh deploy

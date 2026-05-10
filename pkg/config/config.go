@@ -2,15 +2,18 @@ package config //nolint:revive
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/managedsettings"
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v2"
 )
@@ -56,6 +59,28 @@ type ImageGeneratorProviderConfig struct {
 type ImageGeneratorConfig struct {
 	// List of configured providers (required)
 	Providers []ImageGeneratorProviderConfig `mapstructure:"providers" yaml:"providers"`
+}
+
+// ProviderBlock configures credentials and endpoint overrides for a provider.
+type ProviderBlock struct {
+	APIKey    string            `mapstructure:"api_key" yaml:"api_key,omitempty"`
+	APIKeyEnv string            `mapstructure:"api_key_env" yaml:"api_key_env,omitempty"`
+	BaseURL   string            `mapstructure:"base_url" yaml:"base_url,omitempty"`
+	Headers   map[string]string `mapstructure:"headers" yaml:"headers,omitempty"`
+}
+
+// ModelRouteConfig configures an alternate model endpoint for routing/fallback metadata.
+type ModelRouteConfig struct {
+	Name      string `mapstructure:"name" yaml:"name"`
+	Model     string `mapstructure:"model" yaml:"model"`
+	BaseURL   string `mapstructure:"base_url" yaml:"base_url,omitempty"`
+	APIKey    string `mapstructure:"api_key" yaml:"api_key,omitempty"`
+	APIKeyEnv string `mapstructure:"api_key_env" yaml:"api_key_env,omitempty"`
+}
+
+// ModelRoutingConfig holds model routing metadata used by command/runtime layers.
+type ModelRoutingConfig struct {
+	Fallbacks []ModelRouteConfig `mapstructure:"fallbacks" yaml:"fallbacks"`
 }
 
 // GetProvider returns the configuration for a specific provider
@@ -121,6 +146,10 @@ type SandboxConfig struct {
 	// Default: true (secure-by-default).
 	Enabled bool `mapstructure:"enabled" yaml:"enabled"`
 
+	// Backend selects the process-level sandbox backend: "", "native", "docker", or "none".
+	// Empty preserves the platform-native default for backward compatibility.
+	Backend string `mapstructure:"backend" yaml:"backend"`
+
 	// NetworkAccess controls whether sandboxed shell commands can use the network.
 	// Default: true (network allowed). Set to false to isolate network.
 	NetworkAccess bool `mapstructure:"network_access" yaml:"network_access"`
@@ -149,15 +178,43 @@ type SandboxConfig struct {
 	// BwrapPath is the absolute path to the bwrap binary on Linux.
 	// When empty, bwrap is located via $PATH.
 	BwrapPath string `mapstructure:"bwrap_path" yaml:"bwrap_path"`
+
+	// DockerImage is the image used by the docker backend.
+	// Default: ubuntu:24.04.
+	DockerImage string `mapstructure:"docker_image" yaml:"docker_image"`
+
+	// DockerLifecycle controls container reuse for the docker backend:
+	// "command" uses one-shot docker run --rm, "task" and "session" execute
+	// commands through a named persistent container keyed by sandbox metadata.
+	DockerLifecycle string `mapstructure:"docker_lifecycle" yaml:"docker_lifecycle"`
 }
 
 // HookConfig is a user-defined shell hook fired before/after tool execution.
 type HookConfig struct {
-	Name    string `mapstructure:"name" yaml:"name"`
-	Event   string `mapstructure:"event" yaml:"event"`     // "pre_tool_use" | "post_tool_use"
-	Pattern string `mapstructure:"pattern" yaml:"pattern"` // e.g. "bash:*"
-	Command string `mapstructure:"command" yaml:"command"` // Shell script body
-	Enabled bool   `mapstructure:"enabled" yaml:"enabled"`
+	Name          string   `mapstructure:"name" yaml:"name"`
+	Event         string   `mapstructure:"event" yaml:"event"`     // "pre_tool_use" | "post_tool_use"
+	Pattern       string   `mapstructure:"pattern" yaml:"pattern"` // e.g. "bash:*"
+	Command       string   `mapstructure:"command" yaml:"command"` // Shell script body
+	Enabled       bool     `mapstructure:"enabled" yaml:"enabled"`
+	FailurePolicy string   `mapstructure:"failure_policy" yaml:"failure_policy"` // confirm | block | allow | ignore_but_audit
+	EnvWhitelist  []string `mapstructure:"env_whitelist" yaml:"env_whitelist"`
+	Async         bool     `mapstructure:"async" yaml:"async"`
+	AsyncRewake   bool     `mapstructure:"async_rewake" yaml:"async_rewake"`
+	Once          bool     `mapstructure:"once" yaml:"once"`
+	StatusMessage string   `mapstructure:"status_message" yaml:"status_message"`
+}
+
+// HooksConfig configures agent lifecycle hook features.
+type HooksConfig struct {
+	Ralph RalphLoopConfig `mapstructure:"ralph" yaml:"ralph"`
+}
+
+// RalphLoopConfig controls Stop-hook based continuation turns.
+type RalphLoopConfig struct {
+	Enabled       bool `mapstructure:"enabled" yaml:"enabled"`
+	MaxIterations int  `mapstructure:"max_iterations" yaml:"max_iterations"`
+	// HardMaxIterations is clamped to nano-agent's built-in safety cap of 50.
+	HardMaxIterations int `mapstructure:"hard_max_iterations" yaml:"hard_max_iterations"`
 }
 
 // SecurityConfig configures the CommandGuard four-layer security system.
@@ -179,6 +236,14 @@ type MiddlewareConfig struct {
 	EnableAudit bool `mapstructure:"enable_audit" yaml:"enable_audit"`
 	// AuditLogPath overrides the default audit log path.
 	AuditLogPath string `mapstructure:"audit_log_path" yaml:"audit_log_path"`
+	// AuditMaxSizeMB is the maximum audit log size in megabytes before rotation.
+	AuditMaxSizeMB int `mapstructure:"audit_max_size_mb" yaml:"audit_max_size_mb"`
+	// AuditMaxBackups is the maximum number of rotated audit logs to retain.
+	AuditMaxBackups int `mapstructure:"audit_max_backups" yaml:"audit_max_backups"`
+	// AuditMaxAgeDays is the maximum age in days for rotated audit logs.
+	AuditMaxAgeDays int `mapstructure:"audit_max_age_days" yaml:"audit_max_age_days"`
+	// AuditCompress compresses rotated audit logs.
+	AuditCompress bool `mapstructure:"audit_compress" yaml:"audit_compress"`
 	// EnableMetrics enables the metrics middleware.
 	EnableMetrics bool `mapstructure:"enable_metrics" yaml:"enable_metrics"`
 	// EnableResilience enables automatic retry with backoff.
@@ -194,6 +259,43 @@ type CriticConfig struct {
 	HighRiskTools []string `mapstructure:"high_risk_tools" yaml:"high_risk_tools"` // Tools requiring Critic evaluation
 	MaxLatencyMs  int      `mapstructure:"max_latency_ms" yaml:"max_latency_ms"`   // Timeout for evaluation
 	CacheEnabled  bool     `mapstructure:"cache_enabled" yaml:"cache_enabled"`     // Enable caching of evaluation results
+}
+
+// FirewallConfig configures the built-in dangerous command firewall.
+type FirewallConfig struct {
+	// Enabled activates the firewall hook (default: true).
+	Enabled bool `mapstructure:"enabled" yaml:"enabled"`
+
+	// SeverityThreshold is the minimum severity level to trigger the firewall.
+	// Values: "high", "medium", "low" (default: "medium").
+	SeverityThreshold string `mapstructure:"severity_threshold" yaml:"severity_threshold"`
+
+	// FailurePolicy determines the action when a dangerous command is detected.
+	// Values: "confirm" (ask user), "block" (hard block), "allow" (log only).
+	// Default: "confirm".
+	FailurePolicy string `mapstructure:"failure_policy" yaml:"failure_policy"`
+
+	// CustomPatterns are user-defined dangerous command patterns in addition to built-in rules.
+	CustomPatterns []DangerousCommandPattern `mapstructure:"custom_patterns" yaml:"custom_patterns"`
+
+	// Overrides are command patterns that bypass the firewall even if they match dangerous rules.
+	// Useful for whitelisting specific legitimate commands.
+	Overrides []string `mapstructure:"overrides" yaml:"overrides"`
+}
+
+// DangerousCommandPattern defines a custom dangerous command rule.
+type DangerousCommandPattern struct {
+	// Pattern is the regex pattern to match against commands.
+	Pattern *regexp.Regexp `mapstructure:"pattern" yaml:"pattern"`
+
+	// Reason explains why this pattern is dangerous.
+	Reason string `mapstructure:"reason" yaml:"reason"`
+
+	// Severity is the severity level: "high", "medium", "low".
+	Severity string `mapstructure:"severity" yaml:"severity"`
+
+	// Category groups related patterns (e.g., "destructive", "git", "sudo").
+	Category string `mapstructure:"category" yaml:"category"`
 }
 
 // AdvancedConfig holds advanced configuration options.
@@ -233,41 +335,29 @@ type MailboxConfig struct {
 	JanitorIntervalSec int `mapstructure:"janitor_interval_sec" yaml:"janitor_interval_sec"`
 }
 
-// DefaultMailboxConfig returns default mailbox configuration
-func DefaultMailboxConfig() *MailboxConfig {
-	return &MailboxConfig{
-		Enabled:               false, // Disabled by default for gradual rollout
-		Backend:               "memory",
-		RootDir:               "", // Will be set to ~/.nano/teams/<team>/mailbox if needed
-		TTLDays:               7,
-		MaxPerAgent:           1000,
-		MaxBodyKB:             16,
-		AckTimeoutSec:         300, // 5 minutes
-		InjectionLimit:        5,
-		InjectionMaxKB:        4,
-		GuidancePromptEnabled: true,
-		JanitorIntervalSec:    60, // 1 minute
-	}
-}
-
 // AdvancedConfig holds advanced configuration options.
 type AdvancedConfig struct {
-	Fork           *ForkAdvConfig           `yaml:"fork,omitempty"`
-	CircuitBreaker *CircuitBreakerAdvConfig `yaml:"circuit_breaker,omitempty"`
+	Fork           *ForkAdvConfig           `mapstructure:"fork" yaml:"fork,omitempty"`
+	CircuitBreaker *CircuitBreakerAdvConfig `mapstructure:"circuit_breaker" yaml:"circuit_breaker,omitempty"`
 }
 
 // ForkAdvConfig holds fork-specific advanced configuration.
 type ForkAdvConfig struct {
 	MaxDepth      int `yaml:"max_depth"`
-	MaxConcurrent int `yaml:"max_concurrent"` // Maximum number of concurrent sub-agents (default: 5)
+	MaxConcurrent int `yaml:"max_concurrent"`  // Maximum number of concurrent sub-agents (default: 5)
+	MaxRuntimeSec int `yaml:"max_runtime_sec"` // Maximum teammate runtime in seconds (0 = unlimited)
 }
 
 // CircuitBreakerAdvConfig holds circuit breaker configuration for LLM client retries.
 type CircuitBreakerAdvConfig struct {
-	MaxRetries    int   `yaml:"max_retries,omitempty"`
-	BaseDelayMs   int64 `yaml:"base_delay_ms,omitempty"`
-	MaxDelayMs    int64 `yaml:"max_delay_ms,omitempty"`
-	OpenTimeoutMs int64 `yaml:"open_timeout_ms,omitempty"`
+	MaxRetries    int   `mapstructure:"max_retries" yaml:"max_retries,omitempty"`
+	BaseDelayMs   int64 `mapstructure:"base_delay_ms" yaml:"base_delay_ms,omitempty"`
+	MaxDelayMs    int64 `mapstructure:"max_delay_ms" yaml:"max_delay_ms,omitempty"`
+	OpenTimeoutMs int64 `mapstructure:"open_timeout_ms" yaml:"open_timeout_ms,omitempty"`
+	// ExcludeNonFailback controls whether non-failback errors bypass CB failure counting.
+	ExcludeNonFailback bool `mapstructure:"exclude_non_failback" yaml:"exclude_non_failback"`
+	// TruncationDetection surfaces finish_reason=length stream metadata to the agent layer.
+	TruncationDetection bool `mapstructure:"truncation_detection" yaml:"truncation_detection"`
 }
 
 // OSSConfig holds Alibaba Cloud OSS configuration
@@ -476,6 +566,16 @@ type Config struct {
 	Model   string `mapstructure:"model" yaml:"model"`
 	Verbose bool   `mapstructure:"verbose" yaml:"verbose"`
 
+	// ProvidersBlock declares per-provider credentials and endpoint overrides for the new provider/model schema.
+	ProvidersBlock map[string]ProviderBlock `mapstructure:"providers" yaml:"providers,omitempty"`
+
+	// Fallbacks declares provider/model fallback references for the new schema.
+	Fallbacks []string `mapstructure:"fallbacks" yaml:"fallbacks,omitempty"`
+
+	// ModelRouting declares optional fallback routes without changing the
+	// default OpenAI-compatible primary route behavior.
+	ModelRouting *ModelRoutingConfig `mapstructure:"model_routing" yaml:"model_routing"`
+
 	// WorkingDir overrides the working directory for the agent.
 	// When non-empty, this takes precedence over os.Getwd() at startup.
 	// Useful in daemon mode to pin the agent to a specific project directory.
@@ -565,6 +665,11 @@ type Config struct {
 	BlockedEnvVars  []string `mapstructure:"blocked_env_vars" yaml:"blocked_env_vars"`
 	Strict          bool     `mapstructure:"strict" yaml:"strict"`
 
+	// SensitiveReadPaths extends the built-in sensitive read confirmation list.
+	SensitiveReadPaths []string `mapstructure:"sensitive_read_paths" yaml:"sensitive_read_paths"`
+	// ArbitraryExecCommands extends the built-in interpreter eval confirmation list.
+	ArbitraryExecCommands []string `mapstructure:"arbitrary_exec_commands" yaml:"arbitrary_exec_commands"`
+
 	CustomSystemPrompt string `mapstructure:"custom_system_prompt" yaml:"custom_system_prompt"`
 
 	// OpenSpec integration configuration
@@ -598,6 +703,12 @@ type Config struct {
 	// Security configures the CommandGuard four-layer security system.
 	Security *SecurityConfig `mapstructure:"security" yaml:"security"`
 
+	// Hooks configures lifecycle hook extensions such as ralph-loop.
+	Hooks *HooksConfig `mapstructure:"hooks" yaml:"hooks"`
+
+	// Firewall configures the built-in dangerous command firewall.
+	Firewall *FirewallConfig `mapstructure:"firewall" yaml:"firewall"`
+
 	// Critic configures the Critic security evaluator (Prompt Injection Protection Layer 3.5)
 	Critic *CriticConfig `mapstructure:"critic" yaml:"critic"`
 
@@ -606,6 +717,43 @@ type Config struct {
 
 	// Mailbox configures the multi-agent mailbox system
 	Mailbox *MailboxConfig `mapstructure:"mailbox" yaml:"mailbox"`
+
+	// Policy configures permission/policy related knobs such as the ModeAuto
+	// risk classifier and managed-settings overrides.
+	Policy *PolicyConfig `mapstructure:"policy" yaml:"policy,omitempty"`
+
+	// Checkpoint configures the filesystem checkpointer (M2-4).
+	Checkpoint *CheckpointConfig `mapstructure:"checkpoint" yaml:"checkpoint,omitempty"`
+}
+
+// PolicyConfig groups permission-related configuration.
+type PolicyConfig struct {
+	// Classifier configures the ModeAuto AI risk classifier.
+	Classifier *ClassifierConfig `mapstructure:"classifier" yaml:"classifier,omitempty"`
+}
+
+// ClassifierConfig configures the two-stage risk classifier consulted in
+// ModeAuto. When Enabled is false, ModeAuto silently degrades to ModeDefault
+// behaviour (always require confirmation). When Enabled is true but no LLM
+// client is wired the manager falls back to a fail-closed classifier.
+type ClassifierConfig struct {
+	Enabled    bool          `mapstructure:"enabled" yaml:"enabled"`
+	FastModel  string        `mapstructure:"fast_model" yaml:"fast_model,omitempty"`
+	ThinkModel string        `mapstructure:"think_model" yaml:"think_model,omitempty"`
+	FailClosed bool          `mapstructure:"fail_closed" yaml:"fail_closed"`
+	CacheSize  int           `mapstructure:"cache_size" yaml:"cache_size,omitempty"`
+	CacheTTL   time.Duration `mapstructure:"cache_ttl" yaml:"cache_ttl,omitempty"`
+	Timeout    time.Duration `mapstructure:"timeout" yaml:"timeout,omitempty"`
+}
+
+// CheckpointConfig configures the filesystem checkpointer (M2-4).
+type CheckpointConfig struct {
+	Enabled       bool   `mapstructure:"enabled" yaml:"enabled"`
+	AutoSnapshot  bool   `mapstructure:"auto_snapshot" yaml:"auto_snapshot"`
+	MaxCount      int    `mapstructure:"max_count" yaml:"max_count,omitempty"`
+	MaxSizeMB     int    `mapstructure:"max_size_mb" yaml:"max_size_mb,omitempty"`
+	RetentionDays int    `mapstructure:"retention_days" yaml:"retention_days,omitempty"`
+	BackupRoot    string `mapstructure:"backup_root" yaml:"backup_root,omitempty"`
 }
 
 // SchedulerConfig configures the TUI-mode recurring task scheduler.
@@ -841,6 +989,14 @@ func DefaultConfig() *Config {
 			runtimeOverride: -1,
 		},
 
+		ModelRouting: &ModelRoutingConfig{},
+		Advanced: &AdvancedConfig{
+			CircuitBreaker: &CircuitBreakerAdvConfig{
+				ExcludeNonFailback:  true,
+				TruncationDetection: true,
+			},
+		},
+
 		// Default memory settings for Mem0 integration
 		Memory: &MemoryConfig{
 			BaseURL: "https://api.mem0.ai", // Default Mem0 API base URL
@@ -941,11 +1097,13 @@ func DefaultConfig() *Config {
 		},
 
 		// Default tool security (no restrictions unless configured)
-		AllowedCommands: []string{},
-		BlockedCommands: []string{},
-		AllowedEnvVars:  []string{},
-		BlockedEnvVars:  []string{},
-		Strict:          false,
+		AllowedCommands:       []string{},
+		BlockedCommands:       []string{},
+		AllowedEnvVars:        []string{},
+		BlockedEnvVars:        []string{},
+		Strict:                false,
+		SensitiveReadPaths:    []string{},
+		ArbitraryExecCommands: []string{},
 
 		// OpenSpec integration (enabled by default)
 		OpenSpec: &OpenSpecConfig{
@@ -988,12 +1146,15 @@ func DefaultConfig() *Config {
 		// Sandbox defaults: disabled; network allowed by default when sandbox is on.
 		Sandbox: &SandboxConfig{
 			Enabled:            false,
+			Backend:            "",
 			NetworkAccess:      true,
 			AllowedPaths:       []string{},
 			BlockedPaths:       []string{"/etc", "/sys", "/proc", "/dev"},
 			ReadOnlyPaths:      []string{},
 			ExtraReadOnlyPaths: []string{},
 			ExtraWritablePaths: []string{},
+			DockerImage:        "ubuntu:24.04",
+			DockerLifecycle:    "command",
 		},
 
 		// Default Critic configuration (prompt injection protection)
@@ -1003,6 +1164,31 @@ func DefaultConfig() *Config {
 			HighRiskTools: []string{"run_shell_command", "write_file", "edit_file", "delete_file"},
 			MaxLatencyMs:  5000, // 5 second timeout
 			CacheEnabled:  true,
+		},
+
+		Firewall: &FirewallConfig{
+			Enabled:           true,
+			SeverityThreshold: "medium",
+			FailurePolicy:     "confirm",
+			CustomPatterns:    nil,
+			Overrides:         nil,
+		},
+
+		Hooks: &HooksConfig{
+			Ralph: RalphLoopConfig{
+				Enabled:           true,
+				MaxIterations:     10,
+				HardMaxIterations: 50,
+			},
+		},
+
+		// Middleware defaults.
+		Middleware: &MiddlewareConfig{
+			EnableAudit:     false,
+			AuditMaxSizeMB:  100,
+			AuditMaxBackups: 3,
+			AuditMaxAgeDays: 28,
+			AuditCompress:   true,
 		},
 	}
 }
@@ -1263,6 +1449,8 @@ func LoadConfig(configPath string) (*Config, error) {
 	overrideStringSliceFromEnv(&cfg.AllowedEnvVars, "NANO_ALLOWED_ENV_VARS")
 	overrideStringSliceFromEnv(&cfg.BlockedEnvVars, "NANO_BLOCKED_ENV_VARS")
 	overrideBoolFromEnv(&cfg.Strict, "NANO_STRICT")
+	overrideStringSliceFromEnv(&cfg.SensitiveReadPaths, "NANO_SENSITIVE_READ_PATHS")
+	overrideStringSliceFromEnv(&cfg.ArbitraryExecCommands, "NANO_ARBITRARY_EXEC_COMMANDS")
 
 	// Override secret redaction configuration from environment
 	if cfg.SecretRedaction != nil {
@@ -1292,8 +1480,11 @@ func LoadConfig(configPath string) (*Config, error) {
 		cfg.Sandbox = &SandboxConfig{}
 	}
 	overrideBoolFromEnv(&cfg.Sandbox.Enabled, "NANO_SANDBOX_ENABLED")
+	overrideStringFromEnv(&cfg.Sandbox.Backend, "NANO_SANDBOX_BACKEND")
 	overrideBoolFromEnv(&cfg.Sandbox.NetworkAccess, "NANO_SANDBOX_NETWORK_ACCESS")
 	overrideStringFromEnv(&cfg.Sandbox.BwrapPath, "NANO_SANDBOX_BWRAP_PATH")
+	overrideStringFromEnv(&cfg.Sandbox.DockerImage, "NANO_SANDBOX_DOCKER_IMAGE")
+	overrideStringFromEnv(&cfg.Sandbox.DockerLifecycle, "NANO_SANDBOX_DOCKER_LIFECYCLE")
 	overrideStringSliceFromEnv(&cfg.Sandbox.AllowedPaths, "NANO_SANDBOX_ALLOWED_PATHS")
 	overrideStringSliceFromEnv(&cfg.Sandbox.BlockedPaths, "NANO_SANDBOX_BLOCKED_PATHS")
 	overrideStringSliceFromEnv(&cfg.Sandbox.ReadOnlyPaths, "NANO_SANDBOX_READ_ONLY_PATHS")
@@ -1310,7 +1501,74 @@ func LoadConfig(configPath string) (*Config, error) {
 			cfg.Reasoning.Enabled, cfg.Reasoning.Effort, cfg.Reasoning.MaxTokens, cfg.Reasoning.Exclude)
 	}
 
+	// Apply enterprise managed-settings overrides last so they always win.
+	applyManagedSettingsOverrides(cfg)
+
 	return cfg, nil
+}
+
+// applyManagedSettingsOverrides reads the OS-specific managed-settings file
+// (if present) and applies the subset of fields it understands. This is a
+// best-effort, well-known-key path that operators can rely on; unknown keys
+// are ignored to keep the override file forward-compatible.
+//
+// Recognised top-level keys:
+//   - permission_mode (string)
+//   - sandbox.backend, sandbox.docker_lifecycle, sandbox.docker_image (strings)
+//   - policy.classifier.enabled (bool)
+//   - checkpoint.enabled, checkpoint.auto_snapshot (bool)
+func applyManagedSettingsOverrides(cfg *Config) {
+	managed, err := managedsettings.Load("")
+	if err != nil {
+		// ErrNotFound is the common "no IT override deployed" path; only log
+		// real parse/IO errors.
+		if !errors.Is(err, managedsettings.ErrNotFound) {
+			logger.Warnf("managed-settings: %v", err)
+		}
+		return
+	}
+	if v, ok := managed["permission_mode"].(string); ok && v != "" {
+		cfg.PermissionMode = v
+	}
+	if sb, ok := managed["sandbox"].(map[string]interface{}); ok {
+		if cfg.Sandbox == nil {
+			cfg.Sandbox = &SandboxConfig{}
+		}
+		if v, ok := sb["backend"].(string); ok && v != "" {
+			cfg.Sandbox.Backend = v
+		}
+		if v, ok := sb["docker_lifecycle"].(string); ok && v != "" {
+			cfg.Sandbox.DockerLifecycle = v
+		}
+		if v, ok := sb["docker_image"].(string); ok && v != "" {
+			cfg.Sandbox.DockerImage = v
+		}
+	}
+	if pol, ok := managed["policy"].(map[string]interface{}); ok {
+		if cls, ok := pol["classifier"].(map[string]interface{}); ok {
+			if cfg.Policy == nil {
+				cfg.Policy = &PolicyConfig{}
+			}
+			if cfg.Policy.Classifier == nil {
+				cfg.Policy.Classifier = &ClassifierConfig{}
+			}
+			if v, ok := cls["enabled"].(bool); ok {
+				cfg.Policy.Classifier.Enabled = v
+			}
+		}
+	}
+	if cp, ok := managed["checkpoint"].(map[string]interface{}); ok {
+		if cfg.Checkpoint == nil {
+			cfg.Checkpoint = &CheckpointConfig{}
+		}
+		if v, ok := cp["enabled"].(bool); ok {
+			cfg.Checkpoint.Enabled = v
+		}
+		if v, ok := cp["auto_snapshot"].(bool); ok {
+			cfg.Checkpoint.AutoSnapshot = v
+		}
+	}
+	logger.Infof("managed-settings: applied overrides from %s", managedsettings.DefaultPath())
 }
 
 // Get returns the loaded configuration
@@ -1529,7 +1787,23 @@ func (c *Config) DeepCopy() *Config {
 	copied.BlockedCommands = append([]string(nil), c.BlockedCommands...)
 	copied.AllowedEnvVars = append([]string(nil), c.AllowedEnvVars...)
 	copied.BlockedEnvVars = append([]string(nil), c.BlockedEnvVars...)
+	copied.SensitiveReadPaths = append([]string(nil), c.SensitiveReadPaths...)
+	copied.ArbitraryExecCommands = append([]string(nil), c.ArbitraryExecCommands...)
 	copied.AllowedRules = append([]string(nil), c.AllowedRules...)
+	copied.Fallbacks = append([]string(nil), c.Fallbacks...)
+	if c.ProvidersBlock != nil {
+		copied.ProvidersBlock = make(map[string]ProviderBlock, len(c.ProvidersBlock))
+		for key, provider := range c.ProvidersBlock {
+			if provider.Headers != nil {
+				headers := make(map[string]string, len(provider.Headers))
+				for headerKey, headerValue := range provider.Headers {
+					headers[headerKey] = headerValue
+				}
+				provider.Headers = headers
+			}
+			copied.ProvidersBlock[key] = provider
+		}
+	}
 
 	// Deep copy Reasoning
 	if c.Reasoning != nil {
@@ -1541,6 +1815,11 @@ func (c *Config) DeepCopy() *Config {
 			runtimeOverride:    c.Reasoning.runtimeOverride,
 			runtimeOverrideSet: c.Reasoning.runtimeOverrideSet,
 		}
+	}
+
+	if c.ModelRouting != nil {
+		copied.ModelRouting = &ModelRoutingConfig{}
+		copied.ModelRouting.Fallbacks = append([]ModelRouteConfig(nil), c.ModelRouting.Fallbacks...)
 	}
 
 	// Deep copy ContextConfig
@@ -1710,7 +1989,19 @@ func (c *Config) DeepCopy() *Config {
 		copied.Advanced = &AdvancedConfig{}
 		if c.Advanced.Fork != nil {
 			copied.Advanced.Fork = &ForkAdvConfig{
-				MaxDepth: c.Advanced.Fork.MaxDepth,
+				MaxDepth:      c.Advanced.Fork.MaxDepth,
+				MaxConcurrent: c.Advanced.Fork.MaxConcurrent,
+				MaxRuntimeSec: c.Advanced.Fork.MaxRuntimeSec,
+			}
+		}
+		if c.Advanced.CircuitBreaker != nil {
+			copied.Advanced.CircuitBreaker = &CircuitBreakerAdvConfig{
+				MaxRetries:          c.Advanced.CircuitBreaker.MaxRetries,
+				BaseDelayMs:         c.Advanced.CircuitBreaker.BaseDelayMs,
+				MaxDelayMs:          c.Advanced.CircuitBreaker.MaxDelayMs,
+				OpenTimeoutMs:       c.Advanced.CircuitBreaker.OpenTimeoutMs,
+				ExcludeNonFailback:  c.Advanced.CircuitBreaker.ExcludeNonFailback,
+				TruncationDetection: c.Advanced.CircuitBreaker.TruncationDetection,
 			}
 		}
 	}
@@ -1718,9 +2009,12 @@ func (c *Config) DeepCopy() *Config {
 	// Deep copy Sandbox
 	if c.Sandbox != nil {
 		copied.Sandbox = &SandboxConfig{
-			Enabled:       c.Sandbox.Enabled,
-			NetworkAccess: c.Sandbox.NetworkAccess,
-			BwrapPath:     c.Sandbox.BwrapPath,
+			Enabled:         c.Sandbox.Enabled,
+			Backend:         c.Sandbox.Backend,
+			NetworkAccess:   c.Sandbox.NetworkAccess,
+			BwrapPath:       c.Sandbox.BwrapPath,
+			DockerImage:     c.Sandbox.DockerImage,
+			DockerLifecycle: c.Sandbox.DockerLifecycle,
 		}
 		copied.Sandbox.AllowedPaths = append([]string(nil), c.Sandbox.AllowedPaths...)
 		copied.Sandbox.BlockedPaths = append([]string(nil), c.Sandbox.BlockedPaths...)
@@ -1739,7 +2033,14 @@ func (c *Config) DeepCopy() *Config {
 		if c.Security.Hooks != nil {
 			copied.Security.Hooks = make([]HookConfig, len(c.Security.Hooks))
 			copy(copied.Security.Hooks, c.Security.Hooks)
+			for i := range copied.Security.Hooks {
+				copied.Security.Hooks[i].EnvWhitelist = append([]string(nil), c.Security.Hooks[i].EnvWhitelist...)
+			}
 		}
+	}
+
+	if c.Hooks != nil {
+		copied.Hooks = &HooksConfig{Ralph: c.Hooks.Ralph}
 	}
 
 	// Deep copy Critic
@@ -1758,6 +2059,10 @@ func (c *Config) DeepCopy() *Config {
 		copied.Middleware = &MiddlewareConfig{
 			EnableAudit:      c.Middleware.EnableAudit,
 			AuditLogPath:     c.Middleware.AuditLogPath,
+			AuditMaxSizeMB:   c.Middleware.AuditMaxSizeMB,
+			AuditMaxBackups:  c.Middleware.AuditMaxBackups,
+			AuditMaxAgeDays:  c.Middleware.AuditMaxAgeDays,
+			AuditCompress:    c.Middleware.AuditCompress,
 			EnableMetrics:    c.Middleware.EnableMetrics,
 			EnableResilience: c.Middleware.EnableResilience,
 			MaxRetries:       c.Middleware.MaxRetries,
@@ -1857,6 +2162,19 @@ func deepCopySecretRedaction(src *SecretRedactionConfig) *SecretRedactionConfig 
 // each with its type, path, and whether the file currently exists.
 func GetConfigLocations(configFile string) []ConfigLocation {
 	var locations []ConfigLocation
+
+	// 0. Enterprise managed-settings file (highest precedence). Reported here
+	// so `nano doctor` / config inspection reveals when an IT-deployed override
+	// is active.
+	managedPath := managedsettings.DefaultPath()
+	if managedPath != "" {
+		_, err := os.Stat(managedPath)
+		locations = append(locations, ConfigLocation{
+			Type:   "Managed (Enterprise)",
+			Path:   managedPath,
+			Exists: err == nil,
+		})
+	}
 
 	// 1. User-specified config file
 	if configFile != "" {

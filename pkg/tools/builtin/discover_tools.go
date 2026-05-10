@@ -20,6 +20,7 @@ type DiscoverToolsTool struct {
 	// The full provider is used for detail queries.
 	toolIndex map[string]toolEntry
 	detailFn  ToolDetailProvider
+	onExpand  func(string)
 }
 
 type toolEntry struct {
@@ -46,6 +47,11 @@ func (t *DiscoverToolsTool) IndexTool(name, description, category, server string
 		Category:    category,
 		Server:      server,
 	}
+}
+
+// SetOnExpand registers a callback invoked after a full tool schema is requested.
+func (t *DiscoverToolsTool) SetOnExpand(fn func(string)) {
+	t.onExpand = fn
 }
 
 // Name returns the tool name.
@@ -137,6 +143,9 @@ func (t *DiscoverToolsTool) searchTools(query string) (*interfaces.ToolResult, e
 func (t *DiscoverToolsTool) getToolDetail(name string) (*interfaces.ToolResult, error) {
 	if t.detailFn != nil {
 		if detail, ok := t.detailFn(name); ok {
+			if t.onExpand != nil {
+				t.onExpand(name)
+			}
 			// Pretty-print if JSON
 			var v interface{}
 			if json.Unmarshal([]byte(detail), &v) == nil {

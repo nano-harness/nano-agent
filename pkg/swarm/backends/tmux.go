@@ -50,8 +50,11 @@ func (t *TmuxBackend) SpawnPane(cmd []string, color string) (string, int, error)
 		return paneID, 0, fmt.Errorf("failed to parse PID %q: %w", pidStr, err)
 	}
 
-	// TODO: Apply color to pane if supported
-	_ = color
+	if strings.TrimSpace(color) != "" {
+		// Best-effort cosmetic hint: set a per-pane style. tmux accepts a subset of
+		// color formats depending on version; failures are non-fatal.
+		_ = exec.Command("tmux", "select-pane", "-t", paneID, "-P", "bg="+color).Run()
+	}
 
 	return paneID, pid, nil
 }

@@ -275,21 +275,17 @@ func (s *SessionScribe) Close() {
 		s.mutex.Unlock()
 		return
 	}
-	s.closed = true
-	s.mutex.Unlock()
-
 	if s.syncTimer != nil {
 		s.syncTimer.Stop()
+		s.syncTimer = nil
 	}
-
-	s.Sync()
-
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.flushAndSyncLocked()
+	s.closed = true
 	if s.writer != nil {
 		_ = s.writer.Flush()
 	}
 	if s.file != nil {
 		_ = s.file.Close()
 	}
+	s.mutex.Unlock()
 }

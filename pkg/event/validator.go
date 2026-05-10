@@ -46,6 +46,8 @@ func NewEventValidator() *EventValidator {
 			EventTypeRetry:               {"Content"},
 			EventTypeWarning:             {"Content"},
 			EventTypeDebug:               {"Content"},
+			EventTypeProviderFallback:    {},
+			EventTypeRouteSelected:       {},
 			EventTypePlannerPlanSnapshot: {"Content"},
 			EventTypePlannerPlanUpdate:   {"Content"},
 			EventTypePlannerDecision:     {"Content"},
@@ -55,6 +57,8 @@ func NewEventValidator() *EventValidator {
 			EventTypeWorkerUpdate:        {"Content"},
 			EventTypeWorkerLog:           {"Content"},
 			EventTypeWorkerEnd:           {"Content"},
+			EventTypeRalphIteration:      {"Content"},
+			EventTypeRalphStopped:        {"Content"},
 		},
 		validSeverities: []string{"low", "medium", "high", "critical"},
 	}

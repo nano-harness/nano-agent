@@ -37,9 +37,6 @@ type MemoryStats struct { //nolint:revive
 	Mem0ServiceConfigured bool      `json:"mem0_service_configured"`
 }
 
-// LLMClientLike interface for backward compatibility.
-type LLMClientLike interface{}
-
 // NewManager creates a local-only memory Manager.
 //
 // workingDir is the project root (used for project memory).
@@ -197,6 +194,30 @@ func (m *Manager) SetKnowledge(key, value, tags string) error {
 		return fmt.Errorf("knowledge store not available")
 	}
 	return m.knowledge.Set(key, value, tags)
+}
+
+// GetKnowledge retrieves a knowledge entry by key.
+func (m *Manager) GetKnowledge(key string) (*KnowledgeEntry, error) {
+	if m.knowledge == nil {
+		return nil, fmt.Errorf("knowledge store not available")
+	}
+	return m.knowledge.Get(key)
+}
+
+// DeleteKnowledge removes a knowledge entry by key.
+func (m *Manager) DeleteKnowledge(key string) error {
+	if m.knowledge == nil {
+		return fmt.Errorf("knowledge store not available")
+	}
+	return m.knowledge.Delete(key)
+}
+
+// ListKnowledge returns recent knowledge entries.
+func (m *Manager) ListKnowledge(limit int) ([]KnowledgeEntry, error) {
+	if m.knowledge == nil {
+		return nil, fmt.Errorf("knowledge store not available")
+	}
+	return m.knowledge.List(limit)
 }
 
 // SaveWithRollback attempts to save session and knowledge data atomically.

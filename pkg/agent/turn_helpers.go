@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/nano-harness/nano-agent/pkg/llm"
+	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/preprocessor"
 )
 
 // buildUserContextPrefix returns a one-line context note (time, timezone, language)
@@ -45,6 +47,16 @@ func (t *Turn) ensureSystemPrompt() {
 // ensureUserMessage ensures the user message is added exactly once per turn
 func (t *Turn) ensureUserMessage() {
 	if t.UserInput != "" && !t.userMessageAdded {
+		fileMentions, err := preprocessor.FileMentionMessages(t.UserInput, t.WorkingDir)
+		if err != nil {
+			logger.Warnf("Failed to process file mentions: %v", err)
+		} else if len(fileMentions.Messages) > 0 {
+			t.Messages = append(t.Messages, fileMentions.Messages...)
+			if len(fileMentions.Images) > 0 {
+				t.images = append(t.images, fileMentions.Images...)
+			}
+		}
+
 		contextPrefix := t.buildUserContextPrefix()
 		userMessage := llm.Message{Role: "user", Content: contextPrefix + t.UserInput}
 
@@ -95,6 +107,20 @@ func (t *Turn) ensureUserMessage() {
 		}
 
 		t.Messages = append(t.Messages, userMessage)
+		t.appendTranscriptMessage("user", userMessage)
 		t.userMessageAdded = true
+	}
+}
+
+func (t *Turn) appendTranscriptMessage(entryType string, msg llm.Message) {
+	if t == nil || t.transcript == nil {
+		return
+	}
+	iteration := 0
+	if t.ralphContext != nil {
+		iteration = t.ralphContext.Iteration()
+	}
+	if err := t.transcript.Append(transcriptEntryForMessage(t.SessionID, t.WorkingDir, t.ID, iteration, entryType, msg)); err != nil {
+		logger.Warnf("Failed to append transcript entry: %v", err)
 	}
 }

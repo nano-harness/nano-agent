@@ -38,11 +38,11 @@ A lightweight AI-powered code assistant built in Go, featuring a modular tool ar
 
 ## Permission auto-approval
 
-nano-agent automatically skips confirmation for read-only shell commands (`grep`, `rg`, `ls`, `find`, etc.) and filesystem edits (`write_file`, `edit_file`, `delete_file`) when all target paths are inside the agent working directory. Paths outside the working directory still require approval. See [Permission Auto-Approval](./docs/PERMISSION_AUTO_APPROVAL.md).
+nano-agent automatically skips confirmation for read-only shell commands (`grep`, `rg`, `ls`, `find`, etc.) and filesystem edits (`write_file`, `edit_file`, `delete_file`) when all target paths are inside the agent working directory. Paths outside the working directory still require approval. See [Permission Auto-Approval](./docs/development/PERMISSION_AUTO_APPROVAL.md).
 
 ## Web Client Integration
 
-Daemon integrations should use `docs/DAEMON_API.md` as the source of truth. Interactive CLI rendering now goes through a shared EventSource layer: `nano chat` and `nano lead-chat` default to BubbleTea, and `--ui tview` selects the tview backend. Automation should call `nano daemon execute --json "command"` instead of parsing TUI output.
+Daemon integrations should use [Daemon API](./docs/operations/DAEMON_API.md) as the source of truth. Interactive CLI rendering now goes through a shared EventSource layer: `nano chat` and `nano lead-chat` default to BubbleTea, and `--ui tview` selects the tview backend. Automation should call `nano daemon execute --json "command"` instead of parsing TUI output.
 
 ## 🚀 Quick Start
 
@@ -187,7 +187,7 @@ nano chat --team alpha
 [team-lead@alpha]> analyze the codebase for security issues using multiple teammates
 ```
 
-See [SWARM.md](./SWARM.md) for detailed multi-agent documentation.
+See [Multi-Agent Runtime](./docs/features/MULTI_AGENT.md) for detailed multi-agent documentation.
 
 #### 3. Daemon Mode (Background Service)
 Run as a background service for production environments:
@@ -324,6 +324,51 @@ nano daemon config set port 9000
 nano daemon config set api_key "your-secret-key"
 ```
 
+### Cron Scheduler (Routines)
+
+Schedule recurring tasks using cron expressions:
+
+```bash
+# List all scheduled routines
+nano routines list
+
+# Add a new routine with cron expression
+nano routines add --cron "0 */2 * * *" "generate status report"
+
+# Add a routine with natural language interval
+nano routines add --every 5m "check build status"
+
+# Remove a routine
+nano routines remove <task-id>
+
+# View routine execution logs
+nano routines logs
+
+# View routine statistics
+nano routines stats
+
+# Manually trigger a routine
+nano routines run <task-id>
+```
+
+When running in daemon mode, you can also manage routines via the REST API:
+
+```bash
+# Create a routine via API
+curl -X POST -H "X-API-Key: $NANO_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"cron_expression":"0 */2 * * *","command":"generate status report"}' \
+  http://127.0.0.1:8080/api/v1/scheduler/tasks
+
+# List routines via API
+curl -H "X-API-Key: $NANO_API_KEY" \
+  http://127.0.0.1:8080/api/v1/scheduler/tasks
+
+# Delete a routine via API
+curl -X DELETE -H "X-API-Key: $NANO_API_KEY" \
+  http://127.0.0.1:8080/api/v1/scheduler/tasks/<task-id>
+```
+
 ### Development Commands
 
 ```bash
@@ -435,15 +480,6 @@ List and inspect available experts:
 /agents:show investigator
 ```
 
-### Key Differences from Previous Fork System
-
-> **⚠️ BREAKING CHANGE**: The expert system replaces the previous `fork` tool:
->
-> 1. **Explicit triggering only**: LLM cannot autonomously call experts. Only users can trigger them with `@expert-name`.
-> 2. **Better observability**: You always know when an expert is invoked and what it costs.
-> 3. **Kebab-case names**: Use `@investigator` not `@codebase_investigator`. Names are auto-converted from YAML config.
-> 4. **Removed implicit fork**: The old `fork` tool has been completely removed - all sub-agent invocations must be explicitly triggered by users.
-
 ## 🔄 Background Task Management
 
 nano-agent supports running long-running shell commands in the background with comprehensive task management capabilities.
@@ -493,6 +529,7 @@ nano-agent features advanced memory management with local SQLite storage, provid
 - **Local SQLite Storage**: Embedded SQLite with FTS5 for fast full-text search — no external API required
 - **Semantic Search**: Intelligent memory retrieval based on context
 - **Cross-Session Persistence**: Memory persists across different nano-agent sessions
+- **Daemon Key-Value API**: Save, retrieve, list, and delete named memory entries through `/api/v1/memory`
 
 ### Configuration
 
@@ -528,7 +565,9 @@ nano memory stats
 
 # Daemon mode memory API
 curl -X GET "http://localhost:8080/api/v1/memory"
-curl -X POST "http://localhost:8080/api/v1/memory" -d '{"content":"fact","category":"dev"}'
+curl -X POST "http://localhost:8080/api/v1/memory" -d '{"key":"api-endpoint","content":"https://api.example.com","tags":["dev"]}'
+curl -X GET "http://localhost:8080/api/v1/memory/api-endpoint"
+curl -X DELETE "http://localhost:8080/api/v1/memory/api-endpoint"
 ```
 
 ## 🧠 Reasoning Support
@@ -737,6 +776,32 @@ cp .nano.yaml.example .nano.yaml
 nano config paths
 ```
 
+### Multi-provider fallback
+
+The legacy `api_key` + `base_url` + `model` configuration still works. For
+multi-provider fallback, prefer `provider/model` references and provider-specific
+API key environment variables:
+
+```yaml
+model: "deepseek/deepseek-chat"
+fallbacks:
+  - "openai/gpt-4.1"
+  - "moonshot/kimi-k2"
+
+providers:
+  deepseek:
+    api_key_env: NANO_DEEPSEEK_API_KEY
+  openai:
+    api_key_env: OPENAI_API_KEY
+  moonshot:
+    api_key_env: MOONSHOT_API_KEY
+```
+
+If `providers:` is present alongside the legacy endpoint fields, the provider
+schema takes precedence and nano-agent logs a deprecation warning. Plain
+`api_key:` remains supported as an escape hatch, but CLI and daemon model route
+output only report whether a key is set and never print the key value.
+
 ### Configuration Files
 
 #### Global Configuration (`~/.config/nano/config.yaml`)
@@ -790,9 +855,14 @@ For CI/CD, Docker, or temporary overrides:
 # Required
 NANO_API_KEY="your-llm-api-key"
 
+# Provider-specific keys for provider/model routing
+NANO_DEEPSEEK_API_KEY="your-deepseek-key"
+NANO_OPENAI_API_KEY="your-openai-key"
+NANO_MOONSHOT_API_KEY="your-moonshot-key"
+
 # Optional
 NANO_BASE_URL="https://api.example.com/v1"
-NANO_MODEL="your-preferred-model"
+NANO_MODEL="your-preferred-model" # can also be "provider/model"
 NANO_VERBOSE="false"
 NANO_READ_FILE_MAX_LINES="200"
 NANO_SEARCH_MAX_RESULTS="20"
@@ -885,7 +955,7 @@ nano mcp auth --list
 nano mcp auth api-server --revoke
 ```
 
-Tokens are automatically injected into requests and refreshed when needed. See [docs/MCP_OAUTH.md](docs/MCP_OAUTH.md) for detailed OAuth configuration.
+Tokens are automatically injected into requests and refreshed when needed. See [MCP OAuth](docs/features/MCP_OAUTH.md) for detailed OAuth configuration.
 
 #### Migration from Legacy Transports
 
@@ -1204,7 +1274,7 @@ nano daemon stop
 - `GET /api/v1/status` - Get agent status
 - `WS /api/v1/stream` - WebSocket streaming
 - `GET /api/v1/mcp/*` - MCP-related endpoints
-- `GET|POST /api/v1/memory/*` - Memory management
+- `GET|POST|DELETE /api/v1/memory/*` - Memory management
 - `POST /api/v1/sessions/{id}/execute` - Execute within a session
 - `GET|POST|DELETE /api/v1/sessions/*` - Session management
 - `POST /api/v1/teams/sessions` - Create team-lead session
@@ -1212,7 +1282,7 @@ nano daemon stop
 - `GET|DELETE /api/v1/teams/sessions/{id}` - Get or delete team session
 - `POST /api/v1/teams/sessions/{id}/execute` - Execute in team session
 
-See [SWARM.md](./SWARM.md) for detailed team session API documentation.
+See [Daemon API](./docs/operations/DAEMON_API.md) and [Multi-Agent Runtime](./docs/features/MULTI_AGENT.md) for detailed team session API documentation.
 
 ### Daemon Configuration
 
@@ -1232,8 +1302,15 @@ For detailed daemon configuration, see the daemon section in this README and `.n
 
 - Report issues: [GitHub Issues](https://github.com/nano-harness/nano-agent/issues)
 - Documentation:
-  - [SWARM.md](./SWARM.md) - Multi-agent system documentation
-  - [MIGRATION.md](./MIGRATION.md) - Migration guide for swarm features
+  - [Documentation Index](./docs/INDEX.md) - Complete documentation index and navigation
+  - [Architecture](./docs/architecture/ARCHITECTURE.md) - Runtime layers, dependency direction, and core interfaces
+  - [Configuration](./docs/development/CONFIGURATION.md) - Config sources, migration notes, and examples
+  - [Daemon API](./docs/operations/DAEMON_API.md) - REST and WebSocket client integration guide
+  - [Multi-Agent Runtime](./docs/features/MULTI_AGENT.md) - Team sessions, teammate profiles, mailbox, and governance
+  - [Sandbox Design](./docs/architecture/SANDBOX_DESIGN.md) - Native and Docker sandbox runtime behavior
+  - [Hooks](./docs/features/HOOKS.md) - Structured lifecycle hook protocol
+  - [Extensions](./docs/features/EXTENSIONS.md) - Skill/MCP extension lifecycle and trust model
+  - [Migration Guide](./docs/migration/MIGRATION_GUIDE.md) - Version migration and upgrade guide
   - Check the README files for comprehensive usage guidance
 - Configuration: See `.nano.yaml.example` for configuration examples and environment variables documentation
 

@@ -121,19 +121,6 @@ func (t *ImageGenerateTool) Schema() *interfaces.ToolSchema { //nolint:revive
 	)
 }
 
-// ImageGenerateResult represents a successful generation response
-type ImageGenerateResult struct {
-	URLs        []string `json:"urls"`
-	Prompt      string   `json:"prompt"`
-	AspectRatio string   `json:"aspect_ratio,omitempty"`
-	InputImages []string `json:"input_images,omitempty"`
-	IsEdit      bool     `json:"is_edit"`
-	Success     bool     `json:"success"`
-	Error       string   `json:"error,omitempty"`
-	Provider    string   `json:"provider,omitempty"`
-	Model       string   `json:"model,omitempty"`
-}
-
 // validateParams validates the input parameters
 func (t *ImageGenerateTool) validateParams(params map[string]interface{}) error {
 	if params == nil {
@@ -468,15 +455,15 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, params map[string]inter
 	}
 
 	// Create result with OSS URLs
-	generationResult := &ImageGenerateResult{
-		URLs:        ossImageURLs,
-		Prompt:      prompt,
-		AspectRatio: aspectRatio,
-		InputImages: inputImageURLs,
-		IsEdit:      len(inputImageURLs) > 0,
-		Success:     true,
-		Provider:    provider.Name(),
-		Model:       providerConfig.Model,
+	generationResult := map[string]interface{}{
+		"urls":         ossImageURLs,
+		"prompt":       prompt,
+		"aspect_ratio": aspectRatio,
+		"input_images": inputImageURLs,
+		"is_edit":      len(inputImageURLs) > 0,
+		"success":      true,
+		"provider":     provider.Name(),
+		"model":        providerConfig.Model,
 	}
 
 	// Format final result

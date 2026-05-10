@@ -59,6 +59,7 @@ func (t *BashOutputTool) Schema() *interfaces.ToolSchema {
 		"Retrieve output from a background shell task",
 		map[string]*interfaces.PropertySchema{
 			"task_id":     taskIDProp,
+			"session_id":  interfaces.NewStringProperty("Optional session ID to enforce task ownership (defaults to current turn session)"),
 			"from_offset": fromOffsetProp,
 			"block":       blockProp,
 			"max_lines":   maxLinesProp,
@@ -97,6 +98,21 @@ func (t *BashOutputTool) Execute(ctx context.Context, params map[string]interfac
 	blockTimeout := time.Duration(0)
 	if block {
 		blockTimeout = 10 * time.Second // 10 seconds
+	}
+
+	sessionID := "default"
+	if v, ok := params["session_id"].(string); ok && v != "" {
+		sessionID = v
+	} else if tc, ok := ctx.Value(interfaces.TurnContextKey{}).(interfaces.TurnContext); ok && tc.SessionID != "" {
+		sessionID = tc.SessionID
+	}
+	if _, ok := t.bgManager.GetForSession(taskID, sessionID); !ok {
+		return &interfaces.ToolResult{
+			Success:     false,
+			Error:       "task_id not found in this session",
+			UserContent: "❌ task_id not found in this session",
+			LLMContent:  "bash_output failed: task_id not found in this session",
+		}, nil
 	}
 
 	content, newOffset, status, err := t.bgManager.ReadOutput(taskID, fromOffset, blockTimeout, maxLines)

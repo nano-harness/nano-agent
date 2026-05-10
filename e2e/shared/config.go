@@ -63,21 +63,3 @@ func NewTestConfig(baseURL, workDir string, isDaemon bool) *config.Config {
 
 	return cfg
 }
-
-// NewTestConfigWithFork builds a test config with custom fork concurrency settings.
-// This is specifically for testing parallel sub-agent execution with controlled concurrency.
-func NewTestConfigWithFork(baseURL, workDir string, isDaemon bool, maxConcurrent int) *config.Config {
-	cfg := NewTestConfig(baseURL, workDir, isDaemon)
-
-	// Configure fork settings
-	if cfg.Advanced == nil {
-		cfg.Advanced = &config.AdvancedConfig{}
-	}
-	if cfg.Advanced.Fork == nil {
-		cfg.Advanced.Fork = &config.ForkAdvConfig{}
-	}
-	cfg.Advanced.Fork.MaxConcurrent = maxConcurrent
-	// Keep default MaxDepth of 3 unless specifically testing depth limits
-
-	return cfg
-}

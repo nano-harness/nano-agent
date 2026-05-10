@@ -54,15 +54,17 @@ type LLMClient interface {
 
 // Client represents an optimized LLM client using official OpenAI SDK
 type Client struct {
-	client         openai.Client
-	model          string
-	baseURL        string
-	provider       ProviderInfo
-	tools          []interfaces.Tool
-	tokenCounter   *TokenCounter
-	validator      *event.EventValidator
-	config         *config.Config // Add config to access reasoning settings
-	circuitBreaker *CircuitBreaker
+	client              openai.Client
+	model               string
+	baseURL             string
+	provider            ProviderInfo
+	tools               []interfaces.Tool
+	tokenCounter        *TokenCounter
+	toolGate            interfaces.ToolGate
+	validator           *event.EventValidator
+	config              *config.Config // Add config to access reasoning settings
+	circuitBreaker      *CircuitBreaker
+	truncationDetection bool
 }
 
 // NewClient creates a new optimized LLM client using official OpenAI SDK
@@ -72,14 +74,15 @@ func NewClient(apiKey, baseURL, model string, tools []interfaces.Tool) *Client {
 	opts := newOpenAIRequestOptions(apiKey, baseURL, cfg)
 
 	client := &Client{
-		client:         openai.NewClient(opts...),
-		model:          model,
-		baseURL:        baseURL,
-		provider:       NewProviderInfo(baseURL),
-		tools:          tools,
-		tokenCounter:   tokenCounter,
-		config:         cfg, // Store config for reasoning support
-		circuitBreaker: newCircuitBreakerFromConfig(cfg),
+		client:              openai.NewClient(opts...),
+		model:               model,
+		baseURL:             baseURL,
+		provider:            NewProviderInfo(baseURL),
+		tools:               tools,
+		tokenCounter:        tokenCounter,
+		config:              cfg, // Store config for reasoning support
+		circuitBreaker:      newCircuitBreakerForRoute(InferProviderID(baseURL, model), baseURL, cfg),
+		truncationDetection: truncationDetectionEnabled(cfg),
 	}
 
 	return client
@@ -221,6 +224,8 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 		var lastThinkingSendTime time.Time
 		const thinkingSendInterval = 300 * time.Millisecond
 		var lastSentReasoningLen int
+		var finishReason string
+		truncated := false
 
 		// Process streaming response
 		for stream.Next() {
@@ -350,6 +355,8 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 
 			// Check if stream is finished
 			if choice.FinishReason != "" {
+				finishReason = choice.FinishReason
+				truncated = c.truncationDetection && finishReason == "length"
 				toolCalls = assembler.FinalizeToolCalls(c.toolRequiresParameters)
 				break
 			}
@@ -373,7 +380,9 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 			if attempt < maxRetries && assembler.ContentLen() == 0 && IsRetryableError(err) {
 				lastErr = err
 				if c.circuitBreaker != nil {
-					c.circuitBreaker.RecordFailure()
+					if c.shouldRecordCBFailure(err) {
+						c.circuitBreaker.RecordFailure()
+					}
 					c.circuitBreaker.RecordRetry()
 				}
 
@@ -403,7 +412,7 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 			}
 
 			// Non-retryable or exhausted retries
-			if c.circuitBreaker != nil {
+			if c.circuitBreaker != nil && c.shouldRecordCBFailure(err) {
 				c.circuitBreaker.RecordFailure()
 			}
 			sanitizedOnEvent(event.StreamEvent{
@@ -420,7 +429,7 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 		}
 
 		// Finalize response without tool execution
-		return c.finalizeResponse(assembler.Content(), assembler.Reasoning(), toolCalls, sanitizedOnEvent, tokenStats)
+		return c.finalizeResponse(assembler.Content(), assembler.Reasoning(), toolCalls, sanitizedOnEvent, tokenStats, finishMetadata(truncated, finishReason))
 	}
 
 	// All retries exhausted (should not normally reach here)
@@ -529,6 +538,8 @@ func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages 
 		stream := c.client.Chat.Completions.NewStreaming(streamCtx, params)
 
 		var responseContent strings.Builder
+		var finishReason string
+		truncated := false
 
 		// Tool call aggregation
 		type toolCallBuilder struct {
@@ -629,6 +640,8 @@ func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages 
 
 			// Check if stream is finished
 			if choice.FinishReason != "" {
+				finishReason = choice.FinishReason
+				truncated = c.truncationDetection && finishReason == "length"
 				// Finalize all tool calls
 				for _, idx := range toolCallOrder {
 					if builder, ok := partialToolCalls[idx]; ok {
@@ -687,7 +700,9 @@ func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages 
 			if attempt < maxRetries && responseContent.Len() == 0 && IsRetryableError(err) {
 				lastErr = err
 				if c.circuitBreaker != nil {
-					c.circuitBreaker.RecordFailure()
+					if c.shouldRecordCBFailure(err) {
+						c.circuitBreaker.RecordFailure()
+					}
 					c.circuitBreaker.RecordRetry()
 				}
 
@@ -715,7 +730,7 @@ func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages 
 			}
 
 			// Non-retryable or exhausted retries
-			if c.circuitBreaker != nil {
+			if c.circuitBreaker != nil && c.shouldRecordCBFailure(err) {
 				c.circuitBreaker.RecordFailure()
 			}
 			sanitizedOnEvent(event.StreamEvent{
@@ -734,7 +749,7 @@ func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages 
 		logger.Debugf("Fallback stream completed successfully without reasoning")
 
 		// Finalize response without tool execution
-		return c.finalizeResponse(responseContent.String(), "", toolCalls, sanitizedOnEvent, tokenStats)
+		return c.finalizeResponse(responseContent.String(), "", toolCalls, sanitizedOnEvent, tokenStats, finishMetadata(truncated, finishReason))
 	}
 
 	// All retries exhausted
@@ -758,7 +773,11 @@ func (c *Client) StreamCompletionWithoutReasoning(ctx context.Context, messages 
 }
 
 // finalizeResponse sends the final response events
-func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []tools.ToolCall, onEvent func(event.StreamEvent), tokenStats *TokenStats) error {
+func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []tools.ToolCall, onEvent func(event.StreamEvent), tokenStats *TokenStats, finalMetadata ...map[string]interface{}) error {
+	metadata := map[string]interface{}(nil)
+	if len(finalMetadata) > 0 {
+		metadata = finalMetadata[0]
+	}
 	// Stop streaming and finalize token stats
 	tokenStats.StopStreaming()
 	tokenStats.ResponseSizeBytes = len(content)
@@ -827,6 +846,9 @@ func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []
 		contentEvent = contentEvent.WithContent(content)
 		contentEvent.ToolCalls = toolCallPtrs
 		contentEvent.Reasoning = reasoning
+		for k, v := range metadata {
+			contentEvent = contentEvent.WithMetadata(k, v)
+		}
 		onEvent(contentEvent)
 
 		logger.Debugf("Sent content event with reasoning: %t, tool_calls: %d", reasoning != "", len(toolCalls))
@@ -840,9 +862,36 @@ func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []
 	// Send completion event
 	doneEvent := event.NewStreamEvent(event.EventTypeDone, "llm_client")
 	doneEvent.Done = true
+	for k, v := range metadata {
+		doneEvent = doneEvent.WithMetadata(k, v)
+	}
 	onEvent(doneEvent)
 
 	return nil
+}
+
+func (c *Client) shouldRecordCBFailure(err error) bool {
+	if c.circuitBreaker == nil {
+		return false
+	}
+	if !c.circuitBreaker.config.ExcludeNonFailback {
+		return true
+	}
+	return ShouldRecordCBFailure(err)
+}
+
+func finishMetadata(truncated bool, finishReason string) map[string]interface{} {
+	if !truncated && finishReason == "" {
+		return nil
+	}
+	metadata := make(map[string]interface{})
+	if truncated {
+		metadata["truncated"] = true
+	}
+	if finishReason != "" {
+		metadata["finish_reason"] = finishReason
+	}
+	return metadata
 }
 
 // CompressionConfig holds configuration for conversation compression
@@ -1041,6 +1090,11 @@ func (sc *StreamingConversation) AddMessages(messages []Message) {
 func (c *Client) UpdateTools(tools []interfaces.Tool) {
 	c.tools = tools
 	logger.Debugf("Updated LLM client with %d tools", len(tools))
+}
+
+// SetToolGate updates the progressive disclosure gate used when exposing tool schemas.
+func (c *Client) SetToolGate(gate interfaces.ToolGate) {
+	c.toolGate = gate
 }
 
 // toolRequiresParameters checks if a tool requires mandatory parameters

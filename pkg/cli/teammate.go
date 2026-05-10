@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/agent"
+	"github.com/nano-harness/nano-agent/pkg/agentprofile"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/event"
@@ -15,7 +18,16 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewTeammateCommand creates the teammate command for subprocess execution
+// NewTeammateCommand creates the teammate command for subprocess execution.
+//
+// **Internal use only.** This subcommand is invoked by the `spawn_teammate`
+// tool when running teammates in subprocess mode (`docker_lifecycle=session`
+// or `subprocess` swarm backend). End users should never invoke
+// `nano teammate` directly; use `spawn_teammate` from a lead agent instead.
+//
+// The command is hidden from `nano --help` output and accepts a stable
+// argument set that is treated as a private contract between the cli layer
+// and pkg/swarm.
 func NewTeammateCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "teammate",
@@ -33,6 +45,9 @@ to identify the teammate's role and initial task.`,
 	cmd.Flags().String("name", "", "Teammate name")
 	cmd.Flags().String("session", "", "Parent session ID")
 	cmd.Flags().String("initial-prompt-file", "", "Path to file containing initial prompt")
+	cmd.Flags().Int("max-runtime-sec", 0, "Maximum teammate runtime in seconds (0 = unlimited)")
+	cmd.Flags().String("model", "", "Optional teammate-specific model override")
+	cmd.Flags().String("context-providers", "", "Comma-separated teammate context provider allowlist (memory,skills,openspec)")
 
 	// Mark required flags
 	_ = cmd.MarkFlagRequired("team")
@@ -49,6 +64,11 @@ func runTeammate(cmd *cobra.Command, args []string) error {
 	name, _ := cmd.Flags().GetString("name")
 	sessionID, _ := cmd.Flags().GetString("session")
 	promptFile, _ := cmd.Flags().GetString("initial-prompt-file")
+	maxRuntimeSec, _ := cmd.Flags().GetInt("max-runtime-sec")
+	model, _ := cmd.Flags().GetString("model")
+	contextProvidersFlag, _ := cmd.Flags().GetString("context-providers")
+	contextProviders := splitComma(contextProvidersFlag)
+	fallbacks := teammateProfileFallbacks(name, cfgWorkingDir(config.Get()))
 
 	// Validate parameters
 	if team == "" || name == "" || sessionID == "" || promptFile == "" {
@@ -67,19 +87,33 @@ func runTeammate(cmd *cobra.Command, args []string) error {
 	if cfg == nil {
 		return fmt.Errorf("configuration not initialized")
 	}
+	if model != "" {
+		childCfg := cfg.DeepCopy()
+		childCfg.Model = model
+		cfg = childCfg
+	}
 
 	// Create teammate identity
 	identity := &swarm.TeammateIdentity{
-		TeamName:        team,
-		AgentName:       name,
-		AgentID:         fmt.Sprintf("%s@%s", name, team),
-		ParentSessionID: sessionID,
+		TeamName:         team,
+		AgentName:        name,
+		AgentID:          fmt.Sprintf("%s@%s", name, team),
+		ParentSessionID:  sessionID,
+		Model:            model,
+		Fallbacks:        fallbacks,
+		ContextProviders: contextProviders,
 	}
+	cfg = configForTeammate(cfg, identity)
 
 	logger.Infof("Starting teammate '%s' in team '%s'", name, team)
 
 	// Setup signal handling
 	ctx := signalContext()
+	if maxRuntimeSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(maxRuntimeSec)*time.Second)
+		defer cancel()
+	}
 
 	// Create approval handler (auto-approve for teammates)
 	approvalHandler := func(info *agent.ToolCallInfo) bool {
@@ -101,6 +135,41 @@ func runTeammate(cmd *cobra.Command, args []string) error {
 
 	logger.Infof("Teammate '%s' completed successfully", name)
 	return nil
+}
+
+func splitComma(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func cfgWorkingDir(cfg *config.Config) string {
+	if cfg != nil && cfg.WorkingDir != "" {
+		return cfg.WorkingDir
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return ""
+}
+
+func teammateProfileFallbacks(name, cwd string) []string {
+	if name == "" || cwd == "" {
+		return nil
+	}
+	profile, ok := agentprofile.NewManager(cwd).Find(name)
+	if !ok || len(profile.Fallbacks) == 0 {
+		return nil
+	}
+	return append([]string(nil), profile.Fallbacks...)
 }
 
 // runTeammateLoop runs the teammate's main loop

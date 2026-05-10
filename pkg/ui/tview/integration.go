@@ -62,9 +62,27 @@ type Integration struct {
 	// thinking mode and other engine-level settings.
 	engine *engine.Engine
 
-	// newSessionCallback is invoked when Ctrl+R / /clear is triggered.
+	cronTracker cronStatusTracker
+
+	// newSessionCallback is invoked when Ctrl+L / /clear is triggered.
 	// It is wired by the cli layer to call agent.StartNewSession().
 	newSessionCallback func() string
+
+	// teamName, if non-empty, scopes /teammates and /agents listings.
+	teamName string
+
+	// localDispatcher is constructed lazily and shared with the bubbletea
+	// implementation. It is consulted for slash commands that have not been
+	// handled by the permission/engine pipeline above (e.g. /agents,
+	// /teammates, /checkpoint, /models, /skill:*, /opsx:*, /routines).
+	localDispatcher     *slash.LocalDispatcher
+	routinesLister      func() string
+	runningStatusLister func() string
+}
+
+type cronStatusTracker interface {
+	SetOnChange(func())
+	FormatIndicator() string
 }
 
 func (i *Integration) BindOutbound(send func(eventsource.Outbound) error) {
@@ -417,7 +435,35 @@ func (i *Integration) SetEngine(eng *engine.Engine) {
 	i.engine = eng
 }
 
-// SetNewSessionCallback wires the callback used by Ctrl+R / /clear to create
+func (i *Integration) SetCronTracker(t cronStatusTracker) {
+	i.cronTracker = t
+	if t == nil {
+		return
+	}
+	t.SetOnChange(func() {
+		indicator := t.FormatIndicator()
+		i.eventChan <- func() {
+			i.model.SetCronIndicator(indicator)
+		}
+	})
+	i.eventChan <- func() {
+		i.model.SetCronIndicator(t.FormatIndicator())
+	}
+}
+
+// SetRoutinesLister wires a callback for /routines list.
+func (i *Integration) SetRoutinesLister(fn func() string) {
+	i.routinesLister = fn
+	i.localDispatcher = nil
+}
+
+// SetRunningStatusLister wires a callback for /routines status.
+func (i *Integration) SetRunningStatusLister(fn func() string) {
+	i.runningStatusLister = fn
+	i.localDispatcher = nil
+}
+
+// SetNewSessionCallback wires the callback used by Ctrl+L / /clear to create
 // a new agent session.
 func (i *Integration) SetNewSessionCallback(cb func() string) {
 	i.newSessionCallback = cb
@@ -502,6 +548,13 @@ func (i *Integration) handleLocalSlashCommand(input string) bool {
 		i.model.AddMessage("system", "⚡ YOLO 模式已激活：所有工具将自动执行，无需确认。")
 		return true
 
+	case lower == "/plan":
+		if pm != nil {
+			pm.SetMode(permission.ModePlan)
+		}
+		i.model.AddMessage("system", "📋 Plan 模式已激活：只允许只读工具执行（用于安全代码分析）。使用 /permission default 恢复。")
+		return true
+
 	case lower == "/permissions":
 		if pm == nil {
 			i.model.AddMessage("system", "权限管理器未初始化。")
@@ -530,11 +583,11 @@ func (i *Integration) handleLocalSlashCommand(input string) bool {
 		}
 		mode := permission.PermissionMode(arg)
 		switch mode {
-		case permission.ModeDefault, permission.ModeAcceptEdits, permission.ModeYOLO:
+		case permission.ModeDefault, permission.ModeAcceptEdits, permission.ModePlan, permission.ModeAuto, permission.ModeYOLO:
 			pm.SetMode(mode)
 			i.model.AddMessage("system", fmt.Sprintf("✅ 权限模式已切换为：%s", arg))
 		default:
-			i.model.AddMessage("system", fmt.Sprintf("❌ 未知模式：%s（可选：default / acceptEdits / yolo）", arg))
+			i.model.AddMessage("system", fmt.Sprintf("❌ 未知模式：%s（可选：default / acceptEdits / plan / auto / yolo）", arg))
 		}
 		return true
 
@@ -586,10 +639,36 @@ func (i *Integration) handleLocalSlashCommand(input string) bool {
 		return true
 
 	case lower == "/clear", lower == "/new":
-		// /clear or /new: Start a new session (clear context) - equivalent to Ctrl+R
+		// /clear or /new: Start a new session (clear context) - equivalent to Ctrl+L
 		i.StartNewSession()
 		return true
 	}
 
+	// Fall through to the shared LocalDispatcher for /agents, /teammates,
+	// /checkpoint, /models, /skill:*, /opsx:*, /routines, ... so the tview
+	// frontend stays in sync with the bubbletea frontend.
+	if i.localDispatcher == nil {
+		d := slash.NewLocalDispatcher(i.teamName, i.workdir).
+			WithCheckpointer(slash.NewDefaultCheckpointManager(i.workdir))
+		if i.routinesLister != nil {
+			d = d.WithRoutinesLister(i.routinesLister)
+		}
+		if i.runningStatusLister != nil {
+			d = d.WithRunningStatusLister(i.runningStatusLister)
+		}
+		i.localDispatcher = d
+	}
+	if r := i.localDispatcher.Dispatch(input); r.Handled {
+		i.model.AddMessage("system", r.Message)
+		return true
+	}
+
 	return false
+}
+
+// SetTeamName scopes locally-handled slash commands such as /teammates and
+// /agents to a specific team. Pass an empty string to list all teams.
+func (i *Integration) SetTeamName(name string) {
+	i.teamName = name
+	i.localDispatcher = nil
 }

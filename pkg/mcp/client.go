@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/sandbox"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -32,6 +33,10 @@ type MCPClient struct { //nolint:revive
 
 	// Reconnection channel
 	reconnectChan chan string
+
+	// Sandbox runtime for stdio MCP servers.
+	sandboxRuntime    sandbox.Runtime
+	sandboxWorkingDir string
 
 	// Background context for long-lived goroutines (health checks, reconnect handler)
 	bgCtx    context.Context
@@ -92,6 +97,17 @@ func NewMCPClient(config *MCPConfig) *MCPClient {
 	client.diagnostics = NewDiagnostics(client, client.healthChecker)
 
 	return client
+}
+
+// SetSandboxRuntime configures process isolation for stdio MCP servers.
+func (c *MCPClient) SetSandboxRuntime(runtime sandbox.Runtime, workingDir ...string) {
+	if c == nil {
+		return
+	}
+	c.sandboxRuntime = runtime
+	if len(workingDir) > 0 {
+		c.sandboxWorkingDir = workingDir[0]
+	}
 }
 
 // Start initializes and connects to all configured MCP servers
@@ -262,7 +278,27 @@ func (c *MCPClient) createTransport(ctx context.Context, config MCPServerConfig)
 			return nil, nil, fmt.Errorf("command is required for stdio transport")
 		}
 
-		cmd := exec.Command(config.Command[0], config.Command[1:]...)
+		command := config.Command[0]
+		args := append([]string(nil), config.Command[1:]...)
+		if c.sandboxRuntime != nil {
+			env, err := c.sandboxRuntime.PrepareCommand(ctx, sandbox.SandboxRequest{
+				Command:    command,
+				Args:       args,
+				WorkingDir: c.sandboxWorkingDir,
+				Metadata: map[string]interface{}{
+					"tool":       "mcp_stdio_server",
+					"mcp_server": config.Name,
+					"transport":  string(TransportSTDIO),
+				},
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			command = env.Command
+			args = env.Args
+		}
+
+		cmd := exec.Command(command, args...)
 		// place child in its own process group so we can terminate group
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		return &mcp.CommandTransport{Command: cmd}, cmd, nil

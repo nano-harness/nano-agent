@@ -15,6 +15,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/nano-harness/nano-agent/pkg/sandbox"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/nano-harness/nano-agent/pkg/tools/system"
 )
@@ -106,6 +107,10 @@ type ToolScheduler struct {
 	securityDecisions map[string]*middleware.Decision
 	// agentConfig is used to check daemon confirm policy when no approval handler is present
 	agentConfig *config.Config
+	// hookEngine dispatches lifecycle hook events
+	hookEngine *middleware.HookEngine
+	// workDir is the working directory for hook execution context
+	workDir string
 }
 
 // SetEventHandler sets the event handler for the tool scheduler and propagates
@@ -151,6 +156,20 @@ func (ts *ToolScheduler) SetAgentConfig(cfg *config.Config) {
 	ts.mutex.Lock()
 	defer ts.mutex.Unlock()
 	ts.agentConfig = cfg
+}
+
+// SetHookEngine sets the hook engine for lifecycle event dispatch.
+func (ts *ToolScheduler) SetHookEngine(engine *middleware.HookEngine) {
+	ts.mutex.Lock()
+	defer ts.mutex.Unlock()
+	ts.hookEngine = engine
+}
+
+// SetWorkDir sets the working directory for hook execution context.
+func (ts *ToolScheduler) SetWorkDir(dir string) {
+	ts.mutex.Lock()
+	defer ts.mutex.Unlock()
+	ts.workDir = dir
 }
 
 func (ts *ToolScheduler) addAllowlistRules(call *ToolCallInfo) {
@@ -288,8 +307,10 @@ func (ts *ToolScheduler) setStatus(callID string, status ToolCallStatus, result 
 	var durationMs *int64
 	var success *bool
 	var errorStr string
+	var parameters map[string]interface{}
 	if toolCall != nil {
 		toolName = toolCall.Name
+		parameters = toolCall.Parameters
 		durationMs = toolCall.DurationMs
 		if toolCall.Result != nil {
 			s := toolCall.Result.Success
@@ -368,6 +389,18 @@ func (ts *ToolScheduler) setStatus(callID string, status ToolCallStatus, result 
 			ev = ev.WithMetadata("error", errorStr)
 		}
 		ts.eventHandler(ev)
+		if status == StatusAwaitingApproval {
+			ts.eventHandler(event.StreamEvent{
+				Type: event.EventTypeWaitingForUser,
+				Metadata: map[string]interface{}{
+					"kind":       "tool_approval_request",
+					"call_id":    callID,
+					"tool_name":  toolName,
+					"parameters": parameters,
+					"status":     string(status),
+				},
+			})
+		}
 	}
 
 	// Call callbacks outside of lock
@@ -454,6 +487,75 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 			continue
 		}
 
+		// Dispatch PreToolUse hook
+		ts.mutex.RLock()
+		hookEngine := ts.hookEngine
+		ts.mutex.RUnlock()
+		hookRequiresApproval := false
+		if hookEngine != nil {
+			hookDecision, err := hookEngine.Execute(ctx, middleware.HookPreToolUse, tool.Name, tool.Parameters)
+			if err != nil {
+				logger.Warnf("PreToolUse hook execution error for tool %s: %v", tool.Name, err)
+			}
+			if hookDecision != nil {
+				switch hookDecision.Action {
+				case middleware.ActionBlock:
+					// Hook blocked the tool execution
+					tr := &interfaces.ToolResult{
+						Success:     false,
+						Error:       "blocked by hook",
+						Metadata:    map[string]interface{}{"code": "hook_blocked", "tool_name": tool.Name, "hook_rule": hookDecision.Rule},
+						LLMContent:  fmt.Sprintf("Tool '%s' call blocked by hook: %s", tool.Name, hookDecision.Reason),
+						UserContent: fmt.Sprintf("工具 '%s' 被 hook 阻止: %s", tool.Name, hookDecision.Reason),
+					}
+					ts.mutex.Lock()
+					ts.toolCalls[tool.ID] = toolCall
+					ts.mutex.Unlock()
+					if ts.eventHandler != nil {
+						ts.eventHandler(event.StreamEvent{
+							Type: event.EventTypeToolCall,
+							ToolCalls: []*tools.ToolCall{{
+								ID:        toolCall.ID,
+								Name:      toolCall.Name,
+								Arguments: toolCall.Parameters,
+							}},
+						})
+						ts.eventHandler(event.StreamEvent{
+							Type: event.EventTypeToolResult,
+							ToolResult: &tools.ToolResult{
+								ID:      toolCall.ID,
+								Content: tr.LLMContent,
+								Error:   tr.Error,
+							},
+						})
+						ts.eventHandler(event.StreamEvent{
+							Type:   event.EventTypeToolUse,
+							Source: "agent_turn",
+							ToolUse: &event.ToolUse{
+								ID:         toolCall.ID,
+								ToolName:   toolCall.Name,
+								Parameters: toolCall.Parameters,
+								Status:     string(StatusError),
+								Result:     tr.UserContent,
+							},
+						})
+					}
+					ts.setStatus(tool.ID, StatusError, tr, fmt.Errorf("blocked by hook: %s", hookDecision.Reason))
+					continue
+				case middleware.ActionConfirm:
+					// Hook requires confirmation - mark for approval
+					toolCall.RequiresApproval = true
+					hookRequiresApproval = true
+				case middleware.ActionAllow:
+					// Hook allows - apply any parameter modifications
+					if len(hookDecision.ModifiedParams) > 0 {
+						tool.Parameters = middleware.MergeDecisionParams(tool.Parameters, hookDecision.ModifiedParams)
+						toolCall.Parameters = tool.Parameters
+					}
+				}
+			}
+		}
+
 		// Enforce allowed tools whitelist if set
 		policy := ts.policyEngine()
 		preflight := policy.PreflightTool(ctx, tool.Name, tool.Parameters, toolInstance)
@@ -509,7 +611,7 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 		}
 
 		// Check if tool requires confirmation.
-		toolCall.RequiresApproval = preflight.RequiresApproval
+		toolCall.RequiresApproval = hookRequiresApproval || preflight.RequiresApproval
 
 		// Unified security pre-analysis for tools that support it.
 		// This is the single source of truth: if the tool provides a security
@@ -615,7 +717,9 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 				continue
 			case middleware.ActionAllow:
 				// Safe command: no user confirmation needed.
-				toolCall.RequiresApproval = false
+				if !hookRequiresApproval {
+					toolCall.RequiresApproval = false
+				}
 			case middleware.ActionConfirm:
 				// Check if confidence is high enough to skip confirmation.
 				ts.mutex.RLock()
@@ -637,6 +741,10 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 					// Confirmation required: explicitly enforce approval even if earlier checks did not.
 					toolCall.RequiresApproval = true
 				}
+			}
+			if len(decision.ModifiedParams) > 0 && decision.Action != middleware.ActionBlock {
+				tool.Parameters = middleware.MergeDecisionParams(tool.Parameters, decision.ModifiedParams)
+				toolCall.Parameters = tool.Parameters
 			}
 			// Store decision for context injection during execution.
 			ts.mutex.Lock()
@@ -1281,6 +1389,9 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 		}
 		callCtx = system.WithOutputCallback(callCtx, cb)
 	}
+	if ts.eventHandler != nil {
+		callCtx = sandbox.WithEventPublisher(callCtx, sandboxEventPublisher{handler: ts.eventHandler})
+	}
 
 	ts.mutex.Unlock()
 	defer func() {
@@ -1326,6 +1437,31 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 	}
 
 	execResult := ts.recovery.ExecuteWithRecovery(callCtx, ts.toolbox, toolToExecute)
+
+	// Dispatch PostToolUse or PostToolUseFailure hook
+	ts.mutex.RLock()
+	hookEngine := ts.hookEngine
+	ts.mutex.RUnlock()
+	if hookEngine != nil {
+		hookEvent := middleware.HookPostToolUse
+		if execResult.Error != nil {
+			hookEvent = middleware.HookPostToolUseFailure
+		}
+		hookParams := make(map[string]interface{})
+		for k, v := range toolCall.Parameters {
+			hookParams[k] = v
+		}
+		if execResult.Result != nil {
+			hookParams["_result"] = execResult.Result
+		}
+		if execResult.Error != nil {
+			hookParams["_error"] = execResult.Error.Error()
+		}
+		_, err := hookEngine.Execute(callCtx, hookEvent, toolCall.Name, hookParams)
+		if err != nil {
+			logger.Warnf("PostToolUse hook execution error for tool %s: %v", toolCall.Name, err)
+		}
+	}
 
 	if execResult.Error != nil {
 		logger.Errorf("Tool %s failed after recovery: %v", toolCall.Name, execResult.Error)
@@ -1388,6 +1524,23 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 			},
 		})
 	}
+}
+
+type sandboxEventPublisher struct {
+	handler func(event.StreamEvent)
+}
+
+func (p sandboxEventPublisher) PublishSandboxEvent(ev sandbox.Event) {
+	if p.handler == nil {
+		return
+	}
+	p.handler(event.StreamEvent{
+		Type:      event.EventType(ev.Type),
+		Content:   ev.Content,
+		Source:    ev.Source,
+		Timestamp: ev.Timestamp,
+		Metadata:  ev.Metadata,
+	})
 }
 
 // GetToolCallStatus returns the current status of a tool call

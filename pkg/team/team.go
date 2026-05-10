@@ -33,15 +33,28 @@ type Team struct {
 
 // TeamMember represents a teammate in the swarm
 type TeamMember struct {
-	AgentID    string `json:"agentId"`              // Fully qualified ID like "researcher@alpha"
-	Name       string `json:"name"`                 // Short name like "researcher"
-	Color      string `json:"color,omitempty"`      // Optional UI color
-	Mode       string `json:"mode,omitempty"`       // Default permission mode
-	IsActive   bool   `json:"isActive"`             // Whether the teammate is currently active
-	TmuxPaneID string `json:"tmuxPaneId,omitempty"` // Tmux pane ID for subprocess teammates
-	PID        int    `json:"pid,omitempty"`        // Process ID for subprocess teammates
-	SessionID  string `json:"sessionId"`            // Session ID for this teammate
-	Kind       string `json:"kind"`                 // KindInProcess or KindSubprocess
+	AgentID          string        `json:"agentId"`                    // Fully qualified ID like "researcher@alpha"
+	Name             string        `json:"name"`                       // Short name like "researcher"
+	Color            string        `json:"color,omitempty"`            // Optional UI color
+	Mode             string        `json:"mode,omitempty"`             // Default permission mode
+	IsActive         bool          `json:"isActive"`                   // Whether the teammate is currently active
+	TmuxPaneID       string        `json:"tmuxPaneId,omitempty"`       // Tmux pane ID for subprocess teammates
+	PID              int           `json:"pid,omitempty"`              // Process ID for subprocess teammates
+	SessionID        string        `json:"sessionId"`                  // Session ID for this teammate
+	Kind             string        `json:"kind"`                       // KindInProcess or KindSubprocess
+	Model            string        `json:"model,omitempty"`            // Optional teammate-specific model override
+	Fallbacks        []string      `json:"fallbacks,omitempty"`        // Optional teammate-specific fallback route chain
+	ContextProviders []string      `json:"contextProviders,omitempty"` // Optional teammate context provider allowlist
+	MaxRuntimeSec    int           `json:"maxRuntimeSec,omitempty"`    // Max runtime in seconds (0 = unlimited)
+	Sandbox          SandboxPolicy `json:"sandbox,omitempty"`          // Sandbox lifecycle policy for this teammate
+}
+
+// SandboxPolicy records the sandbox isolation contract assigned to a teammate.
+type SandboxPolicy struct {
+	Backend   string `json:"backend,omitempty"`   // none/native/docker
+	Lifecycle string `json:"lifecycle,omitempty"` // session/task/command
+	Scope     string `json:"scope,omitempty"`     // team/subagent/daemon/local
+	SessionID string `json:"sessionId,omitempty"` // sandbox session/container owner
 }
 
 // TeamsRoot returns the root directory for all teams (~/.nano/teams)

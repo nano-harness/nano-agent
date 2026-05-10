@@ -175,13 +175,14 @@ func TestAutoInvokeDefault(t *testing.T) {
 
 func TestManagerDiscover(t *testing.T) {
 	dir := t.TempDir()
+	personalDir := filepath.Join(t.TempDir(), "personal-empty")
 
 	// Create project skills directory
 	projSkillsDir := filepath.Join(dir, ".nano", "skills")
 	createTestSkill(t, projSkillsDir, "code-review", "code-review", "Review code quality", []string{"review", "code review"})
 	createTestSkill(t, projSkillsDir, "deploy", "deploy", "Deployment guide", []string{"deploy", "release"})
 
-	mgr := NewManager(dir, "", filepath.Join(dir, ".nano", "skills"), 0, 0, 0, true)
+	mgr := NewManager(dir, personalDir, filepath.Join(dir, ".nano", "skills"), 0, 0, 0, true)
 	if err := mgr.Discover(); err != nil {
 		t.Fatalf("Discover failed: %v", err)
 	}
@@ -353,10 +354,11 @@ func TestMatchGlobs(t *testing.T) {
 
 func TestMatchSkipsActiveSkills(t *testing.T) {
 	dir := t.TempDir()
+	personalDir := filepath.Join(t.TempDir(), "personal-empty")
 	projDir := filepath.Join(dir, "skills")
 	createTestSkill(t, projDir, "review", "review", "Review", []string{"review"})
 
-	mgr := NewManager(dir, "", projDir, 0, 0, 5, true)
+	mgr := NewManager(dir, personalDir, projDir, 0, 0, 5, true)
 	if err := mgr.Discover(); err != nil {
 		t.Fatal(err)
 	}

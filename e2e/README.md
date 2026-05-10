@@ -84,7 +84,23 @@ make e2e-client   # Client mode tests only
 make e2e-tui      # TUI mode tests only
 make e2e-binary   # Binary mode tests only
 make e2e-expert   # Sub-agent/expert tests (single + parallel)
+make test-e2e     # Real PTY smoke tests with race detector
 ```
+
+### Real PTY TUI E2E
+
+The Bubble Tea TUI has black-box PTY coverage in `tui/tui_e2e_test.go`, backed by
+`Netflix/go-expect` and `creack/pty`. These tests build `cmd/nano`, attach it to
+a real pseudoterminal, and assert startup, prompt readiness, file picker,
+`/clear`, and Ctrl+C shutdown behavior.
+
+```bash
+go test -race -tags=e2e -timeout=5m ./e2e/tui/...
+EXPECT_DEBUG=1 go test -tags=e2e -run TestE2E_TUI_ ./e2e/tui/...
+```
+
+Supported CI platforms are Linux and macOS. Windows PTY behavior is outside the
+current support scope for `go-expect`.
 
 ### Single Test
 ```bash

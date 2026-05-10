@@ -2,7 +2,11 @@ package swarm
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
+
+	"github.com/nano-harness/nano-agent/pkg/team"
 )
 
 func TestWithTeammate_FromContext_RoundTrip(t *testing.T) {
@@ -12,6 +16,10 @@ func TestWithTeammate_FromContext_RoundTrip(t *testing.T) {
 		AgentName:        "researcher",
 		TeamName:         "alpha",
 		Color:            "#FF5733",
+		PermissionMode:   "acceptEdits",
+		AllowedTools:     []string{"read_file", "run_shell_command"},
+		Model:            "gpt-5-mini",
+		ContextProviders: []string{"memory", "skills"},
 		PlanModeRequired: true,
 		ParentSessionID:  "session-123",
 	}
@@ -37,6 +45,18 @@ func TestWithTeammate_FromContext_RoundTrip(t *testing.T) {
 	}
 	if retrieved.Color != identity.Color {
 		t.Errorf("Color mismatch: got %q, want %q", retrieved.Color, identity.Color)
+	}
+	if retrieved.PermissionMode != identity.PermissionMode {
+		t.Errorf("PermissionMode mismatch: got %q, want %q", retrieved.PermissionMode, identity.PermissionMode)
+	}
+	if len(retrieved.AllowedTools) != 2 || retrieved.AllowedTools[0] != "read_file" || retrieved.AllowedTools[1] != "run_shell_command" {
+		t.Errorf("AllowedTools mismatch: got %#v", retrieved.AllowedTools)
+	}
+	if retrieved.Model != "gpt-5-mini" {
+		t.Errorf("Model = %q, want gpt-5-mini", retrieved.Model)
+	}
+	if len(retrieved.ContextProviders) != 2 || retrieved.ContextProviders[0] != "memory" || retrieved.ContextProviders[1] != "skills" {
+		t.Errorf("ContextProviders mismatch: got %#v", retrieved.ContextProviders)
 	}
 	if retrieved.PlanModeRequired != identity.PlanModeRequired {
 		t.Errorf("PlanModeRequired mismatch: got %v, want %v", retrieved.PlanModeRequired, identity.PlanModeRequired)
@@ -176,5 +196,149 @@ func TestWithTeammate_NilParent(t *testing.T) {
 	}
 	if retrieved.AgentID != identity.AgentID {
 		t.Errorf("AgentID mismatch: got %q, want %q", retrieved.AgentID, identity.AgentID)
+	}
+}
+
+type captureRunner struct {
+	identity *TeammateIdentity
+}
+
+func (r *captureRunner) Run(_ context.Context, identity *TeammateIdentity, _ string) error {
+	r.identity = identity
+	return nil
+}
+
+func TestSpawnInProcessCarriesAllowedTools(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := team.CreateTeam("alpha", "test", "team-lead@alpha", "lead-alpha-chat-1"); err != nil {
+		t.Fatal(err)
+	}
+	runner := &captureRunner{}
+	handle, err := SpawnInProcess(context.Background(), SpawnOptions{
+		TeamName:      "alpha",
+		Name:          "reviewer",
+		InitialPrompt: "review",
+		AllowedTools:  []string{"read_file"},
+		Runner:        runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-handle.Done; err != nil {
+		t.Fatal(err)
+	}
+	if runner.identity == nil || len(runner.identity.AllowedTools) != 1 || runner.identity.AllowedTools[0] != "read_file" {
+		t.Fatalf("allowed tools not propagated: %+v", runner.identity)
+	}
+}
+
+func TestSpawnInProcessCarriesModel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := team.CreateTeam("alpha", "test", "team-lead@alpha", "lead-alpha-chat-1"); err != nil {
+		t.Fatal(err)
+	}
+	runner := &captureRunner{}
+	handle, err := SpawnInProcess(context.Background(), SpawnOptions{
+		TeamName:      "alpha",
+		Name:          "reviewer",
+		InitialPrompt: "review",
+		Model:         "gpt-5-mini",
+		Runner:        runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-handle.Done; err != nil {
+		t.Fatal(err)
+	}
+	if runner.identity == nil || runner.identity.Model != "gpt-5-mini" {
+		t.Fatalf("model not propagated: %+v", runner.identity)
+	}
+	created, err := team.ReadTeam("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Members) != 1 || created.Members[0].Model != "gpt-5-mini" {
+		t.Fatalf("member model not recorded: %+v", created.Members)
+	}
+}
+
+func TestSpawnInProcessCarriesContextProviders(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := team.CreateTeam("alpha", "test", "team-lead@alpha", "lead-alpha-chat-1"); err != nil {
+		t.Fatal(err)
+	}
+	runner := &captureRunner{}
+	handle, err := SpawnInProcess(context.Background(), SpawnOptions{
+		TeamName:         "alpha",
+		Name:             "reviewer",
+		InitialPrompt:    "review",
+		ContextProviders: []string{"memory", "skills"},
+		Runner:           runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-handle.Done; err != nil {
+		t.Fatal(err)
+	}
+	if runner.identity == nil || len(runner.identity.ContextProviders) != 2 {
+		t.Fatalf("context providers not propagated: %+v", runner.identity)
+	}
+	created, err := team.ReadTeam("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Members) != 1 || len(created.Members[0].ContextProviders) != 2 {
+		t.Fatalf("member context providers not recorded: %+v", created.Members)
+	}
+}
+
+type waitForCancelRunner struct {
+	seenCtx context.Context
+}
+
+func (r *waitForCancelRunner) Run(ctx context.Context, _ *TeammateIdentity, _ string) error {
+	r.seenCtx = ctx
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestSpawnInProcessEnforcesMaxRuntime(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := team.CreateTeam("alpha", "test", "team-lead@alpha", "lead-alpha-chat-1"); err != nil {
+		t.Fatal(err)
+	}
+	runner := &waitForCancelRunner{}
+	handle, err := SpawnInProcess(context.Background(), SpawnOptions{
+		TeamName:      "alpha",
+		Name:          "reviewer",
+		InitialPrompt: "review",
+		MaxRuntimeSec: 1,
+		Runner:        runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-handle.Done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Done error = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("teammate did not stop after max runtime")
+	}
+	if runner.seenCtx == nil {
+		t.Fatal("runner did not receive context")
+	}
+	created, err := team.ReadTeam("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Members) != 1 || created.Members[0].IsActive {
+		t.Fatalf("teammate was not deactivated after max runtime: %+v", created.Members)
+	}
+	if created.Members[0].MaxRuntimeSec != 1 {
+		t.Fatalf("member MaxRuntimeSec = %d, want 1", created.Members[0].MaxRuntimeSec)
 	}
 }

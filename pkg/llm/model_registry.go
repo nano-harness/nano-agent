@@ -190,19 +190,24 @@ func InferModelProfile(modelName string) ModelProfile {
 	}
 
 	// 2. Prefix match: find the longest registry key that is a prefix of the model name
-	best := ""
-	for key := range modelRegistry {
-		if strings.HasPrefix(lower, key) && len(key) > len(best) {
-			// Ensure the prefix is followed by a non-alphanumeric character or end-of-string
-			// to avoid "gpt-4" matching "gpt-4o"
-			rest := lower[len(key):]
-			if rest == "" || !isAlphaNum(rune(rest[0])) {
-				best = key
-			}
-		}
+	if p, ok := longestPrefixMatch(lower); ok {
+		return p
 	}
-	if best != "" {
-		return modelRegistry[best]
+
+	// 2.5. Vendor prefixes sometimes use separators other than "/" (e.g. aliyun-glm-5.1).
+	remaining := lower
+	for {
+		idx := strings.IndexAny(remaining, "-_")
+		if idx < 0 || idx >= len(remaining)-1 {
+			break
+		}
+		remaining = remaining[idx+1:]
+		if p, ok := modelRegistry[remaining]; ok {
+			return p
+		}
+		if p, ok := longestPrefixMatch(remaining); ok {
+			return p
+		}
 	}
 
 	// 3. Keyword inference from context-window size hints in the name
@@ -212,6 +217,22 @@ func InferModelProfile(modelName string) ModelProfile {
 
 	// 4. Conservative default
 	return defaultProfile
+}
+
+func longestPrefixMatch(lower string) (ModelProfile, bool) {
+	best := ""
+	for key := range modelRegistry {
+		if strings.HasPrefix(lower, key) && len(key) > len(best) {
+			rest := lower[len(key):]
+			if rest == "" || !isAlphaNum(rune(rest[0])) {
+				best = key
+			}
+		}
+	}
+	if best == "" {
+		return ModelProfile{}, false
+	}
+	return modelRegistry[best], true
 }
 
 // ComputeProfileFromContextWindow returns a ModelProfile computed solely from

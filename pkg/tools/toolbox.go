@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -17,6 +16,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/mcp"
 	"github.com/nano-harness/nano-agent/pkg/openspec"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
+	"github.com/nano-harness/nano-agent/pkg/toolruntime"
 	"github.com/nano-harness/nano-agent/pkg/tools/filesystem"
 	mcptool "github.com/nano-harness/nano-agent/pkg/tools/mcp"
 	openspectool "github.com/nano-harness/nano-agent/pkg/tools/openspec"
@@ -28,18 +28,20 @@ import (
 
 // ToolboxConfig holds configuration for the toolbox
 type ToolboxConfig struct {
-	WorkingDirectory string            `json:"working_directory"`
-	Timeout          time.Duration     `json:"timeout"`
-	MaxFileSize      int64             `json:"max_file_size"`
-	MaxResponseSize  int64             `json:"max_response_size"`
-	UserAgent        string            `json:"user_agent"`
-	AllowedCommands  []string          `json:"allowed_commands"`
-	BlockedCommands  []string          `json:"blocked_commands"`
-	EnabledTools     []string          `json:"enabled_tools"`
-	DisabledTools    []string          `json:"disabled_tools"`
-	WebSearchAPIKeys map[string]string `json:"web_search_api_keys"`
-	EnableMCP        bool              `json:"enable_mcp"`
-	MCPConfig        *mcp.MCPConfig    `json:"mcp"`
+	WorkingDirectory      string            `json:"working_directory"`
+	Timeout               time.Duration     `json:"timeout"`
+	MaxFileSize           int64             `json:"max_file_size"`
+	MaxResponseSize       int64             `json:"max_response_size"`
+	UserAgent             string            `json:"user_agent"`
+	AllowedCommands       []string          `json:"allowed_commands"`
+	BlockedCommands       []string          `json:"blocked_commands"`
+	SensitiveReadPaths    []string          `json:"sensitive_read_paths"`
+	ArbitraryExecCommands []string          `json:"arbitrary_exec_commands"`
+	EnabledTools          []string          `json:"enabled_tools"`
+	DisabledTools         []string          `json:"disabled_tools"`
+	WebSearchAPIKeys      map[string]string `json:"web_search_api_keys"`
+	EnableMCP             bool              `json:"enable_mcp"`
+	MCPConfig             *mcp.MCPConfig    `json:"mcp"`
 
 	// Tool-specific configurations
 	ReadFileMaxLines    int
@@ -94,6 +96,7 @@ type Toolbox struct {
 	toolsUpdateChan chan UpdateEvent          // Channel for tools update events
 	readFileState   *filesystem.ReadFileState // shared by ReadFileTool and EditTool
 	chain           *middleware.Chain         // Middleware chain applied to all Execute calls
+	runtime         *toolruntime.Runtime
 }
 
 // MCP returns the MCP client
@@ -101,105 +104,14 @@ func (tb *Toolbox) MCP() *mcp.MCPClient {
 	return tb.mcpClient
 }
 
-// DefaultToolRegistry is the default implementation of ToolRegistry
-type DefaultToolRegistry struct {
-	tools map[string]interfaces.Tool
-	mutex sync.RWMutex
-}
+// DefaultToolRegistry is re-exported for backward compatibility with callers
+// that constructed toolruntime.Registry through the tools package before the
+// toolruntime package owned registry execution.
+type DefaultToolRegistry = toolruntime.Registry
 
-// NewDefaultToolRegistry creates a new DefaultToolRegistry
+// NewDefaultToolRegistry creates a new DefaultToolRegistry.
 func NewDefaultToolRegistry() *DefaultToolRegistry {
-	return &DefaultToolRegistry{
-		tools: make(map[string]interfaces.Tool),
-	}
-}
-
-// Register adds a tool to the registry
-func (r *DefaultToolRegistry) Register(tool interfaces.Tool) error {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-
-	name := tool.Name()
-	if _, exists := r.tools[name]; exists {
-		return fmt.Errorf("tool '%s' is already registered", name)
-	}
-
-	r.tools[name] = tool
-	return nil
-}
-
-// Unregister removes a tool from the registry
-func (r *DefaultToolRegistry) Unregister(name string) error {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-
-	if _, exists := r.tools[name]; !exists {
-		return fmt.Errorf("tool '%s' is not registered", name)
-	}
-
-	delete(r.tools, name)
-	return nil
-}
-
-// Get retrieves a tool by name
-func (r *DefaultToolRegistry) Get(name string) (interfaces.Tool, bool) {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	tool, exists := r.tools[name]
-	return tool, exists
-}
-
-// List returns all registered tools
-func (r *DefaultToolRegistry) List() []interfaces.Tool {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	tools := make([]interfaces.Tool, 0, len(r.tools))
-	for _, tool := range r.tools {
-		tools = append(tools, tool)
-	}
-	return tools
-}
-
-// ListByCategory returns tools in a specific category
-func (r *DefaultToolRegistry) ListByCategory(category interfaces.ToolCategory) []interfaces.Tool {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	var tools []interfaces.Tool
-	for _, tool := range r.tools {
-		if tool.Category() == category {
-			tools = append(tools, tool)
-		}
-	}
-	return tools
-}
-
-// Schemas returns all tool schemas for LLM consumption
-func (r *DefaultToolRegistry) Schemas() map[string]*interfaces.ToolSchema {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	schemas := make(map[string]*interfaces.ToolSchema)
-	for name, tool := range r.tools {
-		schemas[name] = tool.Schema()
-	}
-	return schemas
-}
-
-// Execute runs a tool with given parameters
-func (r *DefaultToolRegistry) Execute(ctx context.Context, name string, params map[string]interface{}) (*interfaces.ToolResult, error) {
-	r.mutex.RLock()
-	tool, exists := r.tools[name]
-	r.mutex.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("tool '%s' not found", name)
-	}
-
-	// Execute the tool
-	return tool.Execute(ctx, params)
+	return toolruntime.NewRegistry()
 }
 
 // NewToolbox creates a new toolbox with default tools
@@ -223,6 +135,7 @@ func NewToolbox(workingDir string, config *ToolboxConfig, _ interface{}) *Toolbo
 
 	tb.registerDefaultTools()
 	tb.chain = tb.buildDefaultChain()
+	tb.runtime = toolruntime.NewRuntime(tb.registry, tb.chain, nil)
 
 	// Initialize MCP if enabled
 	if config.EnableMCP {
@@ -237,7 +150,14 @@ func (tb *Toolbox) buildDefaultChain() *middleware.Chain {
 	var ms []middleware.ToolMiddleware
 	ms = append(ms, middleware.NewMetricsMiddleware())
 
-	guard := middleware.NewCommandGuard(nil, nil, nil)
+	guard := middleware.NewCommandGuardWithConfig(
+		nil,
+		nil,
+		nil,
+		tb.workingDir,
+		tb.config.SensitiveReadPaths,
+		tb.config.ArbitraryExecCommands,
+	)
 	pathChecker := sandbox.NewPathChecker(tb.config.sandboxConfig())
 	const defaultMaxFileSize = 100 * 1024 * 1024 // 100 MB
 	ms = append(ms, middleware.NewSecurityMiddleware(guard, pathChecker, defaultMaxFileSize))
@@ -248,6 +168,9 @@ func (tb *Toolbox) buildDefaultChain() *middleware.Chain {
 // SetMiddlewareChain replaces the toolbox middleware chain.
 func (tb *Toolbox) SetMiddlewareChain(chain *middleware.Chain) {
 	tb.chain = chain
+	if tb.runtime != nil {
+		tb.runtime.SetMiddlewareChain(chain)
+	}
 }
 
 // registerDefaultTools registers the default set of tools
@@ -302,6 +225,7 @@ func (tb *Toolbox) registerDefaultTools() {
 
 	coreTools := []interfaces.Tool{
 		filesystem.NewReadFileToolWithState(tb.workingDir, config, pathChecker, readFileState),
+		filesystem.NewReadPDFTool(tb.workingDir, pathChecker),
 		filesystem.NewCodeSkeletonTool(tb.workingDir, config, nil),
 		filesystem.NewWriteFileToolWithState(tb.workingDir, config, pathChecker, readFileState),
 		filesystem.NewEditToolWithState(tb.workingDir, config, pathChecker, readFileState),
@@ -409,12 +333,7 @@ func (tb *Toolbox) List() []interfaces.Tool {
 
 // Descriptors returns typed metadata for all registered tools.
 func (tb *Toolbox) Descriptors() []ToolDescriptor {
-	registered := tb.registry.List()
-	descriptors := make([]ToolDescriptor, 0, len(registered))
-	for _, tool := range registered {
-		descriptors = append(descriptors, DescriptorFor(tool))
-	}
-	return descriptors
+	return toolruntime.NewCatalog(tb.registry).Descriptors()
 }
 
 // ListByCategory returns tools in a specific category
@@ -427,23 +346,16 @@ func (tb *Toolbox) Schemas() map[string]*interfaces.ToolSchema {
 	return tb.registry.Schemas()
 }
 
-// Execute runs a tool with given parameters through the middleware chain.
+// Execute runs a tool with given parameters through ToolRuntime.
 func (tb *Toolbox) Execute(ctx context.Context, name string, params map[string]interface{}) (*interfaces.ToolResult, error) {
 	logger.Infof("Running tool: %s", name)
 
-	tool, ok := tb.registry.Get(name)
-	if !ok {
-		return nil, fmt.Errorf("tool '%s' not found", name)
+	// Keep Execute safe for compatibility with legacy tests and callers that
+	// construct Toolbox literals instead of using NewToolbox.
+	if tb.runtime == nil {
+		tb.runtime = toolruntime.NewRuntime(tb.registry, tb.chain, nil)
 	}
-
-	// If a middleware chain is configured, route through it.
-	if tb.chain != nil {
-		return tb.chain.Execute(ctx, tool, params, func(ctx context.Context, t interfaces.Tool, p map[string]interface{}) (*interfaces.ToolResult, error) {
-			return t.Execute(ctx, p)
-		})
-	}
-
-	return tool.Execute(ctx, params)
+	return tb.runtime.Execute(ctx, name, params)
 }
 
 // GetConfig returns the toolbox configuration
@@ -551,6 +463,7 @@ func (tb *Toolbox) initializeMCP() {
 
 	// Create MCP client
 	tb.mcpClient = mcp.NewMCPClient(mcpConfig)
+	tb.mcpClient.SetSandboxRuntime(sandbox.NewRuntime(tb.config.sandboxConfig(), tb.workingDir), tb.workingDir)
 
 	logger.Info("MCP client initialized successfully")
 }

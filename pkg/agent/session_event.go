@@ -24,16 +24,46 @@ type SessionEvent struct {
 	Reasoning   string                 `json:"reasoning,omitempty"`    // Reasoning tokens from the model
 	Timestamp   int64                  `json:"timestamp"`              // Unix timestamp
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`     // Additional metadata
+	Seq         int64                  `json:"seq,omitempty"`          // Monotonic sequence number for resume
+
+	StateTransition *StateTransition  `json:"state_transition,omitempty"`  // State machine transition event
+	Compaction      *CompactionMarker `json:"compaction_marker,omitempty"` // Autocompact checkpoint marker
+}
+
+const (
+	SessionEventTypeCompactionMarker = "compaction_marker"
+	SessionEventTypeStateTransition  = "state_transition"
+	SessionEventTypeCheckpoint       = "checkpoint"
+)
+
+// StateTransition describes a session lifecycle state transition.
+type StateTransition struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// CompactionMarker records a durable context compaction checkpoint.
+type CompactionMarker struct {
+	OriginalMessageCount   int    `json:"original_message_count"`
+	CompressedMessageCount int    `json:"compressed_message_count"`
+	OriginalTokens         int    `json:"original_tokens"`
+	CompressedTokens       int    `json:"compressed_tokens"`
+	SummaryHash            string `json:"summary_hash"`
+	LastSeqBeforeCompact   int64  `json:"last_seq_before_compact"`
 }
 
 // SessionIndexEntry represents metadata for a single session in sessions-index.json
 type SessionIndexEntry struct {
-	ID           string `json:"id"`
-	Summary      string `json:"summary,omitempty"` // First user message or AI-generated summary
-	MessageCount int    `json:"message_count"`
-	CreatedAt    int64  `json:"created_at"`  // Unix timestamp
-	ModifiedAt   int64  `json:"modified_at"` // Unix timestamp
-	WorkingDir   string `json:"working_dir"` // Project working directory
+	ID                string `json:"id"`
+	Summary           string `json:"summary,omitempty"` // First user message or AI-generated summary
+	MessageCount      int    `json:"message_count"`
+	CreatedAt         int64  `json:"created_at"`  // Unix timestamp
+	ModifiedAt        int64  `json:"modified_at"` // Unix timestamp
+	WorkingDir        string `json:"working_dir"` // Project working directory
+	LastSeq           int64  `json:"last_seq,omitempty"`
+	LastCompactionSeq int64  `json:"last_compaction_seq,omitempty"`
+	State             string `json:"state,omitempty"`
 }
 
 // SessionEventsToMessages converts a slice of SessionEvent to llm.Message slice
@@ -41,6 +71,10 @@ func SessionEventsToMessages(events []SessionEvent) []llm.Message {
 	messages := make([]llm.Message, 0, len(events))
 
 	for _, event := range events {
+		switch event.Type {
+		case SessionEventTypeCompactionMarker, SessionEventTypeStateTransition, SessionEventTypeCheckpoint:
+			continue
+		}
 		msg := llm.Message{
 			Role:        event.Role,
 			Content:     event.Content,
@@ -60,7 +94,7 @@ func SessionEventsToMessages(events []SessionEvent) []llm.Message {
 func MessagesToSessionEvents(messages []llm.Message) []SessionEvent {
 	events := make([]SessionEvent, 0, len(messages))
 
-	for _, msg := range messages {
+	for i, msg := range messages {
 		eventType := "message"
 		switch msg.Role {
 		case "user":
@@ -81,6 +115,7 @@ func MessagesToSessionEvents(messages []llm.Message) []SessionEvent {
 			ToolCallID:  msg.ToolCallID,
 			Reasoning:   msg.Reasoning,
 			Timestamp:   time.Now().Unix(), // Set timestamp per message
+			Seq:         int64(i + 1),
 		}
 		events = append(events, event)
 	}

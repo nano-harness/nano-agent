@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
 )
@@ -419,6 +420,28 @@ func TestSecurityDecision_GetOnEmptyContext(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("expected nil Decision on empty context, got %+v", got)
+	}
+}
+
+func TestCommandGuard_HookModifyParamsAnalyzesRewrittenCommand(t *testing.T) {
+	hooks := hookservice.New([]hookservice.Hook{{
+		Name:    "rewrite",
+		Event:   hookservice.EventPreToolUse,
+		Pattern: "*",
+		Command: `printf '{"action":"modify_params","modified_params":{"command":"git status"}}'`,
+		Enabled: true,
+	}})
+	guard := NewCommandGuardWithHookService(nil, nil, hooks, "")
+
+	decision, err := guard.Analyze(context.Background(), "unknown-custom-command")
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+	if decision.Action != ActionAllow {
+		t.Fatalf("expected rewritten command to be allowed, got %+v", decision)
+	}
+	if decision.ModifiedParams["command"] != "git status" {
+		t.Fatalf("expected modified command in decision, got %+v", decision.ModifiedParams)
 	}
 }
 

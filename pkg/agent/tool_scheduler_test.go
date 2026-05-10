@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/nano-harness/nano-agent/pkg/sandbox"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/nano-harness/nano-agent/pkg/tools/system"
 )
@@ -125,6 +127,64 @@ func TestToolScheduler_ToolNotFoundEmitsEventsAndResult(t *testing.T) {
 	}
 	if !sawCall || !sawResult || !sawUse {
 		t.Fatalf("expected ToolCall/ToolResult/ToolUse events, got call=%v result=%v use=%v", sawCall, sawResult, sawUse)
+	}
+}
+
+func TestToolSchedulerBridgesSandboxEvents(t *testing.T) {
+	ensureConfigLoaded(t)
+	tempDir := t.TempDir()
+	tb := tools.NewToolbox(tempDir, nil, nil)
+
+	var mu sync.Mutex
+	var events []event.StreamEvent
+	handler := func(e event.StreamEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     handler,
+		RecoveryStrategy: NewToolRecoveryStrategy(handler),
+	})
+	results, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:   "shell-1",
+		Name: "run_shell_command",
+		Parameters: map[string]interface{}{
+			"command":         "echo scheduler",
+			"directory":       tempDir,
+			"timeout_seconds": float64(5),
+			"capture_output":  true,
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results["shell-1"] == nil || !results["shell-1"].Success {
+		t.Fatalf("shell result = %#v", results["shell-1"])
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	seenStarted := false
+	seenFinished := false
+	for _, ev := range events {
+		switch ev.Type {
+		case event.EventType(sandbox.EventTypeSandboxCommandStarted):
+			seenStarted = true
+			if ev.Metadata["sandbox"] == nil {
+				t.Fatalf("started event missing sandbox metadata: %#v", ev)
+			}
+		case event.EventType(sandbox.EventTypeSandboxCommandFinished):
+			seenFinished = true
+			if ev.Metadata["exit_code"] != 0 {
+				t.Fatalf("finished exit_code = %#v, want 0", ev.Metadata["exit_code"])
+			}
+		}
+	}
+	if !seenStarted || !seenFinished {
+		t.Fatalf("missing sandbox command events: started=%t finished=%t events=%#v", seenStarted, seenFinished, events)
 	}
 }
 
@@ -447,6 +507,88 @@ func TestToolScheduler_AllowShellCommand_NoApproval(t *testing.T) {
 	}
 	if approvalCalled {
 		t.Error("approval handler must not be called for ActionAllow commands")
+	}
+}
+
+func TestExecuteShell_FirewallBlocksDangerous(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+	firewallConfig := permission.DefaultFirewallConfig()
+	firewallConfig.FailurePolicy = "block"
+	hookEngine := middleware.NewHookEngine(nil)
+	hookEngine.RegisterProgrammaticHook(permission.NewFirewallHook(firewallConfig))
+
+	approvalCalled := false
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     func(_ event.StreamEvent) {},
+		RecoveryStrategy: NewToolRecoveryStrategy(nil),
+		ApprovalHandler: func(_ *ToolCallInfo) bool {
+			approvalCalled = true
+			return true
+		},
+	})
+	ts.SetHookEngine(hookEngine)
+
+	results, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "firewall-blocked",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "rm -rf " + filepath.Join(tempDir, "target")},
+	}})
+	if err != nil {
+		t.Fatalf("ExecuteParallel: %v", err)
+	}
+	tr := results["firewall-blocked"]
+	if tr == nil {
+		t.Fatal("expected firewall result")
+	}
+	if tr.Success {
+		t.Fatalf("expected firewall block, got %#v", tr)
+	}
+	if tr.Metadata == nil || tr.Metadata["code"] != "hook_blocked" {
+		t.Fatalf("expected hook_blocked metadata, got %#v", tr.Metadata)
+	}
+	if approvalCalled {
+		t.Fatal("approval handler should not run for firewall block")
+	}
+}
+
+func TestExecuteShell_FirewallAllowsSafe(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+	hookEngine := middleware.NewHookEngine(nil)
+	hookEngine.RegisterProgrammaticHook(permission.NewFirewallHook(permission.DefaultFirewallConfig()))
+
+	approvalCalled := false
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     func(_ event.StreamEvent) {},
+		RecoveryStrategy: NewToolRecoveryStrategy(nil),
+		ApprovalHandler: func(_ *ToolCallInfo) bool {
+			approvalCalled = true
+			return true
+		},
+	})
+	ts.SetHookEngine(hookEngine)
+
+	results, err := ts.ExecuteParallel(context.Background(), []ToolToExecute{{
+		ID:         "firewall-allowed",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "ls"},
+	}})
+	if err != nil {
+		t.Fatalf("ExecuteParallel: %v", err)
+	}
+	tr := results["firewall-allowed"]
+	if tr == nil || !tr.Success {
+		t.Fatalf("expected successful safe command, got %#v", tr)
+	}
+	if approvalCalled {
+		t.Fatal("approval handler should not run for safe command")
 	}
 }
 

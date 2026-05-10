@@ -34,6 +34,42 @@ type Engine struct {
 	Scheduler *cron.Scheduler
 	// StateStore is the shared persistent state store.
 	StateStore *config.StateStore
+
+	cronNotifier func(event.StreamEvent)
+}
+
+func (e *Engine) SetCronNotifier(fn func(event.StreamEvent)) {
+	e.cronNotifier = fn
+}
+
+func (e *Engine) notifyCronLifecycle(ev event.StreamEvent) {
+	if e != nil && e.cronNotifier != nil {
+		e.cronNotifier(ev)
+	}
+}
+
+func cronTaskSessionID(taskID string) string {
+	return fmt.Sprintf("cron-task-%s", taskID)
+}
+
+func newCronLifecycleEvent(eventType event.EventType, taskID, command, sessionID string, success bool, durationMs int64, err error) event.StreamEvent {
+	ev := event.NewStreamEvent(eventType, "cron")
+	ev.TaskID = taskID
+	ev.SessionID = sessionID
+	ev.Metadata = map[string]interface{}{
+		"task_id":         taskID,
+		"task_command":    command,
+		"task_session_id": sessionID,
+	}
+	if eventType == event.EventTypeCronTaskFinished {
+		ev.Metadata["success"] = success
+		ev.Metadata["duration_ms"] = durationMs
+		if err != nil {
+			ev.Metadata["error"] = err.Error()
+			ev.Error = err.Error()
+		}
+	}
+	return ev
 }
 
 // buildCronApprovalHandler creates an approval handler based on the cron permission policy.
@@ -60,8 +96,8 @@ func buildCronApprovalHandler(policy string) func(*agent.ToolCallInfo) bool {
 
 // New builds an Engine from the provided config and optional approval handler.
 // The approvalHandler may be nil (all tool calls are auto-approved).
-func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*Engine, error) {
-	agentInstance, err := agent.New(cfg, approvalHandler)
+func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opts ...agent.Option) (*Engine, error) {
+	agentInstance, err := agent.New(cfg, approvalHandler, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("engine: create agent: %w", err)
 	}
@@ -90,8 +126,7 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*E
 	executeTaskWithMeta := func(command, taskID string) (cron.TaskExecutionMetadata, error) {
 		meta := cron.TaskExecutionMetadata{}
 
-		// Generate session ID
-		meta.SessionID = fmt.Sprintf("cron-%s-%d", taskID, time.Now().Unix())
+		meta.SessionID = cronTaskSessionID(taskID)
 
 		// Create events directory if configured
 		eventsDir := cronCfg.EventsDir
@@ -106,7 +141,7 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*E
 		if eventsDir != "" {
 			taskEventsDir := filepath.Join(eventsDir, taskID)
 			if err := os.MkdirAll(taskEventsDir, 0o755); err == nil {
-				eventsPath := filepath.Join(taskEventsDir, fmt.Sprintf("%d.jsonl", time.Now().Unix()))
+				eventsPath := filepath.Join(taskEventsDir, fmt.Sprintf("%s.jsonl", meta.SessionID))
 				meta.EventsPath = eventsPath
 				eventsFile, _ = os.OpenFile(eventsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 				if eventsFile != nil {
@@ -158,8 +193,10 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*E
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		// Execute the task
-		err := agentInstance.ProcessStream(ctx, command, callback)
+		started := time.Now()
+		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskStarted, taskID, command, meta.SessionID, true, 0, nil))
+		err := agentInstance.ProcessStreamWithMultimodalAndSession(ctx, meta.SessionID, command, nil, callback)
+		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskFinished, taskID, command, meta.SessionID, err == nil, time.Since(started).Milliseconds(), err))
 
 		meta.ToolCallCount = toolCallCount
 		meta.TokenUsage = tokenUsage
@@ -220,13 +257,13 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*E
 
 // NewLeadEngine creates an Engine for a team-lead agent with swarm capabilities.
 // The lead agent can spawn teammates and coordinate multi-agent tasks.
-func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, teamName string) (*Engine, error) {
+func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, teamName string, opts ...agent.Option) (*Engine, error) {
 	if teamName == "" {
 		teamName = "default"
 	}
 
 	// Create agent
-	agentInstance, err := agent.New(cfg, approvalHandler)
+	agentInstance, err := agent.New(cfg, approvalHandler, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("engine: create lead agent: %w", err)
 	}
@@ -270,7 +307,7 @@ func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo)
 
 	executeTaskWithMeta := func(command, taskID string) (cron.TaskExecutionMetadata, error) {
 		meta := cron.TaskExecutionMetadata{}
-		meta.SessionID = fmt.Sprintf("cron-%s-%d", taskID, time.Now().Unix())
+		meta.SessionID = cronTaskSessionID(taskID)
 
 		eventsDir := cronCfg.EventsDir
 		if eventsDir == "" {
@@ -284,7 +321,7 @@ func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo)
 		if eventsDir != "" {
 			taskEventsDir := filepath.Join(eventsDir, taskID)
 			if err := os.MkdirAll(taskEventsDir, 0o755); err == nil {
-				eventsPath := filepath.Join(taskEventsDir, fmt.Sprintf("%d.jsonl", time.Now().Unix()))
+				eventsPath := filepath.Join(taskEventsDir, fmt.Sprintf("%s.jsonl", meta.SessionID))
 				meta.EventsPath = eventsPath
 				eventsFile, _ = os.OpenFile(eventsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 				if eventsFile != nil {
@@ -330,7 +367,10 @@ func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo)
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		err := agentInstance.ProcessStream(ctx, command, callback)
+		started := time.Now()
+		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskStarted, taskID, command, meta.SessionID, true, 0, nil))
+		err := agentInstance.ProcessStreamWithMultimodalAndSession(ctx, meta.SessionID, command, nil, callback)
+		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskFinished, taskID, command, meta.SessionID, err == nil, time.Since(started).Milliseconds(), err))
 
 		meta.ToolCallCount = toolCallCount
 		meta.TokenUsage = tokenUsage

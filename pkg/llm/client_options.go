@@ -46,6 +46,10 @@ func newOpenAIRequestOptions(apiKey, baseURL string, cfg *config.Config) []optio
 }
 
 func newCircuitBreakerFromConfig(cfg *config.Config) *CircuitBreaker {
+	return newCircuitBreakerForRoute("", "", cfg)
+}
+
+func newCircuitBreakerForRoute(providerID, baseURL string, cfg *config.Config) *CircuitBreaker {
 	cbCfg := DefaultCircuitBreakerConfig()
 	if cfg != nil && cfg.Advanced != nil && cfg.Advanced.CircuitBreaker != nil {
 		cbAdv := cfg.Advanced.CircuitBreaker
@@ -61,6 +65,15 @@ func newCircuitBreakerFromConfig(cfg *config.Config) *CircuitBreaker {
 		if cbAdv.OpenTimeoutMs > 0 {
 			cbCfg.OpenTimeout = time.Duration(cbAdv.OpenTimeoutMs) * time.Millisecond
 		}
+		cbCfg.ExcludeNonFailback = cbAdv.ExcludeNonFailback
+		cbCfg.excludeNonFailbackConfigured = true
 	}
-	return NewCircuitBreaker(cbCfg)
+	return getOrCreateCircuitBreaker(providerID, baseURL, cbCfg)
+}
+
+func truncationDetectionEnabled(cfg *config.Config) bool {
+	if cfg == nil || cfg.Advanced == nil || cfg.Advanced.CircuitBreaker == nil {
+		return true
+	}
+	return cfg.Advanced.CircuitBreaker.TruncationDetection
 }

@@ -3,6 +3,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,14 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/cron"
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/mailbox"
 	"github.com/nano-harness/nano-agent/pkg/mcp"
 	"github.com/nano-harness/nano-agent/pkg/memory"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
 	agentruntime "github.com/nano-harness/nano-agent/pkg/runtime"
 	"github.com/nano-harness/nano-agent/pkg/skill"
 	"github.com/nano-harness/nano-agent/pkg/tools"
@@ -50,10 +53,11 @@ type Agent struct {
 	ctx               context.Context
 	cancelFn          context.CancelFunc
 	shutdownOnce      sync.Once
-	isSubAgent        bool                // 标识是否为subagent
-	sessionManager    *SessionManager     // Manages isolated conversation sessions
-	skillManager      *skill.Manager      // Manages Claude Code compatible skills
-	permissionManager *permission.Manager // Manages tool execution permissions
+	isSubAgent        bool                   // 标识是否为subagent
+	sessionManager    *SessionManager        // Manages isolated conversation sessions
+	skillManager      *skill.Manager         // Manages Claude Code compatible skills
+	permissionManager *permission.Manager    // Manages tool execution permissions
+	hookEngine        *middleware.HookEngine // Manages lifecycle hook execution
 
 	// stateStore provides persistent runtime state (scheduled tasks, active skills).
 	stateStore *config.StateStore
@@ -68,6 +72,8 @@ type Agent struct {
 	// manageRoutineTool holds a reference to the registered manage_routine tool
 	// so SetTUIScheduler can wire the live scheduler into it.
 	manageRoutineTool *builtin.ManageRoutineTool
+
+	progressiveDisclosure *ProgressiveDisclosure
 
 	// approvalConfirmFnOverride optionally overrides the default auto-confirm logic.
 	approvalConfirmFnOverride func(string) bool
@@ -215,6 +221,7 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 		sessionManager:  bootstrap.sessionManager,
 		stateStore:      bootstrap.stateStore,
 		activeSessionID: "default", // Default session ID for backward compatibility
+		hookEngine:      bootstrap.hookEngine,
 	}
 
 	agent.permissionManager = bootstrap.permissionManager
@@ -226,6 +233,24 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 
 	agent.runtime = newAgentRuntime(agent)
 	agent.skillManager = bootstrap.skillManager
+	if agent.hookEngine != nil {
+		agent.hookEngine.SetAsyncRunner(hookservice.NewAsyncRunner(func(ctx context.Context, sessionID, reason string) error {
+			if agent.mailbox == nil {
+				return nil
+			}
+			if reason == "" {
+				reason = "async ralph hook requested continuation"
+			}
+			return agent.mailbox.Send(ctx, mailbox.Message{
+				ID:        fmt.Sprintf("ralph-%d", time.Now().UnixNano()),
+				From:      "ralph-hook",
+				To:        sessionID,
+				Topic:     "ralph_async_rewake",
+				Body:      map[string]interface{}{"content": reason, "session_id": sessionID},
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}))
+	}
 
 	// Register conversational configuration management tools.
 	if !cfg.IsSubAgent {
@@ -271,18 +296,6 @@ func (a *Agent) Runtime() *agentruntime.AgentRuntime {
 	return a.runtime
 }
 
-// RegisterTool registers an additional tool into the agent's toolbox and
-// updates the LLM client's tool list. This is a convenience wrapper around
-// toolbox.Register used by the Engine to wire in dynamically created tools.
-func (a *Agent) RegisterTool(t interfaces.Tool) error {
-	if err := a.toolbox.Register(t); err != nil {
-		return err
-	}
-	// Keep the LLM client in sync with the updated tool list.
-	a.llmClient.UpdateTools(a.toolbox.List())
-	return nil
-}
-
 // GetToolScheduler returns the tool scheduler for advanced usage
 func (a *Agent) GetToolScheduler() *ToolScheduler {
 	return a.toolScheduler
@@ -296,13 +309,6 @@ func (a *Agent) GetEventHandler() func(event.StreamEvent) {
 // GetPermissionManager returns the permission manager for the agent.
 func (a *Agent) GetPermissionManager() *permission.Manager {
 	return a.permissionManager
-}
-
-// SetPermissionMode changes the active permission mode at runtime.
-func (a *Agent) SetPermissionMode(mode permission.PermissionMode) {
-	if a.permissionManager != nil {
-		a.permissionManager.SetMode(mode)
-	}
 }
 
 // SetApprovalHandler sets the approval handler for the agent.
@@ -410,6 +416,12 @@ func (a *Agent) ProcessStreamWithMultimodalAndSession(ctx context.Context, sessi
 // processStreamWithSessionInternal processes a request using a specific session's conversation history.
 func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *Session, userInput string, images []llm.MultimodalImage, onEvent func(event.StreamEvent)) error {
 	logger.Infof("Processing streaming request with session %s: %s", session.ID, userInput)
+	_ = a.sessionManager.TransitionSessionState(session.ID, SessionStateActive, "turn_started")
+	defer func() {
+		if session.GetState() == SessionStateActive {
+			_ = a.sessionManager.TransitionSessionState(session.ID, SessionStateIdle, "turn_finished")
+		}
+	}()
 
 	var turnAllowedTools []interfaces.Tool
 	{
@@ -468,6 +480,16 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 					preludeOutput += "[⚠️ Prelude shell commands skipped: run_shell_command not allowed by allowed-tools]\n"
 				}
 			}
+			if def.PermissionProfile != "" && a.permissionManager != nil {
+				mode := permission.PermissionMode(def.PermissionProfile)
+				if permission.IsValidMode(mode) {
+					previousMode := a.permissionManager.GetMode()
+					a.permissionManager.SetMode(mode)
+					defer a.permissionManager.SetMode(previousMode)
+				} else {
+					logger.Warnf("Ignoring invalid permission-profile %q for slash command %q", def.PermissionProfile, def.Name)
+				}
+			}
 			// Re-render prompt without prelude lines
 			processed = skill.RenderCommandBody(rest, args)
 			if preludeOutput != "" {
@@ -522,32 +544,8 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 	sessionHistory := session.GetConversationHistory()
 
 	sessionHistory = a.cleanupMessageSequence(sessionHistory)
-
-	// Create turn configuration with session's conversation history
-	turnConfig := &TurnConfig{
-		WorkingDir:    a.toolbox.GetWorkingDirectory(),
-		Toolbox:       a.toolbox,
-		LLMClient:     a.llmClient,
-		MemoryManager: a.memoryManager,
-		Tools: func() []interfaces.Tool {
-			if turnAllowedTools != nil {
-				return turnAllowedTools
-			}
-			return a.toolbox.List()
-		}(),
-		ToolScheduler:             a.toolScheduler,
-		TUIScheduler:              a.tuiScheduler,
-		InitialMessages:           sessionHistory,
-		IsSubAgent:                a.isSubAgent,
-		AgentConfig:               a.config,
-		SkillManager:              a.skillManager,
-		CachedSystemPromptBuilder: a.cachedSystemPromptBuilder,
-		SessionID:                 session.ID, // Pass session ID for background task isolation (Phase 2)
-		Agent:                     a,          // Pass agent reference for mailbox injection
-	}
-
-	// Create enhanced turn that uses StreamRenderer
-	turn := NewTurnWithMultimodal(userInput, images, turnConfig)
+	ralphCtx := session.RalphContext()
+	ralphCtx.Configure(a.config)
 
 	// Sanitize all outgoing events centrally
 	validator := event.NewEventValidator()
@@ -577,39 +575,104 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 	sanitizedOnEvent := func(ev event.StreamEvent) {
 		// Add session ID to all events
 		ev.SessionID = session.ID
+		if ev.Type == event.EventTypeWaitingForUser {
+			_ = a.sessionManager.TransitionSessionState(session.ID, SessionStateAwaitingInput, "waiting_for_user")
+		}
 		clean := validator.SanitizeEvent(ev)
 		onEvent(clean)
 	}
 
-	// Set the event handler for both the turn and the tool scheduler
-	a.eventHandler = sanitizedOnEvent // Store in agent for GetEventHandler()
-	turn.eventHandler = sanitizedOnEvent
+	// Create turn configuration with session's conversation history
+	turnConfig := &TurnConfig{
+		WorkingDir:    a.toolbox.GetWorkingDirectory(),
+		Toolbox:       a.toolbox,
+		LLMClient:     a.llmClient,
+		MemoryManager: a.memoryManager,
+		Tools: func() []interfaces.Tool {
+			if turnAllowedTools != nil {
+				return turnAllowedTools
+			}
+			return a.toolbox.List()
+		}(),
+		ToolScheduler:             a.toolScheduler,
+		TUIScheduler:              a.tuiScheduler,
+		InitialMessages:           sessionHistory,
+		IsSubAgent:                a.isSubAgent,
+		AgentConfig:               a.config,
+		SkillManager:              a.skillManager,
+		CachedSystemPromptBuilder: a.cachedSystemPromptBuilder,
+		SessionID:                 session.ID, // Pass session ID for background task isolation (Phase 2)
+		Agent:                     a,          // Pass agent reference for mailbox injection
+		HookEngine:                a.hookEngine,
+		RalphContext:              ralphCtx,
+		Transcript:                session.Transcript(),
+	}
+
 	if a.toolScheduler != nil {
 		a.toolScheduler.SetEventHandler(sanitizedOnEvent)
 	}
 
-	// Execute the turn (this will use the plan manager and enhanced features)
-	err := turn.Execute(ctx)
+	a.eventHandler = sanitizedOnEvent // Store in agent for GetEventHandler()
+	nextInput := userInput
+	nextImages := images
+	var turn *Turn
+	var err error
+	for {
+		turnConfig.InitialMessages = sessionHistory
+		turn = NewTurnWithMultimodal(nextInput, nextImages, turnConfig)
+		turn.eventHandler = sanitizedOnEvent
+		err = turn.Execute(ctx)
 
-	// Update session's conversation history after turn execution
-	filteredMessages := make([]llm.Message, 0, len(turn.Messages))
-	for _, msg := range turn.Messages {
-		if msg.Role == "system" {
+		filteredMessages := make([]llm.Message, 0, len(turn.Messages))
+		for _, msg := range turn.Messages {
+			if msg.Role == "system" {
+				continue
+			}
+			filteredMessages = append(filteredMessages, msg)
+		}
+		session.SetConversationHistory(filteredMessages)
+		if info := turn.GetCompressionInfo(); info != nil {
+			session.SetMetadata("last_compression", info)
+			a.writeCompactionCheckpoint(session, info)
+		}
+
+		var totalTokens int
+		if turn.TokenStats != nil {
+			if turn.TokenStats.SessionTotalTokens > 0 {
+				totalTokens = turn.TokenStats.SessionTotalTokens
+			} else {
+				totalTokens = turn.TokenStats.TotalTokens
+			}
+		}
+		session.UpdateStats(totalTokens, time.Since(turn.StartTime).Seconds())
+
+		if errors.Is(err, ErrContinueRequested) && ralphCtx.IsEnabled() {
+			iter, exceeded := ralphCtx.NextIteration()
+			if exceeded {
+				logger.Warnf("Ralph-loop max iteration (%d) reached, forcing stop", ralphCtx.Max())
+				sanitizedOnEvent(event.NewStreamEvent(event.EventTypeRalphStopped, "agent_turn").
+					WithContent("ralph-loop max iteration reached").
+					WithMetadata("iteration", iter).
+					WithMetadata("max_iterations", ralphCtx.Max()))
+				err = nil
+				break
+			}
+			sanitizedOnEvent(event.NewStreamEvent(event.EventTypeRalphIteration, "agent_turn").
+				WithContent(fmt.Sprintf("[Ralph iteration %d/%d]", iter, ralphCtx.Max())).
+				WithMetadata("iteration", iter).
+				WithMetadata("max_iterations", ralphCtx.Max()))
+			nextInput = turn.ContinuationReason()
+			nextImages = nil
+			sessionHistory = filteredMessages
+			ralphCtx.SetActive(true)
 			continue
 		}
-		filteredMessages = append(filteredMessages, msg)
+		break
 	}
-	session.SetConversationHistory(filteredMessages)
-
-	var totalTokens int
-	if turn.TokenStats != nil {
-		if turn.TokenStats.SessionTotalTokens > 0 {
-			totalTokens = turn.TokenStats.SessionTotalTokens
-		} else {
-			totalTokens = turn.TokenStats.TotalTokens
-		}
+	ralphCtx.Reset()
+	if errors.Is(err, ErrContinueRequested) {
+		err = nil
 	}
-	session.UpdateStats(totalTokens, time.Since(turn.StartTime).Seconds())
 
 	history := session.GetConversationHistory()
 	if len(history) >= 1 {
@@ -624,10 +687,11 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 		if shouldGenerate && !a.isSubAgent {
 			historyCopy := append([]llm.Message(nil), history...)
 			ctx, cancel := context.WithCancel(context.Background())
-			a.sessionManager.RegisterBackgroundCancel(session.ID, cancel)
+			cancelIdx := a.sessionManager.RegisterBackgroundCancel(session.ID, cancel)
 
 			go func(s *Session, h []llm.Message) {
 				defer cancel()
+				defer a.sessionManager.UnregisterBackgroundCancel(s.ID, cancelIdx)
 
 				// Try to use first user message as title if short enough
 				var firstUserMsg string
@@ -699,6 +763,29 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 	return nil
 }
 
+// GetContextStatus returns context budget and compression status for a session.
+func (a *Agent) GetContextStatus(sessionID string) (ContextStatus, bool) {
+	if a == nil || a.sessionManager == nil {
+		return ContextStatus{}, false
+	}
+	session, ok := a.sessionManager.GetSession(sessionID)
+	if !ok || session == nil {
+		return ContextStatus{}, false
+	}
+	strategy := NewCompressionStrategy()
+	var last *CompressionInfo
+	if raw, ok := session.GetMetadata("last_compression"); ok {
+		if info, ok := raw.(*CompressionInfo); ok {
+			last = info
+		}
+	}
+	status := strategy.Status(session.GetConversationHistory(), "", last)
+	if a.config != nil {
+		status.CompressionEnabled = a.config.ContextConfig.EnableCompression
+	}
+	return status, true
+}
+
 // ProcessStream processes a user request with streaming output using Turn-based approach
 func (a *Agent) ProcessStream(ctx context.Context, userInput string, onEvent func(event.StreamEvent)) error {
 	return a.ProcessStreamWithMultimodal(ctx, userInput, nil, onEvent)
@@ -738,12 +825,9 @@ func (a *Agent) GetSessionManager() *SessionManager {
 	return a.sessionManager
 }
 
-// ProcessResult represents the result of processing a request
-type ProcessResult struct {
-	Success  bool     `json:"success"`
-	Response string   `json:"response"`
-	Actions  []string `json:"actions"`
-	Error    string   `json:"error,omitempty"`
+// GetSkillManager returns the loaded skill manager for TUI command wiring.
+func (a *Agent) GetSkillManager() *skill.Manager {
+	return a.skillManager
 }
 
 // Shutdown gracefully shuts down the agent and its resources
@@ -774,10 +858,38 @@ func (a *Agent) Shutdown() error {
 
 		// Close toolbox and its channels
 		a.toolbox.Close()
+		if a.hookEngine != nil {
+			_ = a.hookEngine.Close()
+		}
 
 		logger.Info("Agent shutdown completed")
 	})
 	return err
+}
+
+func (a *Agent) writeCompactionCheckpoint(session *Session, info *CompressionInfo) {
+	if a == nil || a.sessionManager == nil || session == nil || info == nil {
+		return
+	}
+	storage, ok := a.sessionManager.GetStorage().(IncrementalSessionStorage)
+	if !ok {
+		return
+	}
+	hash := sha256.Sum256([]byte(info.Summary))
+	marker := CompactionMarker{
+		OriginalMessageCount:   info.MessagesBefore,
+		CompressedMessageCount: info.MessagesAfter,
+		OriginalTokens:         info.OriginalTokens,
+		CompressedTokens:       info.CompressedTokens,
+		SummaryHash:            fmt.Sprintf("%x", hash[:]),
+		LastSeqBeforeCompact:   session.LastPersistedSeq,
+	}
+	if err := storage.WriteCheckpoint(session.ID, marker); err != nil {
+		logger.Warnf("Failed to write compaction checkpoint for session %s: %v", session.ID, err)
+		return
+	}
+	session.LastCompactionSeq = marker.LastSeqBeforeCompact + 1
+	a.sessionManager.emitLifecycle(context.Background(), session.ID, SessionLifecycleCheckpoint, map[string]interface{}{"reason": "autocompact"})
 }
 
 // convertMCPConfig converts consolidated config.MCPConfig to mcp.MCPConfig
@@ -847,6 +959,11 @@ func (a *Agent) registerBuiltinManagementTools(tb *tools.Toolbox, cfg *config.Co
 		logger.Debugf("manage_mcp_server already registered: %v", err)
 	}
 
+	manageExtensionTool := builtin.NewManageExtensionTool(a.skillManager, cfg, configPath, tb, a.approvalConfirmFn)
+	if err := tb.Register(manageExtensionTool); err != nil {
+		logger.Debugf("manage_extension already registered: %v", err)
+	}
+
 	// manage_routine: scheduler is nil until TUI starts; it is wired in
 	// SetTUIScheduler via ManageRoutineTool.SetScheduler.
 	manageRoutineTool := builtin.NewManageRoutineTool(nil, a.stateStore, a.approvalConfirmFn)
@@ -888,6 +1005,13 @@ func (a *Agent) registerBuiltinManagementTools(tb *tools.Toolbox, cfg *config.Co
 	discoverSkillsTool := builtin.NewDiscoverSkillsTool(a.skillManager)
 	if err := tb.Register(discoverSkillsTool); err != nil {
 		logger.Debugf("discover_skills already registered: %v", err)
+	}
+
+	a.progressiveDisclosure = NewProgressiveDisclosure(20, 5)
+	discoverToolsTool.SetOnExpand(a.progressiveDisclosure.MarkExpanded)
+	a.progressiveDisclosure.IndexTools(tb.List())
+	if setter, ok := a.llmClient.(interface{ SetToolGate(interfaces.ToolGate) }); ok {
+		setter.SetToolGate(a.progressiveDisclosure)
 	}
 
 	logger.Info("Conversational management tools registered")

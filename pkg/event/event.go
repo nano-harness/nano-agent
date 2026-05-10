@@ -20,17 +20,25 @@ const (
 	EventTypeTodoUpdate     EventType = "todo_update"      // Individual todo updates
 	EventTypeFinalSummary   EventType = "final_summary"    // Final summary response after synthesis completion
 	// EventTypeTaskStart Task execution started
-	EventTypeTaskStart    EventType = "task_start"    // Task execution started
-	EventTypeTaskProgress EventType = "task_progress" // Task progress update
-	EventTypeTaskCancel   EventType = "task_cancel"   // Task was cancelled
-	EventTypeRetry        EventType = "retry"         // Retry attempt notification
-	EventTypeWarning      EventType = "warning"       // Warning message
-	EventTypeDebug        EventType = "debug"         // Debug information
+	EventTypeTaskStart        EventType = "task_start"        // Task execution started
+	EventTypeTaskProgress     EventType = "task_progress"     // Task progress update
+	EventTypeTaskCancel       EventType = "task_cancel"       // Task was cancelled
+	EventTypeRetry            EventType = "retry"             // Retry attempt notification
+	EventTypeWarning          EventType = "warning"           // Warning message
+	EventTypeDebug            EventType = "debug"             // Debug information
+	EventTypeProviderFallback EventType = "provider_fallback" // Provider/model fallback route selected
+	EventTypeRouteSelected    EventType = "route_selected"    // Provider/model route selected
 	// EventTypeTaskCompletion Task completion notification with details
 	EventTypeTaskCompletion    EventType = "task_completion"    // Task completion notification with details
 	EventTypeSatisfactionEval  EventType = "satisfaction_eval"  // LLM satisfaction evaluation result
 	EventTypeTerminationSignal EventType = "termination_signal" // Graceful termination signal
 	EventTypeSessionInfo       EventType = "session_info"       // Session information event
+
+	// Cron task lifecycle events are intended for lightweight status indicators,
+	// not chat transcript rendering.
+	EventTypeCronTaskStarted  EventType = "cron_task_started"
+	EventTypeCronTaskFinished EventType = "cron_task_finished"
+	EventTypeCronTaskProgress EventType = "cron_task_progress"
 
 	// EventTypePlannerPlanSnapshot Planner / Executor / Worker observability events
 	EventTypePlannerPlanSnapshot EventType = "planner_plan_snapshot"
@@ -48,6 +56,9 @@ const (
 	// terminate early. Metadata fields: "reason", "loop_type", "iteration".
 	EventTypeLoopDetected EventType = "loop_detected"
 
+	EventTypeRalphIteration EventType = "ralph_iteration"
+	EventTypeRalphStopped   EventType = "ralph_stopped"
+
 	// Expert system events
 	EventTypeExpertStarted  EventType = "expert_started"  // Expert execution started
 	EventTypeExpertProgress EventType = "expert_progress" // Expert execution progress
@@ -56,6 +67,16 @@ const (
 	// Mailbox system events
 	EventTypeMailboxSent     EventType = "mailbox_sent"     // Message sent to agent mailbox
 	EventTypeMailboxReceived EventType = "mailbox_received" // Message received from mailbox
+
+	// Sandbox audit and observability events
+	EventTypeSandboxDecisionCreated       EventType = "sandbox.decision.created"
+	EventTypeSandboxEnvironmentCreated    EventType = "sandbox.environment.created"
+	EventTypeSandboxCommandStarted        EventType = "sandbox.command.started"
+	EventTypeSandboxCommandFinished       EventType = "sandbox.command.finished"
+	EventTypeSandboxEnvironmentCleaned    EventType = "sandbox.environment.cleaned"
+	EventTypeSandboxFallbackUsed          EventType = "sandbox.fallback.used"
+	EventTypeSandboxViolationDetected     EventType = "sandbox.violation.detected"
+	EventTypeSandboxResourceLimitExceeded EventType = "sandbox.resource.limit.exceeded"
 )
 
 // ToolUse represents the usage of a tool
@@ -131,4 +152,8 @@ type TokenStats struct {
 	ReasoningEffort   string `json:"reasoning_effort,omitempty"`
 	ReasoningFallback bool   `json:"reasoning_fallback,omitempty"`
 	ReasoningLatency  int64  `json:"reasoning_latency_ms,omitempty"`
+
+	// Context-window statistics
+	ContextWindowMax  int `json:"context_window_max,omitempty"`
+	ContextUsedTokens int `json:"context_used_tokens,omitempty"`
 }

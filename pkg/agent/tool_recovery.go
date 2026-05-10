@@ -9,7 +9,6 @@ import (
 
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
-	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 )
@@ -489,22 +488,4 @@ func (ter *ToolExecutionResult) GetRecoveryStats() map[string]interface{} {
 	stats["error_category"] = ter.ErrorCategory
 	stats["recovery_info"] = ter.RecoveryInfo
 	return stats
-}
-
-// ToolRecoveryManager manages tool recovery
-type ToolRecoveryManager struct {
-	agent *Agent
-}
-
-// NewToolRecoveryManager creates a new tool recovery manager
-func NewToolRecoveryManager(agent *Agent) *ToolRecoveryManager {
-	return &ToolRecoveryManager{
-		agent: agent,
-	}
-}
-
-// HandleToolError handles tool errors and attempts recovery
-func (m *ToolRecoveryManager) HandleToolError(_ string, err error, _ []llm.Message) (string, error) {
-	// Simple heuristic recovery strategies
-	return "", err
 }

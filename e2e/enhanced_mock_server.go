@@ -26,6 +26,8 @@ type MockResponse struct {
 	Reasoning        string
 	ToolCalls        []MockToolCall
 	Error            int           // HTTP 状态码（非 0 时直接返回错误码）
+	ErrorBody        string        // Optional HTTP error body for provider-specific error text
+	FinishReason     string        // Optional stream/non-stream finish_reason override
 	Delay            time.Duration // 返回前的固定延迟
 	StreamBreakAt    int           // 在第 N 个内容 chunk 后中断流式传输（不发送 DONE）
 	StreamBreakError string        // 中断时用于日志/断言的错误信息（HTTP 层面仍为正常 200）
@@ -154,7 +156,6 @@ func (m *EnhancedMockServer) GetRecordedRequests() []RecordedRequest {
 	return result
 }
 
-
 // matchTitleRequest checks if the messages contain the title generation prompt
 func matchTitleRequest(messages []map[string]interface{}) bool {
 	const titleKeyword = "请根据以下对话内容，生成一个简短的标题"
@@ -210,13 +211,21 @@ func (m *EnhancedMockServer) handleChatCompletions(w http.ResponseWriter, r *htt
 		if status == 0 {
 			status = http.StatusInternalServerError
 		}
-		http.Error(w, fmt.Sprintf("mock failure at pattern index %d", failureIndex), status)
+		body := resp.ErrorBody
+		if body == "" {
+			body = fmt.Sprintf("mock failure at pattern index %d", failureIndex)
+		}
+		http.Error(w, body, status)
 		return
 	}
 
 	// 如果响应自身带 Error，则直接返回该状态码
 	if resp.Error != 0 {
-		http.Error(w, "mock error", resp.Error)
+		body := resp.ErrorBody
+		if body == "" {
+			body = "mock error"
+		}
+		http.Error(w, body, resp.Error)
 		return
 	}
 
@@ -366,6 +375,9 @@ func (m *EnhancedMockServer) streamResponse(w http.ResponseWriter, resp MockResp
 	if len(resp.ToolCalls) > 0 {
 		finishReason = "tool_calls"
 	}
+	if resp.FinishReason != "" {
+		finishReason = resp.FinishReason
+	}
 	if !sendChunk(map[string]interface{}{}, &finishReason) {
 		return
 	}
@@ -401,6 +413,9 @@ func (m *EnhancedMockServer) jsonResponse(w http.ResponseWriter, resp MockRespon
 	finishReason := "stop"
 	if len(resp.ToolCalls) > 0 {
 		finishReason = "tool_calls"
+	}
+	if resp.FinishReason != "" {
+		finishReason = resp.FinishReason
 	}
 
 	response := map[string]interface{}{
@@ -439,23 +454,6 @@ func MatchUserMessageContains(substr string) func([]map[string]interface{}) bool
 		for i := len(messages) - 1; i >= 0; i-- {
 			msg := messages[i]
 			if role, ok := msg["role"].(string); ok && role == "user" {
-				if content, ok := msg["content"].(string); ok {
-					if strings.Contains(content, substr) {
-						return true
-					}
-				}
-			}
-		}
-		return false
-	}
-}
-
-// MatchSystemPromptContains returns a matcher that checks if any system message contains the specified substring.
-// This is useful for routing based on expert names in system prompts during parallel expert execution.
-func MatchSystemPromptContains(substr string) func([]map[string]interface{}) bool {
-	return func(messages []map[string]interface{}) bool {
-		for _, msg := range messages {
-			if role, ok := msg["role"].(string); ok && role == "system" {
 				if content, ok := msg["content"].(string); ok {
 					if strings.Contains(content, substr) {
 						return true

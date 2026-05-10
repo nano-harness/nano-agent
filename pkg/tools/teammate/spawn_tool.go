@@ -3,10 +3,13 @@ package teammate
 import (
 	"context"
 	"fmt"
+	"os"
 
+	"github.com/nano-harness/nano-agent/pkg/agentprofile"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/swarm"
+	"github.com/nano-harness/nano-agent/pkg/team"
 )
 
 // SpawnTool implements the spawn_teammate tool
@@ -26,7 +29,7 @@ func (t *SpawnTool) Name() string {
 
 // Description returns the tool description
 func (t *SpawnTool) Description() string {
-	return "Spawn a new teammate agent to work on a subtask (team-lead only)"
+	return "Spawn a new teammate agent to work on a subtask (team-lead only); initial_prompt is optional when a matching .nano/agents profile provides one"
 }
 
 // Category returns the tool category
@@ -47,7 +50,7 @@ func (t *SpawnTool) ConcurrencySafe() bool {
 // Schema returns the JSON schema for tool parameters
 func (t *SpawnTool) Schema() *interfaces.ToolSchema {
 	return interfaces.CreateSchema(
-		"Spawn a new teammate agent to work on a subtask",
+		"Spawn a new teammate agent to work on a subtask; initial_prompt is optional when supplied by a matching .nano/agents profile",
 		map[string]*interfaces.PropertySchema{
 			"name": {
 				Type:        "string",
@@ -60,7 +63,7 @@ func (t *SpawnTool) Schema() *interfaces.ToolSchema {
 			},
 			"initial_prompt": {
 				Type:        "string",
-				Description: "Initial task/prompt for the teammate",
+				Description: "Initial task/prompt for the teammate; optional when a matching .nano/agents profile provides initial_prompt",
 			},
 			"color": {
 				Type:        "string",
@@ -68,11 +71,17 @@ func (t *SpawnTool) Schema() *interfaces.ToolSchema {
 			},
 			"permission_mode": {
 				Type:        "string",
-				Description: "Permission mode: 'auto' (automatic approval) or 'ask' (require approval)",
-				Enum:        []string{"auto", "ask"},
+				Description: "Permission mode: 'auto'/'ask' or nano modes 'default', 'acceptEdits', 'yolo'",
+				Enum:        []string{"auto", "ask", "default", "acceptEdits", "yolo"},
 			},
+			"model": {
+				Type:        "string",
+				Description: "Optional model override for this teammate (defaults to matching .nano/agents profile or parent config)",
+			},
+			"fallbacks":         interfaces.NewArrayProperty("Optional provider/model fallback chain for this teammate (omitted inherits parent config or matching .nano/agents profile)", "string"),
+			"context_providers": interfaces.NewArrayProperty("Optional context provider allowlist for this teammate (memory, skills, openspec; omitted inherits parent config)", "string"),
 		},
-		[]string{"name", "initial_prompt"},
+		[]string{"name"},
 	)
 }
 
@@ -93,6 +102,36 @@ func (t *SpawnTool) Execute(ctx context.Context, params map[string]interface{}) 
 	initialPrompt, _ := params["initial_prompt"].(string)
 	color, _ := params["color"].(string)
 	permissionMode, _ := params["permission_mode"].(string)
+	model, _ := params["model"].(string)
+	fallbackValue, fallbackProvided := params["fallbacks"]
+	fallbacks := stringSliceParam(fallbackValue)
+	contextProviders := stringSliceParam(params["context_providers"])
+	var allowedTools []string
+
+	if profile, ok := t.findProfile(name); ok {
+		if kind == "" {
+			kind = profile.Kind
+		}
+		if initialPrompt == "" {
+			initialPrompt = profile.InitialPrompt
+		}
+		if color == "" {
+			color = profile.Color
+		}
+		if permissionMode == "" {
+			permissionMode = profile.PermissionMode
+		}
+		if model == "" {
+			model = profile.Model
+		}
+		if !fallbackProvided {
+			fallbacks = append([]string(nil), profile.Fallbacks...)
+		}
+		if len(contextProviders) == 0 {
+			contextProviders = append([]string(nil), profile.ContextProviders...)
+		}
+		allowedTools = append([]string(nil), profile.AllowedTools...)
+	}
 
 	// Validate input
 	if name == "" {
@@ -131,15 +170,31 @@ func (t *SpawnTool) Execute(ctx context.Context, params map[string]interface{}) 
 	if leadCtx, ok := swarm.TeamLeadFromContext(ctx); ok && leadCtx.TeamName != "" {
 		teamName = leadCtx.TeamName
 	}
+	if result := t.enforceAgentLimits(teamName); result != nil {
+		return result, nil
+	}
 
 	// Prepare spawn options
 	opts := swarm.SpawnOptions{
-		TeamName:       teamName,
-		Name:           name,
-		Color:          color,
-		InitialPrompt:  initialPrompt,
-		PermissionMode: permissionMode,
-		Runner:         swarm.NewDefaultRunner(t.cfg),
+		TeamName:         teamName,
+		Name:             name,
+		Color:            color,
+		InitialPrompt:    initialPrompt,
+		PermissionMode:   permissionMode,
+		AllowedTools:     allowedTools,
+		Model:            model,
+		Fallbacks:        fallbacks,
+		ContextProviders: contextProviders,
+		MaxRuntimeSec:    t.maxRuntimeSec(),
+		Runner:           swarm.NewDefaultRunner(t.cfg),
+	}
+	if t.cfg != nil && t.cfg.Sandbox != nil {
+		opts.Sandbox.Backend = t.cfg.Sandbox.Backend
+		if opts.Sandbox.Backend == "" && t.cfg.Sandbox.Enabled {
+			opts.Sandbox.Backend = "native"
+		}
+		opts.Sandbox.Lifecycle = "task"
+		opts.Sandbox.Scope = "subagent"
 	}
 
 	// Spawn the teammate
@@ -176,4 +231,79 @@ func (t *SpawnTool) Execute(ctx context.Context, params map[string]interface{}) 
 		LLMContent:  result,
 		UserContent: result,
 	}, nil
+}
+
+func (t *SpawnTool) findProfile(name string) (agentprofile.AgentProfile, bool) {
+	cwd := ""
+	if t.cfg != nil {
+		cwd = t.cfg.WorkingDir
+	}
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		}
+	}
+	return agentprofile.NewManager(cwd).Find(name)
+}
+
+func stringSliceParam(value interface{}) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func (t *SpawnTool) maxRuntimeSec() int {
+	if t.cfg == nil || t.cfg.Advanced == nil || t.cfg.Advanced.Fork == nil {
+		return 0
+	}
+	if t.cfg.Advanced.Fork.MaxRuntimeSec <= 0 {
+		return 0
+	}
+	return t.cfg.Advanced.Fork.MaxRuntimeSec
+}
+
+func (t *SpawnTool) enforceAgentLimits(teamName string) *interfaces.ToolResult {
+	maxConcurrent := 0
+	if t.cfg != nil && t.cfg.Advanced != nil && t.cfg.Advanced.Fork != nil {
+		maxConcurrent = t.cfg.Advanced.Fork.MaxConcurrent
+	}
+	if maxConcurrent <= 0 {
+		return nil
+	}
+
+	existingTeam, err := team.ReadTeam(teamName)
+	if err != nil {
+		message := fmt.Sprintf("Failed to evaluate max concurrent agents limit for team %q: %v", teamName, err)
+		return &interfaces.ToolResult{
+			Success:     false,
+			LLMContent:  message,
+			UserContent: message,
+		}
+	}
+	active := 0
+	for _, member := range existingTeam.Members {
+		if member.IsActive {
+			active++
+		}
+	}
+	if active < maxConcurrent {
+		return nil
+	}
+	message := fmt.Sprintf("Max concurrent agents limit reached for team %q: active=%d limit=%d", teamName, active, maxConcurrent)
+	return &interfaces.ToolResult{
+		Success:     false,
+		LLMContent:  message,
+		UserContent: message,
+	}
 }

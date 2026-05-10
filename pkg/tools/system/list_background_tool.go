@@ -47,9 +47,11 @@ func (t *ListBackgroundTool) Schema() *interfaces.ToolSchema {
 }
 
 func (t *ListBackgroundTool) Execute(ctx context.Context, params map[string]interface{}) (*interfaces.ToolResult, error) {
-	// Get session ID from context (Phase 2)
+	// Get session ID from Turn context (if available).
 	sessionID := "default"
-	// TODO: Extract from Turn context when available
+	if tc, ok := ctx.Value(interfaces.TurnContextKey{}).(interfaces.TurnContext); ok && tc.SessionID != "" {
+		sessionID = tc.SessionID
+	}
 
 	tasks := t.bgManager.List(sessionID)
 
@@ -73,9 +75,10 @@ func (t *ListBackgroundTool) Execute(ctx context.Context, params map[string]inte
 	output.WriteString("─────────────────────────────────────────────────────────────────────\n")
 
 	for _, task := range tasks {
+		status, taskExitCode, finishedAt := task.snapshot()
 		exitCode := "-"
-		if task.FinishedAt != nil {
-			exitCode = fmt.Sprintf("%d", task.ExitCode)
+		if finishedAt != nil {
+			exitCode = fmt.Sprintf("%d", taskExitCode)
 		}
 
 		started := task.StartedAt.Format("01-02 15:04:05")
@@ -87,7 +90,7 @@ func (t *ListBackgroundTool) Execute(ctx context.Context, params map[string]inte
 		}
 
 		output.WriteString(fmt.Sprintf("%-10s %-12s %-8s %-20s %s\n",
-			task.ID, task.Status, exitCode, started, cmd))
+			task.ID, status, exitCode, started, cmd))
 	}
 
 	content := output.String()

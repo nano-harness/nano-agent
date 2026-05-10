@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/swarm/backends"
 	"github.com/nano-harness/nano-agent/pkg/team"
@@ -45,6 +46,15 @@ func SpawnSubprocess(ctx context.Context, opts SpawnOptions) (*SpawnHandle, erro
 		"--session", identity.sessionID,
 		"--initial-prompt-file", promptFile,
 	}
+	if opts.MaxRuntimeSec > 0 {
+		cmd = append(cmd, "--max-runtime-sec", fmt.Sprintf("%d", opts.MaxRuntimeSec))
+	}
+	if opts.Model != "" {
+		cmd = append(cmd, "--model", opts.Model)
+	}
+	if len(opts.ContextProviders) > 0 {
+		cmd = append(cmd, "--context-providers", joinComma(opts.ContextProviders))
+	}
 
 	// Spawn the pane
 	paneID, pid, err := backend.SpawnPane(cmd, opts.Color)
@@ -69,6 +79,10 @@ func SpawnSubprocess(ctx context.Context, opts SpawnOptions) (*SpawnHandle, erro
 		SessionID: identity.sessionID,
 		Done:      nil, // Subprocess doesn't provide a done channel
 	}, nil
+}
+
+func joinComma(values []string) string {
+	return strings.Join(values, ",")
 }
 
 // writeTempPromptFile writes the initial prompt to a temporary file

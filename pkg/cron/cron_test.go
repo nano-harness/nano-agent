@@ -2,6 +2,7 @@ package cron
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -138,11 +139,16 @@ func TestStopIdempotent(t *testing.T) {
 }
 
 func TestSetExecuteTaskRich(t *testing.T) {
-	var executed bool
-	var capturedTaskID string
-	var capturedCommand string
+	var (
+		mu              sync.Mutex
+		executed        bool
+		capturedTaskID  string
+		capturedCommand string
+	)
 
 	richExec := func(command, taskID string) (TaskExecutionMetadata, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		executed = true
 		capturedCommand = command
 		capturedTaskID = taskID
@@ -171,12 +177,18 @@ func TestSetExecuteTaskRich(t *testing.T) {
 		case <-deadline:
 			t.Fatal("task was not executed within 3 seconds")
 		default:
-			if executed {
-				if capturedCommand != "test command" {
-					t.Errorf("capturedCommand = %q, want %q", capturedCommand, "test command")
+			mu.Lock()
+			done := executed
+			cmd := capturedCommand
+			taskID := capturedTaskID
+			mu.Unlock()
+
+			if done {
+				if cmd != "test command" {
+					t.Errorf("capturedCommand = %q, want %q", cmd, "test command")
 				}
-				if capturedTaskID != task.ID {
-					t.Errorf("capturedTaskID = %q, want %q", capturedTaskID, task.ID)
+				if taskID != task.ID {
+					t.Errorf("capturedTaskID = %q, want %q", taskID, task.ID)
 				}
 				return
 			}

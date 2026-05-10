@@ -77,6 +77,29 @@ func TestBuildBaseSystemPromptContainsProfessionalObjectivity(t *testing.T) {
 	}
 }
 
+func TestBuildBaseSystemPrompt_IncludesProjectType(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spb := NewSystemPromptBuilder(dir, nil, nil, &config.Config{})
+
+	prompt := spb.BuildBaseSystemPrompt()
+	if !strings.Contains(prompt, "Project type: go") {
+		t.Fatalf("expected project type context in prompt, got:\n%s", prompt)
+	}
+}
+
+func TestBuildBaseSystemPrompt_GitContextOptional(t *testing.T) {
+	dir := t.TempDir()
+	spb := NewSystemPromptBuilder(dir, nil, nil, &config.Config{})
+
+	prompt := spb.BuildBaseSystemPrompt()
+	if !strings.Contains(prompt, "**Working Directory**: "+dir) {
+		t.Fatalf("expected working directory in prompt, got:\n%s", prompt)
+	}
+}
+
 func TestBuildEnhancedSystemPromptContainsBlockingRequirement(t *testing.T) {
 	spb := newTestSystemPromptBuilder()
 	sm := newTestSkillManagerWithSkill(t)
@@ -290,8 +313,15 @@ func TestBuildMemorySectionEmpty(t *testing.T) {
 
 func TestBuildInstructionsSectionEmpty(t *testing.T) {
 	// A loader pointed at an empty dir should produce no instructions.
-	spb := NewSystemPromptBuilder(t.TempDir(), nil, nil, &config.Config{
+	workDir := t.TempDir()
+	homeDir := t.TempDir()
+	spb := NewSystemPromptBuilder(workDir, nil, nil, &config.Config{
 		UserInfo: &config.UserInfoConfig{AutoDetectUserInfo: false},
+	})
+	spb.SetInstructionLoader(&InstructionLoader{
+		workingDir: workDir,
+		homeDir:    homeDir,
+		cache:      make(map[string]string),
 	})
 	result := spb.buildInstructionsSection()
 	if result != "" {

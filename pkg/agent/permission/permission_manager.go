@@ -1,6 +1,9 @@
 package permission
 
 import (
+	"context"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
@@ -14,6 +17,8 @@ type Manager struct {
 	mode      PermissionMode
 	allowlist *SessionAllowlist
 	workdir   string
+	// classifier (optional) implements ModeAuto. nil → ModeAuto behaves like ModeDefault.
+	classifier Classifier
 	// ConfidenceThreshold is the minimum confidence level for auto-approval.
 	// Decisions with confidence >= threshold are auto-approved without user confirmation.
 	// Range: 0.0 (strictest, require confirmation for everything) to 1.0 (most permissive).
@@ -73,16 +78,39 @@ func (m *Manager) GetSessionAllowlist() *SessionAllowlist {
 // Decision order:
 //  1. YOLO mode → never confirm.
 //  2. Session allowlist match → never confirm.
-//  3. AcceptEdits mode + edit tool → never confirm.
-//  4. Filesystem edit tool path inside trusted workdir → never confirm.
-//  5. ContextualConfirmationTool.RequiresConfirmationForParams → use that.
+//  3. ContextualConfirmationTool.RequiresConfirmationForParams → confirm when
+//     the tool marks the specific parameters as sensitive. Filesystem write,
+//     edit, and delete tools define this for protected names such as .env,
+//     package manifests, lock files, config files, and paths outside the
+//     trusted workspace.
+//  4. AcceptEdits mode + non-sensitive edit tool → never confirm.
+//  5. Filesystem edit tool path inside trusted workdir → never confirm.
 //  6. Tool.RequiresConfirmation → use that.
 //  7. Default → no confirmation required.
 func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, tool interfaces.Tool) bool {
 	m.mu.RLock()
 	mode := m.mode
 	workdir := m.workdir
+	classifier := m.classifier
 	m.mu.RUnlock()
+
+	// M3-3: NANO_AUTO_ACCEPT environment variable globally short-circuits
+	// confirmation prompts. Intended for non-interactive automation contexts
+	// where the operator has already accepted full autonomy.
+	if v := os.Getenv("NANO_AUTO_ACCEPT"); v == "1" || strings.EqualFold(v, "true") {
+		return false
+	}
+
+	// 0. Plan mode - block tools that aren't in the read-only whitelist.
+	// This check comes first to enforce read-only restrictions.
+	if mode == ModePlan {
+		if !IsToolAllowedInPlanMode(toolName, params) {
+			// Return true to force confirmation, which will then be blocked
+			// by a separate check in the tool execution pipeline.
+			return true
+		}
+		// For allowed read-only tools, proceed with normal confirmation logic
+	}
 
 	// 1. YOLO – skip everything.
 	if mode == ModeYOLO {
@@ -94,25 +122,48 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 		return false
 	}
 
-	// 3. AcceptEdits – auto-approve file edits.
+	// M2-1: Auto mode consults an AI classifier. The classifier is given a
+	// bounded timeout; on error or timeout we keep the conservative default
+	// of asking the user (fail-closed).
+	if mode == ModeAuto && classifier != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), classifier.Timeout())
+		defer cancel()
+		result, err := classifier.Classify(ctx, ClassifyRequest{
+			ToolName: toolName,
+			Params:   params,
+			WorkDir:  workdir,
+			PermMode: mode,
+		})
+		if err == nil && result != nil {
+			return result.ShouldBlock
+		}
+		// fall through to default behaviour on error
+	}
+
+	if tool == nil {
+		return false
+	}
+
+	// 3. Let tools force confirmation for sensitive parameter sets before
+	// workspace/acceptEdits shortcuts. Filesystem protected-name checks live in
+	// pkg/tools/filesystem/* RequiresConfirmationForParams implementations.
+	if ct, ok := tool.(interfaces.ContextualConfirmationTool); ok && ct.RequiresConfirmationForParams(params) {
+		return true
+	}
+
+	// 4. AcceptEdits – auto-approve non-sensitive file edits.
 	if mode == ModeAcceptEdits && tool != nil && IsEditTool(tool) {
 		return false
 	}
 
-	// 4. Filesystem edit tools inside the trusted workdir are auto-approved.
+	// 5. Filesystem edit tools inside the trusted workdir are auto-approved.
 	if tool != nil && IsEditTool(tool) && workdir != "" {
 		if path := extractFilesystemPath(toolName, params); path != "" {
 			return !middleware.IsPathWithinWorkdir(workdir, path)
 		}
 	}
 
-	// 5 & 6. Delegate to the tool's own confirmation logic.
-	if tool == nil {
-		return false
-	}
-	if ct, ok := tool.(interfaces.ContextualConfirmationTool); ok {
-		return ct.RequiresConfirmationForParams(params)
-	}
+	// 6. Delegate to the tool's own static confirmation logic.
 	return tool.RequiresConfirmation()
 }
 
@@ -127,6 +178,22 @@ func extractFilesystemPath(toolName string, params map[string]interface{}) strin
 	}
 	path, _ := params[key].(string)
 	return path
+}
+
+// SetClassifier installs (or replaces) the AI risk classifier consulted in
+// ModeAuto. Passing nil disables ModeAuto's auto-approve path (it falls back
+// to default-mode behaviour).
+func (m *Manager) SetClassifier(c Classifier) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.classifier = c
+}
+
+// Classifier returns the currently installed classifier (may be nil).
+func (m *Manager) Classifier() Classifier {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.classifier
 }
 
 // SetConfidenceThreshold sets the minimum confidence for auto-approval.

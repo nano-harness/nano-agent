@@ -2,43 +2,96 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"os"
-	"os/exec"
-	"strings"
-	"time"
+
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
 )
 
 // HookEvent identifies when a hook fires.
-type HookEvent string
+type HookEvent = hookservice.Event
 
 const (
-	HookPreToolUse  HookEvent = "pre_tool_use"
-	HookPostToolUse HookEvent = "post_tool_use"
+	HookPreToolUse         HookEvent = hookservice.EventPreToolUse
+	HookPostToolUse        HookEvent = hookservice.EventPostToolUse
+	HookPostToolUseFailure HookEvent = hookservice.EventPostToolUseFailure
+	HookPermissionRequest  HookEvent = hookservice.EventPermissionRequest
+	HookPermissionDenied   HookEvent = hookservice.EventPermissionDenied
+	HookSessionStart       HookEvent = hookservice.EventSessionStart
+	HookSessionEnd         HookEvent = hookservice.EventSessionEnd
+	HookPreCompact         HookEvent = hookservice.EventPreCompact
+	HookPostCompact        HookEvent = hookservice.EventPostCompact
+	HookUserPromptSubmit   HookEvent = hookservice.EventUserPromptSubmit
+	HookNotification       HookEvent = hookservice.EventNotification
+	HookStop               HookEvent = hookservice.EventStop
+	HookStopFailure        HookEvent = hookservice.EventStopFailure
+	HookSubagentStart      HookEvent = hookservice.EventSubagentStart
+	HookSubagentStop       HookEvent = hookservice.EventSubagentStop
+	HookTeammateIdle       HookEvent = hookservice.EventTeammateIdle
+	HookTaskStart          HookEvent = hookservice.EventTaskStart
+	HookTaskComplete       HookEvent = hookservice.EventTaskComplete
+	HookFileRead           HookEvent = hookservice.EventFileRead
+	HookFileWrite          HookEvent = hookservice.EventFileWrite
+	HookFileDelete         HookEvent = hookservice.EventFileDelete
+	HookShellCommand       HookEvent = hookservice.EventShellCommand
+	HookNetworkRequest     HookEvent = hookservice.EventNetworkRequest
+	HookCheckpointCreate   HookEvent = hookservice.EventCheckpointCreate
+	HookCheckpointRestore  HookEvent = hookservice.EventCheckpointRestore
 )
 
 // Hook is a user-defined shell script that fires before or after tool execution.
-type Hook struct {
-	Name    string    // Human-readable name
-	Event   HookEvent // "pre_tool_use" | "post_tool_use"
-	Pattern string    // Glob pattern: "bash:*" or "bash:rm*" or "*:*"
-	Command string    // Shell script body to execute
-	Enabled bool
-}
+type Hook = hookservice.Hook
 
 // HookEngine manages and executes registered hooks.
 type HookEngine struct {
-	hooks   []Hook
-	timeout time.Duration // Per-hook execution timeout (default 5s)
+	service           *hookservice.Service
+	programmaticHooks []ProgrammaticHook
 }
 
 // NewHookEngine creates a HookEngine from a slice of hooks.
 func NewHookEngine(hooks []Hook) *HookEngine {
-	return &HookEngine{
-		hooks:   hooks,
-		timeout: 5 * time.Second,
+	return NewHookEngineWithOptions(hooks, HookOptions{})
+}
+
+// HookOptions configures hook execution.
+type HookOptions = hookservice.Options
+
+// NewHookEngineWithOptions creates a HookEngine from a slice of hooks and options.
+func NewHookEngineWithOptions(hooks []Hook, options HookOptions) *HookEngine {
+	return &HookEngine{service: hookservice.NewWithOptions(hooks, options)}
+}
+
+func (e *HookEngine) SetAsyncRunner(runner *hookservice.AsyncRunner) {
+	if e == nil || e.service == nil {
+		return
 	}
+	e.service.SetAsyncRunner(runner)
+}
+
+func (e *HookEngine) Close() error {
+	if e == nil || e.service == nil {
+		return nil
+	}
+	return e.service.Close()
+}
+
+// RegisterProgrammaticHook registers a Go-implemented hook.
+func (e *HookEngine) RegisterProgrammaticHook(h ProgrammaticHook) {
+	if e == nil || h == nil {
+		return
+	}
+	e.programmaticHooks = append(e.programmaticHooks, h)
+}
+
+// HasProgrammaticHook reports whether a Go-implemented hook is registered.
+func (e *HookEngine) HasProgrammaticHook(name string) bool {
+	if e == nil {
+		return false
+	}
+	for _, hook := range e.programmaticHooks {
+		if hook != nil && hook.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Execute runs all matching hooks for the given event/tool combination.
@@ -46,96 +99,98 @@ func NewHookEngine(hooks []Hook) *HookEngine {
 // Exit codes: 0 = allow, 1 = confirm, 2 = block.
 // The first non-allow decision wins.
 func (e *HookEngine) Execute(ctx context.Context, event HookEvent, toolName string, params map[string]interface{}) (*Decision, error) {
-	if e == nil || len(e.hooks) == 0 {
-		return &Decision{Action: ActionAllow, Reason: "no hooks configured", Layer: LayerHook}, nil
+	decision, err := e.execute(ctx, event, toolName, params)
+	if err != nil {
+		return nil, err
+	}
+	if decision != nil && decision.Action != ActionAllow {
+		decision.Layer = LayerHook
+		return decision, nil
 	}
 
-	inputJSON, _ := json.Marshal(params)
+	programmaticParams := params
+	if decision != nil && len(decision.ModifiedParams) > 0 {
+		programmaticParams = MergeDecisionParams(params, decision.ModifiedParams)
+	}
+	programmaticDecision := e.executeProgrammatic(ctx, event, toolName, programmaticParams)
+	if programmaticDecision != nil && programmaticDecision.Action != ActionAllow {
+		programmaticDecision.Layer = LayerHook
+		return programmaticDecision, nil
+	}
+	if decision == nil || (len(decision.ModifiedParams) == 0 && programmaticDecision != nil) {
+		decision = programmaticDecision
+	}
+	if decision == nil {
+		decision = &Decision{Action: ActionAllow, Reason: "all hooks passed"}
+	}
+	decision.Layer = LayerHook
+	return decision, nil
+}
 
-	for i := range e.hooks {
-		h := &e.hooks[i]
-		if !h.Enabled || h.Event != event {
+func (e *HookEngine) execute(ctx context.Context, event HookEvent, toolName string, params map[string]interface{}) (*Decision, error) {
+	if e == nil || e.service == nil {
+		return &Decision{Action: ActionAllow, Reason: "no hooks configured"}, nil
+	}
+	decision, err := e.service.Execute(ctx, event, toolName, params)
+	if err != nil {
+		return nil, err
+	}
+	return hookDecisionToMiddleware(decision), nil
+}
+
+func (e *HookEngine) executeProgrammatic(ctx context.Context, event HookEvent, toolName string, params map[string]interface{}) *Decision {
+	if e == nil || len(e.programmaticHooks) == 0 {
+		return &Decision{Action: ActionAllow, Reason: "no programmatic hooks configured"}
+	}
+	for _, hook := range e.programmaticHooks {
+		if hook == nil || hook.Event() != hookservice.Event(event) {
 			continue
 		}
-		if !matchPattern(h.Pattern, toolName) {
-			continue
-		}
-
-		decision, err := e.runHook(ctx, h, string(inputJSON), toolName)
+		decision, err := hook.Execute(ctx, hookservice.Event(event), toolName, params)
 		if err != nil {
-			// Hook execution error → treat as Confirm (be safe but not blocking).
-			return &Decision{Action: ActionConfirm, Reason: fmt.Sprintf("hook %q execution error: %v", h.Name, err), Layer: LayerHook}, nil
+			return &Decision{
+				Action: ActionConfirm,
+				Reason: "programmatic hook " + hook.Name() + " execution error: " + err.Error(),
+				Rule:   hook.Name(),
+			}
 		}
-		if decision.Action != ActionAllow {
-			return decision, nil
+		middlewareDecision := hookDecisionToMiddleware(decision)
+		if middlewareDecision == nil {
+			continue
+		}
+		if middlewareDecision.Rule == "" {
+			middlewareDecision.Rule = hook.Name()
+		}
+		if middlewareDecision.Action != ActionAllow {
+			return middlewareDecision
 		}
 	}
-	return &Decision{Action: ActionAllow, Reason: "all hooks passed", Layer: LayerHook}, nil
+	return &Decision{Action: ActionAllow, Reason: "all programmatic hooks passed"}
 }
 
-func (e *HookEngine) runHook(ctx context.Context, h *Hook, inputJSON, toolName string) (*Decision, error) {
-	hookCtx, cancel := context.WithTimeout(ctx, e.timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(hookCtx, "sh", "-c", h.Command)
-	cmd.Env = append(os.Environ(),
-		"NANO_TOOL_NAME="+toolName,
-		"NANO_TOOL_INPUT="+inputJSON,
-	)
-
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err == nil {
-		return &Decision{Action: ActionAllow, Reason: "hook " + h.Name + " allowed", Layer: LayerHook}, nil
+func hookDecisionToMiddleware(decision *hookservice.Decision) *Decision {
+	if decision == nil {
+		return nil
 	}
-
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		reason := strings.TrimSpace(stderr.String())
-		if reason == "" {
-			reason = fmt.Sprintf("hook %q denied with exit code %d", h.Name, exitErr.ExitCode())
-		}
-		switch exitErr.ExitCode() {
-		case 1:
-			return &Decision{Action: ActionConfirm, Reason: reason, Rule: h.Name, Layer: LayerHook}, nil
-		case 2:
-			return &Decision{Action: ActionBlock, Reason: reason, Rule: h.Name, Layer: LayerHook}, nil
-		default:
-			return &Decision{Action: ActionConfirm, Reason: reason, Rule: h.Name, Layer: LayerHook}, nil
-		}
+	return &Decision{
+		Action:         hookActionToMiddleware(decision.Action),
+		Reason:         decision.Reason,
+		Rule:           decision.Rule,
+		Suggestions:    append([]string(nil), decision.Warnings...),
+		AuditMetadata:  copyDecisionParams(decision.AuditMetadata),
+		ModifiedParams: copyDecisionParams(decision.ModifiedParams),
 	}
-	return nil, err
 }
 
-// matchPattern matches "tool:pattern" where '*' is a wildcard.
-// Examples: "bash:*", "bash:rm*", "*:*", "run_shell_command:*"
-func matchPattern(pattern, toolName string) bool {
-	if pattern == "*" || pattern == "*:*" {
-		return true
+func hookActionToMiddleware(action hookservice.Action) Action {
+	switch action {
+	case hookservice.ActionAllow:
+		return ActionAllow
+	case hookservice.ActionConfirm:
+		return ActionConfirm
+	case hookservice.ActionBlock:
+		return ActionBlock
+	default:
+		return ActionConfirm
 	}
-	// If pattern has no colon, treat as plain tool name prefix pattern.
-	if !strings.Contains(pattern, ":") {
-		return matchGlob(pattern, toolName)
-	}
-	parts := strings.SplitN(pattern, ":", 2)
-	toolPattern := parts[0]
-	if !matchGlob(toolPattern, toolName) && toolPattern != "*" {
-		return false
-	}
-	return true
-}
-
-// matchGlob performs simple * wildcard matching.
-func matchGlob(pattern, s string) bool {
-	if pattern == "*" {
-		return true
-	}
-	if strings.HasSuffix(pattern, "*") {
-		return strings.HasPrefix(s, strings.TrimSuffix(pattern, "*"))
-	}
-	if strings.HasPrefix(pattern, "*") {
-		return strings.HasSuffix(s, strings.TrimPrefix(pattern, "*"))
-	}
-	return pattern == s
 }

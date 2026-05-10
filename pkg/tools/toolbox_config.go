@@ -15,6 +15,12 @@ func (c *ToolboxConfig) ToolConfigMap() map[string]interface{} {
 	if len(c.BlockedCommands) > 0 {
 		config["blocked_commands"] = c.BlockedCommands
 	}
+	if len(c.SensitiveReadPaths) > 0 {
+		config["sensitive_read_paths"] = c.SensitiveReadPaths
+	}
+	if len(c.ArbitraryExecCommands) > 0 {
+		config["arbitrary_exec_commands"] = c.ArbitraryExecCommands
+	}
 	config["max_file_size"] = c.MaxFileSize
 	config["max_response_size"] = c.MaxResponseSize
 	config["timeout"] = c.Timeout

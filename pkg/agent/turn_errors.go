@@ -10,6 +10,11 @@ import (
 // LLMErrorType represents the category of LLM errors
 type LLMErrorType int
 
+// ErrContinueRequested is returned when a Stop/StopFailure hook signals that
+// the agent should keep working. Higher layers can interpret this to decide
+// whether to launch another turn instead of finalising the session.
+var ErrContinueRequested = errors.New("turn continuation requested by hook")
+
 const (
 	// LLMErrorTransient represents temporary network or connectivity issues
 	LLMErrorTransient LLMErrorType = iota
@@ -87,27 +92,6 @@ func ClassifyLLMError(err error) LLMErrorType {
 	// Default to transient for all other errors (conservative approach)
 	// This includes: timeouts, connection resets, network errors, etc.
 	return LLMErrorTransient
-}
-
-// ShouldRetry determines if an error should be retried based on its type
-func ShouldRetryLLMError(errType LLMErrorType, attempt int, maxRetries int) bool {
-	if attempt >= maxRetries {
-		return false
-	}
-
-	switch errType {
-	case LLMErrorPermanent:
-		// Never retry permanent errors
-		return false
-	case LLMErrorRateLimit:
-		// Retry rate limit errors with backoff
-		return attempt < maxRetries
-	case LLMErrorTransient:
-		// Retry transient errors with limited attempts
-		return attempt < maxRetries
-	default:
-		return false
-	}
 }
 
 // WrapLLMError wraps an error with additional context about its type

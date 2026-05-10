@@ -3,7 +3,6 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -44,7 +43,7 @@ func newClientExecCommand(factory ClientFactory) *cobra.Command {
 		Short: "Execute command on daemon",
 		Long:  `Execute a command on the running nano daemon and return the result.`,
 		Args:  cobra.MinimumNArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			command := strings.Join(args, " ")
 			timeout, _ := cmd.Flags().GetInt("timeout")
 			includeSteps, _ := cmd.Flags().GetBool("include-steps")
@@ -57,8 +56,7 @@ func newClientExecCommand(factory ClientFactory) *cobra.Command {
 			if background {
 				response, err := client.ExecuteInSession(command, sessionID, timeout, includeSteps, true)
 				if err != nil {
-					color.Red("❌ Failed to execute command: %v", err)
-					os.Exit(1)
+					return fmt.Errorf("failed to execute command: %w", err)
 				}
 				if response.Success {
 					color.Green("✅ Session execution started in background")
@@ -67,18 +65,16 @@ func newClientExecCommand(factory ClientFactory) *cobra.Command {
 						fmt.Printf("Session started: %s\n", response.SessionID)
 						fmt.Println("Use 'nano client sessions list' to check status")
 					}
-					return
+					return nil
 				}
-				color.Red("❌ Command failed")
 				if response.Error != "" {
-					logger.Errorf("Error: %s", response.Error)
+					return fmt.Errorf("command failed: %s", response.Error)
 				}
-				os.Exit(1)
+				return fmt.Errorf("command failed")
 			}
 			response, err := client.ExecuteInSession(command, sessionID, timeout, includeSteps, false)
 			if err != nil {
-				color.Red("❌ Failed to execute command: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to execute command: %w", err)
 			}
 
 			if response.Success {
@@ -105,12 +101,12 @@ func newClientExecCommand(factory ClientFactory) *cobra.Command {
 					fmt.Println("\n--- Result ---")
 					fmt.Println(response.Result)
 				}
+				return nil
 			} else {
-				color.Red("❌ Command failed")
 				if response.Error != "" {
-					logger.Errorf("Error: %s", response.Error)
+					return fmt.Errorf("command failed: %s", response.Error)
 				}
-				os.Exit(1)
+				return fmt.Errorf("command failed")
 			}
 		},
 	}
@@ -146,18 +142,19 @@ func newClientSessionsListCommand(factory ClientFactory) *cobra.Command {
 	listCmd := &cobra.Command{
 		Use:   "list",
 		Short: "List sessions and tasks",
-		Run: func(cmd *cobra.Command, _ []string) {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			client := factory()
 			limit, _ := cmd.Flags().GetInt("limit")
 
 			resp, err := client.ListSessions(limit)
 			if err != nil {
 				color.Red("❌ Failed to list sessions: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to list sessions: %w", err)
 			}
 
 			data, _ := json.MarshalIndent(resp, "", "  ")
 			fmt.Println(string(data))
+			return nil
 		},
 	}
 
@@ -170,15 +167,16 @@ func newClientSessionsGetCommand(factory ClientFactory) *cobra.Command {
 		Use:   "get [id]",
 		Short: "Get a session detail",
 		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			client := factory()
 			resp, err := client.GetSession(args[0])
 			if err != nil {
 				color.Red("❌ Failed to get session: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get session: %w", err)
 			}
 			data, _ := json.MarshalIndent(resp, "", "  ")
 			fmt.Println(string(data))
+			return nil
 		},
 	}
 }
@@ -188,15 +186,16 @@ func newClientSessionsCancelCommand(factory ClientFactory) *cobra.Command {
 		Use:   "cancel [id]",
 		Short: "Cancel a running session by id",
 		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			client := factory()
 			resp, err := client.CancelSession(args[0])
 			if err != nil {
 				color.Red("❌ Failed to cancel: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to cancel: %w", err)
 			}
 			data, _ := json.MarshalIndent(resp, "", "  ")
 			fmt.Println(string(data))
+			return nil
 		},
 	}
 }
@@ -206,15 +205,16 @@ func newClientSessionsDeleteCommand(factory ClientFactory) *cobra.Command {
 		Use:   "delete [id]",
 		Short: "Delete a session or task by id",
 		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			client := factory()
 			resp, err := client.DeleteSession(args[0])
 			if err != nil {
 				color.Red("❌ Failed to delete: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to delete: %w", err)
 			}
 			data, _ := json.MarshalIndent(resp, "", "  ")
 			fmt.Println(string(data))
+			return nil
 		},
 	}
 }
@@ -224,7 +224,7 @@ func newClientSessionsResetCommand(factory ClientFactory) *cobra.Command {
 		Use:   "reset [session_id]",
 		Short: "Reset a session history",
 		Args:  cobra.RangeArgs(0, 1),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			client := factory()
 			sessionID := ""
 			if len(args) == 1 {
@@ -234,10 +234,11 @@ func newClientSessionsResetCommand(factory ClientFactory) *cobra.Command {
 			resp, err := client.ResetSession(sessionID)
 			if err != nil {
 				color.Red("❌ Failed to reset session: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to reset session: %w", err)
 			}
 			data, _ := json.MarshalIndent(resp, "", "  ")
 			fmt.Println(string(data))
+			return nil
 		},
 	}
 
@@ -253,21 +254,21 @@ func newClientStatusCommand(factory ClientFactory) *cobra.Command {
 		Use:   "status",
 		Short: "Get daemon status",
 		Long:  `Get status information from the running nano daemon.`,
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			client := factory()
 
 			// Get health
 			health, err := client.Health()
 			if err != nil {
 				color.Red("❌ Failed to get daemon health: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get daemon health: %w", err)
 			}
 
 			// Get status
 			status, err := client.Status()
 			if err != nil {
 				color.Red("❌ Failed to get daemon status: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get daemon status: %w", err)
 			}
 
 			fmt.Println("=== Nano Daemon Status ===")
@@ -278,6 +279,7 @@ func newClientStatusCommand(factory ClientFactory) *cobra.Command {
 			logger.Infof("MCP Enabled: %v", status.MCPEnabled)
 			logger.Infof("Memory Size: %d", status.MemorySize)
 			logger.Infof("Active Tools: %d", status.ActiveTools)
+			return nil
 		},
 	}
 
@@ -299,13 +301,13 @@ func newClientMCPCommand(factory ClientFactory) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status",
 		Short: "Get MCP status",
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			client := factory()
 
 			response, err := client.MCPStatus()
 			if err != nil {
 				color.Red("❌ Failed to get MCP status: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get MCP status: %w", err)
 			}
 
 			fmt.Println("=== MCP Status ===")
@@ -313,6 +315,7 @@ func newClientMCPCommand(factory ClientFactory) *cobra.Command {
 			logger.Infof("Servers: %d", response.Servers)
 			logger.Infof("Tools: %d", response.Tools)
 			logger.Infof("Connections: %d", len(response.Connections))
+			return nil
 		},
 	})
 
@@ -320,13 +323,13 @@ func newClientMCPCommand(factory ClientFactory) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "tools",
 		Short: "List MCP tools",
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			client := factory()
 
 			response, err := client.MCPTools()
 			if err != nil {
 				color.Red("❌ Failed to get MCP tools: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get MCP tools: %w", err)
 			}
 
 			fmt.Println("=== MCP Tools ===")
@@ -336,6 +339,7 @@ func newClientMCPCommand(factory ClientFactory) *cobra.Command {
 				data, _ := json.MarshalIndent(response.Tools, "", "  ")
 				fmt.Println(string(data))
 			}
+			return nil
 		},
 	})
 
@@ -343,18 +347,19 @@ func newClientMCPCommand(factory ClientFactory) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "diagnostics",
 		Short: "Get MCP diagnostics",
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			client := factory()
 
 			response, err := client.MCPDiagnostics()
 			if err != nil {
 				color.Red("❌ Failed to get MCP diagnostics: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get MCP diagnostics: %w", err)
 			}
 
 			fmt.Println("=== MCP Diagnostics ===")
 			data, _ := json.MarshalIndent(response, "", "  ")
 			fmt.Println(string(data))
+			return nil
 		},
 	})
 
@@ -376,13 +381,13 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list",
 		Short: "List sessions",
-		Run: func(_ *cobra.Command, _ []string) {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			client := factory()
 
 			response, err := client.ListMemory()
 			if err != nil {
 				color.Red("❌ Failed to list memory: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to list memory: %w", err)
 			}
 
 			fmt.Println("=== Memory Entries ===")
@@ -394,6 +399,7 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 				data, _ := json.MarshalIndent(response.Entries, "", "  ")
 				fmt.Println(string(data))
 			}
+			return nil
 		},
 	})
 
@@ -402,7 +408,7 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 		Use:   "save [key] [content]",
 		Short: "Save memory entry",
 		Args:  cobra.ExactArgs(2),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			client := factory()
 
 			key := args[0]
@@ -412,7 +418,7 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 			response, err := client.SaveMemory(key, content, tags)
 			if err != nil {
 				color.Red("❌ Failed to save memory: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to save memory: %w", err)
 			}
 
 			if response.Success {
@@ -420,6 +426,7 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 			} else {
 				color.Red("❌ Failed to save memory entry")
 			}
+			return nil
 		},
 	})
 
@@ -428,14 +435,14 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 		Use:   "get [key]",
 		Short: "Get memory entry",
 		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			client := factory()
 
 			key := args[0]
 			response, err := client.GetMemory(key)
 			if err != nil {
 				color.Red("❌ Failed to get memory: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to get memory: %w", err)
 			}
 
 			if response.Found {
@@ -444,6 +451,7 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 			} else {
 				color.Yellow("Memory entry not found: %s", key)
 			}
+			return nil
 		},
 	})
 
@@ -452,14 +460,14 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 		Use:   "delete [key]",
 		Short: "Delete memory entry",
 		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(_ *cobra.Command, args []string) error {
 			client := factory()
 
 			key := args[0]
 			response, err := client.DeleteMemory(key)
 			if err != nil {
 				color.Red("❌ Failed to delete memory: %v", err)
-				os.Exit(1)
+				return fmt.Errorf("failed to delete memory: %w", err)
 			}
 
 			if response.Success {
@@ -467,6 +475,7 @@ func newClientMemoryCommand(factory ClientFactory) *cobra.Command {
 			} else {
 				color.Red("❌ Failed to delete memory entry")
 			}
+			return nil
 		},
 	})
 

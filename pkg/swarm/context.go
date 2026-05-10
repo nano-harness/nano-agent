@@ -21,6 +21,21 @@ type TeammateIdentity struct {
 	// Color is an optional color code for UI display (e.g., "#FF5733")
 	Color string
 
+	// PermissionMode is the teammate's independent permission mode.
+	PermissionMode string
+
+	// AllowedTools optionally constrains this teammate's tool surface.
+	AllowedTools []string
+
+	// Model optionally overrides the teammate's model independently of the parent.
+	Model string
+
+	// Fallbacks optionally overrides the teammate's model fallback chain.
+	Fallbacks []string
+
+	// ContextProviders optionally constrains teammate context sources.
+	ContextProviders []string
+
 	// PlanModeRequired indicates whether this agent must enter plan mode before implementation
 	PlanModeRequired bool
 

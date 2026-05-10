@@ -117,11 +117,24 @@ func TestShouldConfirm_FsToolWithinWorkdir_Skips(t *testing.T) {
 	mgr := permission.NewManagerWithWorkdir(permission.ModeDefault, nil, workdir)
 	tool := &contextualTool{
 		mockTool:      mockTool{requiresOK: true, category: interfaces.CategoryFileSystem},
-		paramsRequire: true,
+		paramsRequire: false,
 	}
 	params := map[string]interface{}{"file_path": filepath.Join(workdir, "notes.md")}
 	if mgr.ShouldConfirm("write_file", params, tool) {
 		t.Error("filesystem write inside workdir should not require confirmation")
+	}
+}
+
+func TestShouldConfirm_ContextualSensitiveFileInsideWorkdir_Confirms(t *testing.T) {
+	workdir := t.TempDir()
+	mgr := permission.NewManagerWithWorkdir(permission.ModeDefault, nil, workdir)
+	tool := &contextualTool{
+		mockTool:      mockTool{requiresOK: false, category: interfaces.CategoryFileSystem},
+		paramsRequire: true,
+	}
+	params := map[string]interface{}{"file_path": filepath.Join(workdir, ".env")}
+	if !mgr.ShouldConfirm("write_file", params, tool) {
+		t.Error("sensitive filesystem write inside workdir should require confirmation")
 	}
 }
 

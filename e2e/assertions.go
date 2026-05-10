@@ -4,8 +4,6 @@ package e2e
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,12 +15,6 @@ import (
 func (s *AgentTestSuite) AssertEventExists(eventType event.EventType) {
 	s.T().Helper()
 	assert.Truef(s.T(), eventExists(s.Events, eventType), "expected event type %s to exist", eventType)
-}
-
-// AssertNoEvent 断言不存在指定类型的事件。
-func (s *AgentTestSuite) AssertNoEvent(eventType event.EventType) {
-	s.T().Helper()
-	assert.Falsef(s.T(), eventExists(s.Events, eventType), "did not expect event type %s", eventType)
 }
 
 // AssertEventSequence 断言事件类型按给定顺序至少出现一次（允许出现其他事件）。
@@ -44,40 +36,10 @@ func (s *AgentTestSuite) AssertToolCallCount(toolName string, count int) {
 	assert.Equalf(s.T(), count, actual, "unexpected call count for tool %q", toolName)
 }
 
-// AssertToolCalledWithParams 断言某次工具调用包含给定参数键值对（JSON 级别匹配）。
-func (s *AgentTestSuite) AssertToolCalledWithParams(toolName string, expected map[string]interface{}) {
-	s.T().Helper()
-	assert.Truef(s.T(), toolCalledWithParams(s.Events, toolName, expected), "expected tool %q to be called with params %v", toolName, expected)
-}
-
 // AssertContentContains 断言 content 型事件中包含指定子串。
 func (s *AgentTestSuite) AssertContentContains(substring string) {
 	s.T().Helper()
 	assert.Truef(s.T(), contentContains(s.Events, substring), "expected content to contain %q", substring)
-}
-
-// AssertFileCreated 断言在工作目录下指定路径的文件存在。
-func (s *AgentTestSuite) AssertFileCreated(path string) {
-	s.T().Helper()
-	fullPath := path
-	if !filepath.IsAbs(path) {
-		fullPath = filepath.Join(s.WorkDir, path)
-	}
-	_, err := os.Stat(fullPath)
-	assert.NoErrorf(s.T(), err, "expected file %s to exist", fullPath)
-}
-
-// AssertFileContains 断言文件内容包含指定子串。
-func (s *AgentTestSuite) AssertFileContains(path, substring string) {
-	s.T().Helper()
-	fullPath := path
-	if !filepath.IsAbs(path) {
-		fullPath = filepath.Join(s.WorkDir, path)
-	}
-	data, err := os.ReadFile(fullPath)
-	if assert.NoErrorf(s.T(), err, "failed to read file %s", fullPath) {
-		assert.Containsf(s.T(), string(data), substring, "expected file %s to contain %q", fullPath, substring)
-	}
 }
 
 // AssertCompletionReason 断言存在 completion 类型事件，并且 reason 匹配（通常放在 Metadata 中）。

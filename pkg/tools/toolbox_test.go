@@ -43,6 +43,7 @@ func TestToolboxIntegration(t *testing.T) {
 	tools := toolbox.List()
 	expectedTools := []string{
 		"read_file",
+		"read_pdf",
 		"write_file",
 		"edit_file",
 		"delete_file",

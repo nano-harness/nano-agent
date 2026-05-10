@@ -320,6 +320,39 @@ func TestManager_SetKnowledge(t *testing.T) {
 	}
 }
 
+func TestManager_GetListDeleteKnowledge(t *testing.T) {
+	dataDir := t.TempDir()
+	m := NewManager(t.TempDir(), dataDir, true)
+	defer m.Close()
+
+	if err := m.SetKnowledge("key1", "value1", "tag"); err != nil {
+		t.Fatalf("SetKnowledge: %v", err)
+	}
+
+	entry, err := m.GetKnowledge("key1")
+	if err != nil {
+		t.Fatalf("GetKnowledge: %v", err)
+	}
+	if entry.Value != "value1" {
+		t.Fatalf("GetKnowledge value = %q, want value1", entry.Value)
+	}
+
+	entries, err := m.ListKnowledge(10)
+	if err != nil {
+		t.Fatalf("ListKnowledge: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ListKnowledge len = %d, want 1", len(entries))
+	}
+
+	if err := m.DeleteKnowledge("key1"); err != nil {
+		t.Fatalf("DeleteKnowledge: %v", err)
+	}
+	if entry, err := m.GetKnowledge("key1"); err != nil || entry != nil {
+		t.Fatalf("GetKnowledge after delete = (%v, %v), want nil entry", entry, err)
+	}
+}
+
 func TestManager_GetMemoryTools(t *testing.T) {
 	dataDir := t.TempDir()
 	m := NewManager(t.TempDir(), dataDir, true)

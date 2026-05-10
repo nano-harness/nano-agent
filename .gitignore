@@ -56,6 +56,9 @@ logs/
 # Exception: banner manifest is required for embed
 !pkg/ui/bubbletea/banner/frames/manifest.json
 
+# Acceptance verification artifacts
+acceptance/
+
 venv/
 
 __pycache__/

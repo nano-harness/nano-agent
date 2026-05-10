@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -76,6 +77,27 @@ func TestCircuitBreakerStates(t *testing.T) {
 	cb.RecordSuccess()
 	if cb.State() != CircuitClosed {
 		t.Fatalf("expected closed after 2 successes, got %s", cb.State())
+	}
+}
+
+func TestCircuitBreakerRegistrySharesProviderEndpointBreakers(t *testing.T) {
+	resetCircuitBreakerRegistryForTest()
+	t.Cleanup(resetCircuitBreakerRegistryForTest)
+
+	cfg := DefaultCircuitBreakerConfig()
+	firstHealth := NewRouteHealth(cfg)
+	secondHealth := NewRouteHealth(cfg)
+	routeA := ResolvedRoute{Name: "primary", ProviderID: "openai", Model: "gpt-4.1", BaseURL: "https://api.openai.com/v1"}
+	routeB := ResolvedRoute{Name: "fallback-1", ProviderID: "openai", Model: "gpt-4o", BaseURL: "https://api.openai.com/v1"}
+
+	first := firstHealth.BreakerForRoute(routeA)
+	second := secondHealth.BreakerForRoute(routeB)
+	if first != second {
+		t.Fatal("expected provider/baseURL routes to share a circuit breaker")
+	}
+	first.RecordFailure()
+	if second.Stats()["total_failures"] != int64(1) {
+		t.Fatalf("shared breaker did not observe failure: %#v", second.Stats())
 	}
 }
 
@@ -251,6 +273,9 @@ func TestIsRetryableError(t *testing.T) {
 		{"quota exceeded", errors.New("insufficient_quota"), false},
 		{"billing issue", errors.New("billing error"), false},
 		{"context canceled", errors.New("context canceled"), false},
+		{"context overflow", errors.New("400 context_length_exceeded: maximum context length exceeded"), false},
+		{"request aborted", errors.New("request aborted by client"), false},
+		{"output format", errors.New("json schema validation failed"), false},
 		{"model not found", errors.New("model not found"), false},
 		{"random error", errors.New("some random error"), false},
 		{
@@ -265,6 +290,31 @@ func TestIsRetryableError(t *testing.T) {
 			result := IsRetryableError(tt.err)
 			if result != tt.expected {
 				t.Errorf("IsRetryableError(%v) = %v, want %v", tt.err, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestShouldRecordCBFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"RateLimit", errors.New("429 Too Many Requests"), true},
+		{"Server", errors.New("500 Internal Server Error"), true},
+		{"Auth", errors.New("401 Unauthorized"), false},
+		{"Quota", errors.New("insufficient_quota"), false},
+		{"ContextOverflow", errors.New("400 context_length_exceeded: maximum context length exceeded"), false},
+		{"Aborted", context.Canceled, false},
+		{"OutputFormat", errors.New("tool_call_validation invalid_tool_call"), false},
+		{"Network", errors.New("connection reset by peer"), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ShouldRecordCBFailure(tt.err); got != tt.expected {
+				t.Fatalf("ShouldRecordCBFailure(%v) = %v, want %v", tt.err, got, tt.expected)
 			}
 		})
 	}

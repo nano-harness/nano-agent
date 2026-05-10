@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - docs(daemon-api): rewrote daemon API as a Web client implementation guide.
 
 ### Added
+- `ShouldFailback` field on `APIErrorInfo`, with dedicated `ContextOverflow`, `Aborted`, and `OutputFormat` API error categories.
+- Stream event metadata `truncated` and `finish_reason` for `finish_reason=length` detection.
+- `advanced.circuit_breaker.exclude_non_failback` and `advanced.circuit_breaker.truncation_detection` configuration options.
 - **Multi-Agent Mailbox System**: Asynchronous message passing infrastructure for fork-based parallel execution
   - Core interfaces: `Mailbox`, `Backend`, `Manager` for structured agent-to-agent communication
   - Memory backend for single-process CLI mode and testing
@@ -40,19 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - YAML `sub_agents` config still works but requires `@name` to trigger
   - Names automatically converted to kebab-case (e.g., `myAgent` → `@my-agent`)
 
+### Fixed
+- Context overflow, authentication, aborted, and output-format errors no longer pollute circuit breaker failure counters.
+
 ### Removed
 - **BREAKING**: Removed `fork` tool - LLM can no longer autonomously fork child agents
   - All sub-agent invocations must be explicitly triggered by users via `@expert-name`
   - Improves observability: users always know when experts are invoked and what they cost
-
-## Background
-
-This release refactors nano-agent's sub-agent system to align with Gemini CLI v0.38.1's expert architecture, with two key differences:
-
-1. **More aggressive than Gemini**: Completely removes LLM's ability to implicitly fork. Only explicit user `@expert-name` triggers work.
-2. **Kebab-case naming**: Uses `@investigator` / `@help` / `@generalist` (not `@codebase_investigator` / `@cli_help`). No alias support.
-
-These breaking changes improve:
-- **Observability**: Users always see when experts are invoked
-- **Cost Control**: No hidden token usage from autonomous forks
-- **Explicit Intent**: Clear user control over expert delegation

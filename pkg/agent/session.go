@@ -30,29 +30,79 @@ type Session struct {
 	TotalTokens         int           `json:"totalTokens"`
 	Duration            float64       `json:"duration"`
 	Metadata            map[string]interface{}
+	State               SessionState `json:"state"`
+	StateChangedAt      time.Time    `json:"state_changed_at"`
+	LastPersistedSeq    int64        `json:"last_persisted_seq"`
+	LastCompactionSeq   int64        `json:"last_compaction_seq"`
+	transcript          *TranscriptWriter
+	ralphContext        *RalphContext
 	mutex               sync.RWMutex
 }
 
 // NewSession creates a new session with a unique ID.
 func NewSession() *Session {
-	return &Session{
+	s := &Session{
 		ID:                  generateSessionID(),
 		ConversationHistory: []llm.Message{},
 		CreatedAt:           time.Now(),
 		LastActiveAt:        time.Now(),
 		Metadata:            make(map[string]interface{}),
+		State:               SessionStateIdle,
+		StateChangedAt:      time.Now(),
 	}
+	s.initRuntimeState()
+	return s
 }
 
 // NewSessionWithID creates a new session with a specified ID.
 func NewSessionWithID(id string) *Session {
-	return &Session{
+	s := &Session{
 		ID:                  id,
 		ConversationHistory: []llm.Message{},
 		CreatedAt:           time.Now(),
 		LastActiveAt:        time.Now(),
 		Metadata:            make(map[string]interface{}),
+		State:               SessionStateIdle,
+		StateChangedAt:      time.Now(),
 	}
+	s.initRuntimeState()
+	return s
+}
+
+func (s *Session) initRuntimeState() {
+	if s == nil {
+		return
+	}
+	s.ralphContext = NewRalphContext(nil)
+	if tw, err := NewTranscriptWriter(s.ID); err == nil {
+		s.transcript = tw
+	} else {
+		logger.Warnf("Failed to initialize transcript for session %s: %v", s.ID, err)
+	}
+}
+
+func (s *Session) Transcript() *TranscriptWriter {
+	if s == nil {
+		return nil
+	}
+	return s.transcript
+}
+
+func (s *Session) TranscriptPath() string {
+	if s == nil || s.transcript == nil {
+		return ""
+	}
+	return s.transcript.Path()
+}
+
+func (s *Session) RalphContext() *RalphContext {
+	if s == nil {
+		return NewRalphContext(nil)
+	}
+	if s.ralphContext == nil {
+		s.ralphContext = NewRalphContext(nil)
+	}
+	return s.ralphContext
 }
 
 // generateSessionID generates a unique session ID.
@@ -133,22 +183,32 @@ func (s *Session) UpdateStats(totalTokens int, duration float64) { //nolint:revi
 
 // cleanupMessageSequenceUnsafe removes incomplete tool call sequences.
 // Caller must hold the mutex.
-func (s *Session) cleanupMessageSequenceUnsafe() { //nolint:unused
+func (s *Session) cleanupMessageSequenceUnsafe() int {
 	if len(s.ConversationHistory) == 0 {
-		return
+		return 0
 	}
 
 	var cleanedHistory []llm.Message
+	removedCount := 0
+	knownToolCalls := make(map[string]struct{})
 
 	for i, msg := range s.ConversationHistory {
 		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			currentToolCalls := make(map[string]struct{}, len(msg.ToolCalls))
+			for _, call := range msg.ToolCalls {
+				if call.ID != "" {
+					currentToolCalls[call.ID] = struct{}{}
+				}
+			}
 			// Check if this assistant message with tool calls has following tool messages
 			hasFollowingToolMessage := false
 
 			for j := i + 1; j < len(s.ConversationHistory); j++ {
 				nextMsg := s.ConversationHistory[j]
 				if nextMsg.Role == "tool" {
-					hasFollowingToolMessage = true
+					_, hasFollowingToolMessage = currentToolCalls[nextMsg.ToolCallID]
+				}
+				if hasFollowingToolMessage {
 					break
 				}
 				if nextMsg.Role == "assistant" {
@@ -164,7 +224,18 @@ func (s *Session) cleanupMessageSequenceUnsafe() { //nolint:unused
 				cleanedMsg := msg
 				cleanedMsg.ToolCalls = nil
 				cleanedHistory = append(cleanedHistory, cleanedMsg)
+				removedCount += len(msg.ToolCalls)
 				logger.Warnf("Session %s: Removed incomplete tool calls from message at index %d", s.ID, i)
+			}
+			for callID := range currentToolCalls {
+				knownToolCalls[callID] = struct{}{}
+			}
+		} else if msg.Role == "tool" && msg.ToolCallID != "" {
+			if _, ok := knownToolCalls[msg.ToolCallID]; ok {
+				cleanedHistory = append(cleanedHistory, msg)
+			} else {
+				removedCount++
+				logger.Warnf("Session %s: Removed orphan tool result for call %s", s.ID, msg.ToolCallID)
 			}
 		} else {
 			// Regular message, keep it
@@ -173,6 +244,14 @@ func (s *Session) cleanupMessageSequenceUnsafe() { //nolint:unused
 	}
 
 	s.ConversationHistory = cleanedHistory
+	return removedCount
+}
+
+// SanitizeMessageSequence removes orphan assistant tool calls and orphan tool results.
+func (s *Session) SanitizeMessageSequence() (removedCount int) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.cleanupMessageSequenceUnsafe()
 }
 
 // Touch updates the last active time.
@@ -187,6 +266,73 @@ func (s *Session) IsExpired(ttl time.Duration) bool {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 	return time.Since(s.LastActiveAt) > ttl
+}
+
+// TransitionState transitions a session through the explicit lifecycle state machine.
+func (s *Session) TransitionState(target SessionState, reason string) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.State == "" {
+		s.State = SessionStateIdle
+	}
+	if !s.State.CanTransitionTo(target) {
+		return fmt.Errorf("invalid session state transition: %s -> %s", s.State, target)
+	}
+	s.State = target
+	s.StateChangedAt = time.Now()
+	s.LastActiveAt = s.StateChangedAt
+	if reason != "" {
+		if s.Metadata == nil {
+			s.Metadata = make(map[string]interface{})
+		}
+		s.Metadata["state_reason"] = reason
+	}
+	return nil
+}
+
+// GetState returns the explicit session lifecycle state.
+func (s *Session) GetState() SessionState {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	if s.State == "" {
+		return SessionStateIdle
+	}
+	return s.State
+}
+
+// NextSeq atomically advances and returns the next session event sequence.
+func (s *Session) NextSeq() int64 {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.LastPersistedSeq++
+	return s.LastPersistedSeq
+}
+
+// IsExpiredByState checks expiration according to the explicit lifecycle state.
+func (s *Session) IsExpiredByState(now time.Time, idleTTL, awaitingTTL time.Duration) (bool, string) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	state := s.State
+	if state == "" {
+		state = SessionStateIdle
+	}
+	reference := s.LastActiveAt
+	switch state {
+	case SessionStateIdle:
+		if now.Sub(reference) > idleTTL {
+			return true, "idle_ttl"
+		}
+	case SessionStateAwaitingInput:
+		if !s.StateChangedAt.IsZero() {
+			reference = s.StateChangedAt
+		}
+		if now.Sub(reference) > awaitingTTL {
+			return true, "awaiting_input_timeout"
+		}
+	case SessionStateTerminated:
+		return true, "user_terminate"
+	}
+	return false, ""
 }
 
 // SetMetadata sets a metadata value for the session.
@@ -209,10 +355,14 @@ type SessionManager struct {
 	sessions          map[string]*Session
 	mutex             sync.RWMutex
 	sessionTTL        time.Duration
+	awaitingInputTTL  time.Duration
 	cleanupCh         chan struct{}
 	wg                sync.WaitGroup
 	storage           SessionStorage
 	backgroundCancels map[string][]context.CancelFunc // per-session background goroutine cancellation, protected by mutex
+	loadInProgress    map[string]chan struct{}
+	lifecycleHooks    []LifecycleHook
+	metrics           *SessionMetrics
 }
 
 // SessionManagerOption is a functional option for SessionManager.
@@ -250,8 +400,11 @@ func NewSessionManager(opts ...SessionManagerOption) *SessionManager {
 	sm := &SessionManager{
 		sessions:          make(map[string]*Session),
 		sessionTTL:        30 * time.Minute, // Default TTL
+		awaitingInputTTL:  DefaultAwaitingInputTTL,
 		cleanupCh:         make(chan struct{}),
 		backgroundCancels: make(map[string][]context.CancelFunc),
+		loadInProgress:    make(map[string]chan struct{}),
+		metrics:           NewSessionMetrics(),
 	}
 
 	for _, opt := range opts {
@@ -267,23 +420,18 @@ func NewSessionManager(opts ...SessionManagerOption) *SessionManager {
 
 // GetOrCreateSession gets an existing session or creates a new one.
 func (sm *SessionManager) GetOrCreateSession(sessionID string) *Session {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	if sessionID != "" {
-		if session, exists := sm.sessions[sessionID]; exists {
-			session.Touch()
+		if session, exists := sm.GetSession(sessionID); exists {
 			return session
 		}
+	}
 
-		// Try to load from storage if enabled
-		if sm.storage != nil {
-			if session, err := sm.storage.LoadSession(sessionID); err == nil && session != nil {
-				session.Touch()
-				sm.sessions[session.ID] = session
-				logger.Infof("Loaded session from storage: %s", session.ID)
-				return session
-			}
+	sm.mutex.Lock()
+	if sessionID != "" {
+		if session, exists := sm.sessions[sessionID]; exists {
+			sm.mutex.Unlock()
+			session.Touch()
+			return session
 		}
 	}
 
@@ -295,43 +443,78 @@ func (sm *SessionManager) GetOrCreateSession(sessionID string) *Session {
 		session = NewSession()
 	}
 	sm.sessions[session.ID] = session
+	if sm.metrics != nil {
+		sm.metrics.RecordStateChange("", session.GetState())
+	}
+	sm.mutex.Unlock()
+	sm.emitLifecycle(context.Background(), session.ID, SessionLifecycleCreated, map[string]interface{}{"state": string(session.GetState())})
 	logger.Infof("Created new session: %s", session.ID)
 	return session
 }
 
 // GetSession gets an existing session by ID.
 func (sm *SessionManager) GetSession(sessionID string) (*Session, bool) {
-	sm.mutex.RLock()
-	// Check memory first
-	session, exists := sm.sessions[sessionID]
-	sm.mutex.RUnlock()
-
-	if exists {
-		session.Touch()
-		return session, true
+	if sessionID == "" {
+		return nil, false
 	}
-
-	// Double check with lock for storage load
 	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	// Re-check memory
 	if session, exists := sm.sessions[sessionID]; exists {
+		sm.mutex.Unlock()
 		session.Touch()
 		return session, true
 	}
-
-	// Try storage
-	if sm.storage != nil {
-		if session, err := sm.storage.LoadSession(sessionID); err == nil && session != nil {
+	if waitCh, loading := sm.loadInProgress[sessionID]; loading {
+		sm.mutex.Unlock()
+		<-waitCh
+		sm.mutex.RLock()
+		session, exists := sm.sessions[sessionID]
+		sm.mutex.RUnlock()
+		if exists {
 			session.Touch()
-			sm.sessions[session.ID] = session
-			logger.Infof("Loaded session from storage: %s", session.ID)
-			return session, true
 		}
+		return session, exists
+	}
+	waitCh := make(chan struct{})
+	sm.loadInProgress[sessionID] = waitCh
+	storage := sm.storage
+	sm.mutex.Unlock()
+
+	defer func() {
+		sm.mutex.Lock()
+		delete(sm.loadInProgress, sessionID)
+		close(waitCh)
+		sm.mutex.Unlock()
+	}()
+
+	if storage == nil {
+		return nil, false
 	}
 
-	return nil, false
+	session, err := storage.LoadSession(sessionID)
+	if err != nil || session == nil {
+		return nil, false
+	}
+	session.Touch()
+	if session.State == "" {
+		session.State = SessionStateIdle
+	}
+	if session.StateChangedAt.IsZero() {
+		session.StateChangedAt = session.LastActiveAt
+	}
+	session.initRuntimeState()
+	sm.mutex.Lock()
+	if existing, exists := sm.sessions[sessionID]; exists {
+		sm.mutex.Unlock()
+		existing.Touch()
+		return existing, true
+	}
+	sm.sessions[session.ID] = session
+	if sm.metrics != nil {
+		sm.metrics.RecordStateChange("", session.GetState())
+	}
+	sm.mutex.Unlock()
+	logger.Infof("Loaded session from storage: %s", session.ID)
+	return session, true
 }
 
 // SaveSession persists a specific session to storage
@@ -348,7 +531,52 @@ func (sm *SessionManager) SaveSession(sessionID string) error {
 		return fmt.Errorf("session %s not found in memory", sessionID)
 	}
 
-	return sm.storage.SaveSession(session)
+	if removed := session.SanitizeMessageSequence(); removed > 0 {
+		logger.Infof("Sanitized %d orphan tool message item(s) before saving session %s", removed, sessionID)
+	}
+	err := sm.storage.SaveSession(session)
+	if err == nil && sm.metrics != nil {
+		lag := session.LastPersistedSeq - session.LastCompactionSeq
+		if lag < 0 {
+			lag = 0
+		}
+		sm.metrics.RecordSeqLag(lag)
+	}
+	return err
+}
+
+// TransitionSessionState transitions a managed session and emits lifecycle/metrics events.
+func (sm *SessionManager) TransitionSessionState(sessionID string, target SessionState, reason string) error {
+	session, exists := sm.GetSession(sessionID)
+	if !exists || session == nil {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	from := session.GetState()
+	if err := session.TransitionState(target, reason); err != nil {
+		return err
+	}
+	to := session.GetState()
+	if sm.metrics != nil {
+		sm.metrics.RecordStateChange(from, to)
+	}
+	sm.emitLifecycle(context.Background(), sessionID, SessionLifecycleStateChanged, map[string]interface{}{
+		"from":   string(from),
+		"to":     string(to),
+		"reason": reason,
+	})
+	if storage, ok := sm.GetStorage().(IncrementalSessionStorage); ok {
+		_ = storage.AppendSessionEvent(sessionID, SessionEvent{
+			Type: SessionEventTypeStateTransition,
+			Seq:  session.NextSeq(),
+			StateTransition: &StateTransition{
+				From:   string(from),
+				To:     string(to),
+				Reason: reason,
+			},
+			Timestamp: time.Now().Unix(),
+		})
+	}
+	return nil
 }
 
 // ListStoredSessions returns a list of sessions available in storage
@@ -369,20 +597,32 @@ func (sm *SessionManager) ListStoredSessionInfos() ([]SessionInfo, error) { //no
 // DeleteSession deletes a session.
 func (sm *SessionManager) DeleteSession(sessionID string) (bool, error) {
 	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	// Cancel all background goroutines for this session first
-	sm.cancelBackgroundsLocked(sessionID)
+	cancels := sm.popBackgroundCancelsLocked(sessionID)
 
 	deleted := false
-	if _, exists := sm.sessions[sessionID]; exists {
+	var deletedSession *Session
+	if existing, exists := sm.sessions[sessionID]; exists {
+		deletedSession = existing
 		delete(sm.sessions, sessionID)
 		logger.Infof("Deleted session from memory: %s", sessionID)
 		deleted = true
 	}
+	storage := sm.storage
+	sm.mutex.Unlock()
 
-	if sm.storage != nil {
-		if err := sm.storage.DeleteSession(sessionID); err != nil {
+	for _, cancel := range cancels {
+		if cancel != nil {
+			cancel()
+		}
+	}
+	if deletedSession != nil && deletedSession.transcript != nil {
+		_ = deletedSession.transcript.Close()
+	}
+	cleanupTranscriptFile(sessionID)
+
+	sm.emitLifecycle(context.Background(), sessionID, SessionLifecycleBeforeCleanup, map[string]interface{}{"reason": "user_delete"})
+	if storage != nil {
+		if err := storage.DeleteSession(sessionID); err != nil {
 			return deleted, err
 		}
 		// If storage.DeleteSession succeeds (even if not found), we consider it handled.
@@ -421,22 +661,38 @@ func (sm *SessionManager) GetSessionCount() int {
 
 // RegisterBackgroundCancel registers a background goroutine cancel function for a session.
 // This allows proper cleanup when the session is deleted or the manager shuts down.
-func (sm *SessionManager) RegisterBackgroundCancel(sessionID string, cancel context.CancelFunc) {
+func (sm *SessionManager) RegisterBackgroundCancel(sessionID string, cancel context.CancelFunc) int {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 	sm.backgroundCancels[sessionID] = append(sm.backgroundCancels[sessionID], cancel)
+	return len(sm.backgroundCancels[sessionID]) - 1
+}
+
+// UnregisterBackgroundCancel unregisters a background cancel function by index.
+func (sm *SessionManager) UnregisterBackgroundCancel(sessionID string, idx int) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	if idx < 0 || idx >= len(sm.backgroundCancels[sessionID]) {
+		return
+	}
+	sm.backgroundCancels[sessionID][idx] = nil
 }
 
 // cancelBackgroundsLocked cancels all registered background goroutines for a session.
 // Must be called while holding the write lock (sm.mutex).
 func (sm *SessionManager) cancelBackgroundsLocked(sessionID string) {
-	cancels := sm.backgroundCancels[sessionID]
+	cancels := sm.popBackgroundCancelsLocked(sessionID)
 	for _, cancel := range cancels {
 		if cancel != nil {
 			cancel()
 		}
 	}
+}
+
+func (sm *SessionManager) popBackgroundCancelsLocked(sessionID string) []context.CancelFunc {
+	cancels := append([]context.CancelFunc(nil), sm.backgroundCancels[sessionID]...)
 	delete(sm.backgroundCancels, sessionID)
+	return cancels
 }
 
 // SaveSessionIfActive atomically checks if the session still exists and context is valid,
@@ -453,9 +709,8 @@ func (sm *SessionManager) SaveSessionIfActive(ctx context.Context, sessionID str
 	}
 
 	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
 	session, exists := sm.sessions[sessionID]
-	sm.mutex.RUnlock()
-
 	if !exists {
 		return fmt.Errorf("session %s no longer active", sessionID)
 	}
@@ -465,6 +720,9 @@ func (sm *SessionManager) SaveSessionIfActive(ctx context.Context, sessionID str
 		return ctx.Err()
 	}
 
+	if removed := session.SanitizeMessageSequence(); removed > 0 {
+		logger.Infof("Sanitized %d orphan tool message item(s) before saving session %s", removed, sessionID)
+	}
 	return sm.storage.SaveSession(session)
 }
 
@@ -488,26 +746,44 @@ func (sm *SessionManager) cleanupLoop() {
 // cleanupExpiredSessions removes expired sessions.
 func (sm *SessionManager) cleanupExpiredSessions() {
 	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 
-	expired := make([]string, 0)
+	type expiredSession struct {
+		id      string
+		session *Session
+		reason  string
+	}
+	expired := make([]expiredSession, 0)
+	now := time.Now()
 	for id, session := range sm.sessions {
-		if session.IsExpired(sm.sessionTTL) {
-			expired = append(expired, id)
+		if ok, reason := session.IsExpiredByState(now, sm.sessionTTL, sm.awaitingInputTTL); ok {
+			expired = append(expired, expiredSession{id: id, session: session, reason: reason})
 		}
 	}
+	for _, item := range expired {
+		delete(sm.sessions, item.id)
+	}
+	storage := sm.storage
+	sm.mutex.Unlock()
 
-	for _, id := range expired {
+	for _, item := range expired {
+		sm.emitLifecycle(context.Background(), item.id, SessionLifecycleBeforeCleanup, map[string]interface{}{"reason": item.reason})
 		// Save to storage before removing from memory if storage is enabled
 		// This effectively "archives" the session
-		if sm.storage != nil {
-			if err := sm.storage.SaveSession(sm.sessions[id]); err != nil {
-				logger.Errorf("Failed to save expired session %s to storage: %v", id, err)
+		if storage != nil {
+			if err := storage.SaveSession(item.session); err != nil {
+				logger.Errorf("Failed to save expired session %s to storage: %v", item.id, err)
 			}
 		}
-
-		delete(sm.sessions, id)
-		logger.Infof("Cleaned up expired session from memory: %s", id)
+		if sm.metrics != nil {
+			sm.metrics.RecordCleanup(item.reason)
+			sm.metrics.RecordSessionLifetime(now.Sub(item.session.CreatedAt))
+			sm.metrics.RecordStateChange(item.session.GetState(), "")
+		}
+		if item.session.transcript != nil {
+			_ = item.session.transcript.Close()
+		}
+		sm.emitLifecycle(context.Background(), item.id, SessionLifecycleCleaned, map[string]interface{}{"reason": item.reason})
+		logger.Infof("Cleaned up expired session from memory: %s", item.id)
 	}
 
 	if len(expired) > 0 {
@@ -521,19 +797,45 @@ func (sm *SessionManager) Shutdown() {
 	sm.wg.Wait()
 
 	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	// Cancel all background goroutines for all sessions
+	allCancels := make([]context.CancelFunc, 0)
 	for sessionID := range sm.backgroundCancels {
-		sm.cancelBackgroundsLocked(sessionID)
+		allCancels = append(allCancels, sm.popBackgroundCancelsLocked(sessionID)...)
+	}
+	sessionsCopy := make([]*Session, 0, len(sm.sessions))
+	for _, session := range sm.sessions {
+		sessionsCopy = append(sessionsCopy, session)
+	}
+	storage := sm.storage
+	sm.mutex.Unlock()
+
+	for _, cancel := range allCancels {
+		if cancel != nil {
+			cancel()
+		}
 	}
 
-	// Save all sessions on shutdown
-	if sm.storage != nil {
-		for _, session := range sm.sessions {
-			_ = sm.storage.SaveSession(session)
+	ctx := context.Background()
+	for _, session := range sessionsCopy {
+		sm.emitLifecycle(ctx, session.ID, SessionLifecycleBeforeShutdown, map[string]interface{}{"reason": "shutdown"})
+	}
+	if storage != nil {
+		for _, session := range sessionsCopy {
+			_ = storage.SaveSession(session)
+		}
+	}
+	for _, session := range sessionsCopy {
+		if session.transcript != nil {
+			_ = session.transcript.Close()
 		}
 	}
 
 	logger.Info("Session manager shutdown completed")
+}
+
+// MetricsSnapshot returns session observability metrics.
+func (sm *SessionManager) MetricsSnapshot() SessionMetricsSnapshot {
+	if sm == nil || sm.metrics == nil {
+		return SessionMetricsSnapshot{CountByState: map[string]int{}, CleanupByReason: map[string]int64{}}
+	}
+	return sm.metrics.Snapshot()
 }

@@ -3,6 +3,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -30,6 +31,12 @@ const (
 	APIErrorCategoryClient APIErrorCategory = "client"
 	// APIErrorCategoryTimeout indicates timeout errors
 	APIErrorCategoryTimeout APIErrorCategory = "timeout"
+	// APIErrorCategoryContextOverflow indicates context window overflow errors
+	APIErrorCategoryContextOverflow APIErrorCategory = "context_overflow"
+	// APIErrorCategoryAborted indicates request cancellation/abort errors
+	APIErrorCategoryAborted APIErrorCategory = "aborted"
+	// APIErrorCategoryOutputFormat indicates model output/tool-call format errors
+	APIErrorCategoryOutputFormat APIErrorCategory = "output_format"
 	// APIErrorCategoryUnknown indicates unknown errors
 	APIErrorCategoryUnknown APIErrorCategory = "unknown"
 )
@@ -50,14 +57,16 @@ const (
 
 // APIErrorInfo API错误信息
 type APIErrorInfo struct {
-	Category   APIErrorCategory
-	Severity   APIErrorSeverity
-	Retryable  bool
-	RetryAfter time.Duration
-	Message    string
-	HTTPStatus int
-	ErrorCode  string
-	Suggestion string
+	Category  APIErrorCategory
+	Severity  APIErrorSeverity
+	Retryable bool
+	// ShouldFailback indicates the error is suitable for retry/fallback health handling.
+	ShouldFailback bool
+	RetryAfter     time.Duration
+	Message        string
+	HTTPStatus     int
+	ErrorCode      string
+	Suggestion     string
 }
 
 // APIErrorHandler API错误处理器
@@ -95,6 +104,35 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 		HTTPStatus: httpStatus,
 	}
 
+	// Semantic checks that must take precedence over HTTP/text retry heuristics.
+	if isAbortedError(err, errorMsg) {
+		errorInfo.Category = APIErrorCategoryAborted
+		errorInfo.Severity = APIErrorSeverityLow
+		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
+		errorInfo.Suggestion = "请求已取消或中止"
+		aeh.recordError(errorInfo)
+		return errorInfo
+	}
+	if isOutputFormatError(errorMsg) {
+		errorInfo.Category = APIErrorCategoryOutputFormat
+		errorInfo.Severity = APIErrorSeverityMedium
+		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
+		errorInfo.Suggestion = "模型输出格式不符合要求，请修正提示词或工具调用格式后重试"
+		aeh.recordError(errorInfo)
+		return errorInfo
+	}
+	if httpStatus == http.StatusBadRequest && isContextOverflowError(errorMsg) {
+		errorInfo.Category = APIErrorCategoryContextOverflow
+		errorInfo.Severity = APIErrorSeverityMedium
+		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
+		errorInfo.Suggestion = "上下文长度超出模型窗口，请启用上下文压缩或减少输入内容"
+		aeh.recordError(errorInfo)
+		return errorInfo
+	}
+
 	// 根据HTTP状态码分类
 	switch httpStatus {
 	case http.StatusTooManyRequests:
@@ -105,11 +143,13 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 			errorInfo.Category = APIErrorCategoryQuota
 			errorInfo.Severity = APIErrorSeverityHigh
 			errorInfo.Retryable = false
+			errorInfo.ShouldFailback = false
 			errorInfo.Suggestion = "配额不足或已触发供应商限额，请检查账户状态或更换模型/密钥"
 		} else {
 			errorInfo.Category = APIErrorCategoryRateLimit
 			errorInfo.Severity = APIErrorSeverityMedium
 			errorInfo.Retryable = true
+			errorInfo.ShouldFailback = true
 			errorInfo.RetryAfter = 30 * time.Second
 			errorInfo.Suggestion = "请求频率过高，建议降低请求频率或等待后重试"
 		}
@@ -118,18 +158,28 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 		errorInfo.Category = APIErrorCategoryAuthentication
 		errorInfo.Severity = APIErrorSeverityHigh
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "认证失败，请检查API密钥是否正确"
+
+	case http.StatusPaymentRequired:
+		errorInfo.Category = APIErrorCategoryQuota
+		errorInfo.Severity = APIErrorSeverityHigh
+		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
+		errorInfo.Suggestion = "配额不足或需要付费，请检查账户状态"
 
 	case http.StatusForbidden:
 		errorInfo.Category = APIErrorCategoryQuota
 		errorInfo.Severity = APIErrorSeverityHigh
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "配额不足或权限不够，请检查账户状态"
 
 	case http.StatusInternalServerError:
 		errorInfo.Category = APIErrorCategoryServer
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 10 * time.Second
 		errorInfo.Suggestion = "服务器内部错误，建议稍后重试"
 
@@ -137,6 +187,7 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 		errorInfo.Category = APIErrorCategoryServer
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 15 * time.Second
 		errorInfo.Suggestion = "网关错误，建议稍后重试"
 
@@ -144,6 +195,7 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 		errorInfo.Category = APIErrorCategoryServer
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 20 * time.Second
 		errorInfo.Suggestion = "服务暂时不可用，建议稍后重试"
 
@@ -151,6 +203,7 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 		errorInfo.Category = APIErrorCategoryTimeout
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 5 * time.Second
 		errorInfo.Suggestion = "网关超时，建议重试"
 
@@ -158,6 +211,7 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 		errorInfo.Category = APIErrorCategoryClient
 		errorInfo.Severity = APIErrorSeverityHigh
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "请求格式错误，请检查请求参数"
 
 	default:
@@ -165,9 +219,7 @@ func (aeh *APIErrorHandler) AnalyzeError(err error, httpStatus int) *APIErrorInf
 		errorInfo = aeh.analyzeByErrorMessage(errorInfo, errorMsg)
 	}
 
-	// 记录错误统计
-	aeh.errorStats[errorInfo.Category]++
-	aeh.lastErrorTime = time.Now()
+	aeh.recordError(errorInfo)
 
 	return errorInfo
 }
@@ -179,6 +231,7 @@ func (aeh *APIErrorHandler) analyzeByErrorMessage(errorInfo *APIErrorInfo, error
 		errorInfo.Category = APIErrorCategoryTimeout
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 5 * time.Second
 		errorInfo.Suggestion = "请求超时，建议重试"
 
@@ -186,6 +239,7 @@ func (aeh *APIErrorHandler) analyzeByErrorMessage(errorInfo *APIErrorInfo, error
 		errorInfo.Category = APIErrorCategoryNetwork
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 3 * time.Second
 		errorInfo.Suggestion = "网络连接问题，建议检查网络后重试"
 
@@ -193,51 +247,97 @@ func (aeh *APIErrorHandler) analyzeByErrorMessage(errorInfo *APIErrorInfo, error
 		errorInfo.Category = APIErrorCategoryRateLimit
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 30 * time.Second
 		errorInfo.Suggestion = "请求频率过高，建议降低请求频率"
+
+	case isContextOverflowError(errorMsg):
+		errorInfo.Category = APIErrorCategoryContextOverflow
+		errorInfo.Severity = APIErrorSeverityMedium
+		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
+		errorInfo.Suggestion = "上下文长度超出模型窗口，请启用上下文压缩或减少输入内容"
+
+	case isOutputFormatError(errorMsg):
+		errorInfo.Category = APIErrorCategoryOutputFormat
+		errorInfo.Severity = APIErrorSeverityMedium
+		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
+		errorInfo.Suggestion = "模型输出格式不符合要求，请修正提示词或工具调用格式后重试"
 
 	case strings.Contains(errorMsg, "quota"), strings.Contains(errorMsg, "limit exceeded"):
 		errorInfo.Category = APIErrorCategoryQuota
 		errorInfo.Severity = APIErrorSeverityHigh
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "配额已用完，请检查账户状态"
 
 	case strings.Contains(errorMsg, "unauthorized"), strings.Contains(errorMsg, "invalid api key"):
 		errorInfo.Category = APIErrorCategoryAuthentication
 		errorInfo.Severity = APIErrorSeverityHigh
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "认证失败，请检查API密钥"
 
 	case strings.Contains(errorMsg, "context canceled"):
-		errorInfo.Category = APIErrorCategoryClient
+		errorInfo.Category = APIErrorCategoryAborted
 		errorInfo.Severity = APIErrorSeverityLow
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "请求被取消"
 	case strings.Contains(errorMsg, "reasoning"), strings.Contains(errorMsg, "o1"):
 		errorInfo.Category = APIErrorCategoryClient
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = false
 		errorInfo.RetryAfter = 2 * time.Second
 		errorInfo.Suggestion = "推理模式请求失败，系统将自动切换到标准模式重试"
 	case strings.Contains(errorMsg, "model not found"), strings.Contains(errorMsg, "invalid model"):
 		errorInfo.Category = APIErrorCategoryClient
 		errorInfo.Severity = APIErrorSeverityHigh
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "模型不存在或无权限访问，请检查模型名称和API权限"
 	case strings.Contains(errorMsg, "max tokens"), strings.Contains(errorMsg, "token limit"):
 		errorInfo.Category = APIErrorCategoryClient
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = false
+		errorInfo.ShouldFailback = false
 		errorInfo.Suggestion = "请求超出模型token限制，请减少输入内容或调整max_tokens参数"
 	default:
 		errorInfo.Category = APIErrorCategoryUnknown
 		errorInfo.Severity = APIErrorSeverityMedium
 		errorInfo.Retryable = true
+		errorInfo.ShouldFailback = true
 		errorInfo.RetryAfter = 5 * time.Second
 		errorInfo.Suggestion = "未知错误，建议重试"
 	}
 
 	return errorInfo
+}
+
+func (aeh *APIErrorHandler) recordError(errorInfo *APIErrorInfo) {
+	aeh.errorStats[errorInfo.Category]++
+	aeh.lastErrorTime = time.Now()
+}
+
+func isContextOverflowError(errorMsg string) bool {
+	return strings.Contains(errorMsg, "context_length_exceeded") ||
+		strings.Contains(errorMsg, "maximum context length") ||
+		strings.Contains(errorMsg, "prompt is too long") ||
+		strings.Contains(errorMsg, "tokens exceed")
+}
+
+func isOutputFormatError(errorMsg string) bool {
+	return strings.Contains(errorMsg, "tool_call_validation") ||
+		strings.Contains(errorMsg, "invalid_tool_call") ||
+		strings.Contains(errorMsg, "json schema validation")
+}
+
+func isAbortedError(err error, errorMsg string) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(errorMsg, "request aborted")
 }
 
 // HandleAPIError 处理API错误

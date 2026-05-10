@@ -31,6 +31,15 @@ type SessionStorage interface {
 	DeleteSession(id string) error
 }
 
+// IncrementalSessionStorage optionally supports append-only JSONL persistence and resume.
+type IncrementalSessionStorage interface {
+	SessionStorage
+	AppendSessionEvent(sessionID string, event SessionEvent) error
+	LoadEventsFromSeq(sessionID string, fromSeq int64) ([]SessionEvent, error)
+	WriteCheckpoint(sessionID string, marker CompactionMarker) error
+	GetLastSeq(sessionID string) (int64, error)
+}
+
 // OSSSessionStorage implements SessionStorage using Aliyun OSS
 type OSSSessionStorage struct {
 	client *oss.Client
@@ -107,6 +116,13 @@ func (s *OSSSessionStorage) LoadSession(id string) (*Session, error) {
 	if err := json.Unmarshal(data, &session); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal session: %w", err)
 	}
+	if session.State == "" {
+		session.State = SessionStateIdle
+	}
+	if session.StateChangedAt.IsZero() {
+		session.StateChangedAt = session.LastActiveAt
+	}
+	session.SanitizeMessageSequence()
 
 	return &session, nil
 }
@@ -144,6 +160,8 @@ type SessionInfo struct {
 	WorkingDir   string `json:"working_dir,omitempty"`
 	MessageCount int    `json:"message_count,omitempty"`
 	Summary      string `json:"summary,omitempty"`
+	State        string `json:"state,omitempty"`
+	LastSeq      int64  `json:"last_seq,omitempty"`
 }
 
 // ListSessionInfos lists session information
@@ -236,6 +254,13 @@ func (s *LocalSessionStorage) LoadSession(id string) (*Session, error) { //nolin
 	if err := json.Unmarshal(data, &session); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal session: %w", err)
 	}
+	if session.State == "" {
+		session.State = SessionStateIdle
+	}
+	if session.StateChangedAt.IsZero() {
+		session.StateChangedAt = session.LastActiveAt
+	}
+	session.SanitizeMessageSequence()
 	return &session, nil
 }
 

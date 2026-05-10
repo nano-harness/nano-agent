@@ -19,7 +19,8 @@ func TestBashOutputTool_Execute(t *testing.T) {
 
 	// Test basic output retrieval
 	params := map[string]interface{}{
-		"task_id": task.ID,
+		"task_id":    task.ID,
+		"session_id": "test-session",
 	}
 
 	result, err := tool.Execute(context.Background(), params)
@@ -41,6 +42,27 @@ func TestBashOutputTool_Execute(t *testing.T) {
 	}
 }
 
+func TestBashOutputTool_SessionIsolation(t *testing.T) {
+	tempDir := t.TempDir()
+	bgManager := NewBackgroundTaskManager(tempDir)
+	tool := NewBashOutputTool(bgManager)
+
+	taskA, _ := bgManager.Spawn(context.Background(), "session-a", "echo hello", "/tmp")
+	waitForCompletion(taskA.ID, bgManager, 500)
+
+	// Wrong session_id should be rejected.
+	result, err := tool.Execute(context.Background(), map[string]interface{}{
+		"task_id":    taskA.ID,
+		"session_id": "session-b",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("Expected failure for wrong session, got success")
+	}
+}
+
 func TestBashOutputTool_IncrementalRead(t *testing.T) {
 	tempDir := t.TempDir()
 	bgManager := NewBackgroundTaskManager(tempDir)
@@ -51,7 +73,8 @@ func TestBashOutputTool_IncrementalRead(t *testing.T) {
 	// First read - should get line1
 	waitForOutput(task.ID, bgManager, 200)
 	result1, _ := tool.Execute(context.Background(), map[string]interface{}{
-		"task_id": task.ID,
+		"task_id":    task.ID,
+		"session_id": "test-session",
 	})
 
 	var offset1 int64
@@ -68,6 +91,7 @@ func TestBashOutputTool_IncrementalRead(t *testing.T) {
 	waitForOutput(task.ID, bgManager, 400)
 	result2, _ := tool.Execute(context.Background(), map[string]interface{}{
 		"task_id":     task.ID,
+		"session_id":  "test-session",
 		"from_offset": float64(offset1),
 	})
 
@@ -97,8 +121,9 @@ func TestBashOutputTool_MaxLines(t *testing.T) {
 
 	// Read with max_lines
 	result, _ := tool.Execute(context.Background(), map[string]interface{}{
-		"task_id":   task.ID,
-		"max_lines": float64(10),
+		"task_id":    task.ID,
+		"session_id": "test-session",
+		"max_lines":  float64(10),
 	})
 
 	lines := result.Metadata["lines"].(int)
@@ -156,7 +181,8 @@ func TestKillBashTool_Execute(t *testing.T) {
 
 	// Kill the task
 	result, err := tool.Execute(context.Background(), map[string]interface{}{
-		"task_id": task.ID,
+		"task_id":    task.ID,
+		"session_id": "test-session",
 	})
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
@@ -172,6 +198,31 @@ func TestKillBashTool_Execute(t *testing.T) {
 	if status != BgStatusKilled {
 		t.Errorf("Expected status %s after kill, got %s", BgStatusKilled, status)
 	}
+}
+
+func TestKillBashTool_SessionIsolation(t *testing.T) {
+	tempDir := t.TempDir()
+	bgManager := NewBackgroundTaskManager(tempDir)
+	tool := NewKillBashTool(bgManager)
+
+	taskA, _ := bgManager.Spawn(context.Background(), "session-a", "sleep 5", "/tmp")
+
+	result, err := tool.Execute(context.Background(), map[string]interface{}{
+		"task_id":    taskA.ID,
+		"session_id": "session-b",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("Expected failure for wrong session, got success")
+	}
+
+	// Cleanup (correct session).
+	_, _ = tool.Execute(context.Background(), map[string]interface{}{
+		"task_id":    taskA.ID,
+		"session_id": "session-a",
+	})
 }
 
 func TestKillBashTool_MissingTaskID(t *testing.T) {

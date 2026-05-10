@@ -18,6 +18,16 @@ func (t *policySecurityTool) AnalyzeSecurity(context.Context, map[string]interfa
 	return t.action, t.reason, t.err
 }
 
+type policySecurityDecisionTool struct {
+	*testTool
+	decision *middleware.Decision
+	err      error
+}
+
+func (t *policySecurityDecisionTool) AnalyzeSecurityDecision(context.Context, map[string]interface{}) (*middleware.Decision, error) {
+	return t.decision, t.err
+}
+
 func TestToolPolicyPreflightRespectsAllowlist(t *testing.T) {
 	scheduler := NewToolSchedulerWithOptions(ToolSchedulerOptions{})
 	scheduler.SetAllowedTools([]string{"allowed_*"})
@@ -55,5 +65,25 @@ func TestToolPolicyPreflightCollectsApprovalAndSecurity(t *testing.T) {
 	}
 	if preflight.SecurityAnalysis.Decision == nil || preflight.SecurityAnalysis.Decision.Action != middleware.ActionConfirm {
 		t.Fatalf("unexpected security decision: %#v", preflight.SecurityAnalysis.Decision)
+	}
+}
+
+func TestToolPolicyPreflightPreservesFullSecurityDecision(t *testing.T) {
+	scheduler := NewToolSchedulerWithOptions(ToolSchedulerOptions{})
+	tool := &policySecurityDecisionTool{
+		testTool: &testTool{name: "run_shell_command"},
+		decision: &middleware.Decision{
+			Action:         middleware.ActionAllow,
+			Reason:         "rewritten by hook",
+			ModifiedParams: map[string]interface{}{"command": "git status"},
+		},
+	}
+
+	preflight := scheduler.policyEngine().PreflightTool(context.Background(), "run_shell_command", map[string]interface{}{"command": "custom"}, tool)
+	if !preflight.SecurityAnalysis.Supported || preflight.SecurityAnalysis.Decision == nil {
+		t.Fatalf("expected security analysis decision, got %#v", preflight.SecurityAnalysis)
+	}
+	if preflight.SecurityAnalysis.Decision.ModifiedParams["command"] != "git status" {
+		t.Fatalf("modified params were not preserved: %#v", preflight.SecurityAnalysis.Decision)
 	}
 }

@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -18,12 +20,12 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/runtime"
+	"github.com/nano-harness/nano-agent/pkg/slash"
 	"github.com/nano-harness/nano-agent/pkg/ui"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea/banner"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
 	"github.com/nano-harness/nano-agent/pkg/version"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fatih/color"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -116,11 +118,13 @@ func float64FromAny(v interface{}) float64 {
 	}
 }
 
-// rootCmd represents the base command when called without any subcommands
-var rootCmd = &cobra.Command{
-	Use:   "nano [prompt]",
-	Short: "A nano AI-powered code generation and modification agent",
-	Long: `nano is a lightweight AI agent designed for code generation,
+// NewRootCmd creates and returns a new root command.
+// This factory function allows for better testability by avoiding global state.
+func NewRootCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "nano [prompt]",
+		Short: "A nano AI-powered code generation and modification agent",
+		Long: `nano is a lightweight AI agent designed for code generation,
 modification, and development tasks. It provides intelligent assistance for developers
 with safety measures and validation.
 
@@ -128,62 +132,75 @@ Usage:
   nano "fix the bug in main.go"
   nano "add error handling to the function"
   nano  # Interactive mode`,
-	Run:  runAgent,
-	Args: cobra.ArbitraryArgs, // Allow arbitrary arguments
+		Run:  runAgent,
+		Args: cobra.ArbitraryArgs, // Allow arbitrary arguments
+	}
+
+	// Add subcommands
+	cmd.AddCommand(NewMemoryCommand())
+	cmd.AddCommand(NewDaemonCommand())
+	cmd.AddCommand(NewClientCommand())
+	cmd.AddCommand(NewMCPCommand())
+	cmd.AddCommand(NewConfigCommand())
+	cmd.AddCommand(NewCommandsCommand())
+	cmd.AddCommand(NewModelCommand())
+	cmd.AddCommand(NewModelsCommand())
+	cmd.AddCommand(NewThinkCommand())
+	cmd.AddCommand(NewEventsCommand())
+	cmd.AddCommand(NewAuditCommand())
+	cmd.AddCommand(NewDoctorCommand())
+	cmd.AddCommand(NewUpdateCommand())
+	cmd.AddCommand(NewRoutinesCommand())
+	cmd.AddCommand(NewSessionCommand())
+	cmd.AddCommand(NewCompletionCommand(cmd))
+	cmd.AddCommand(NewACPCommand())
+	// Swarm commands
+	cmd.AddCommand(NewChatCommand())
+	cmd.AddCommand(NewLeadChatCommand())
+	cmd.AddCommand(NewTeammateCommand())
+	cmd.AddCommand(NewBinaryCommand())
+
+	// Flags for mode selection
+	cmd.PersistentFlags().BoolP("version", "v", false, "version for nano")
+	cmd.Flags().BoolP("tui", "t", false, "force TUI mode even if daemon is running")
+	cmd.Flags().BoolP("daemon", "d", false, "force daemon client mode")
+	cmd.Flags().Int("timeout", daemon.DefaultTaskTimeoutSeconds, "command timeout in seconds for daemon mode")
+	cmd.Flags().String("session-id", "", "session id for daemon mode execution")
+	cmd.PersistentFlags().StringP("config", "c", "", "config file path (optional, overrides auto-discovery)")
+	cmd.PersistentFlags().String("ui", string(ui.ModeBubbleTea), "TUI backend: bubbletea or tview")
+
+	// Experimental: Bubble Tea non-alt-screen TUI
+	cmd.Flags().Bool("tea", false, "use experimental Bubble Tea TUI (non alt-screen)")
+	cmd.Flags().Bool("no-banner", false, "disable startup ASCII banner animation in TUI mode")
+
+	// TUI session management flags
+	cmd.Flags().Bool("continue", false, "resume the most recent session in the current project (TUI mode)")
+	cmd.Flags().String("session", "", "use a specific session id (TUI mode); creates if not exists")
+	cmd.Flags().String("team", "", "start TUI in team-lead mode with mailbox support (TUI mode)")
+
+	// SWE-bench compatibility flags
+	cmd.Flags().Bool("binary-mode", false, "Enable binary mode for SWE-bench evaluation")
+	cmd.Flags().String("output-dir", "", "Output directory for generated files (binary mode)")
+
+	// Permission mode flags
+	cmd.Flags().String("permission-mode", "", "permission mode: default, acceptEdits, yolo")
+	cmd.Flags().Bool("dangerously-skip-permissions", false, "skip all permission checks (equivalent to --permission-mode=yolo)")
+
+	return cmd
 }
+
+// rootCmd maintains backward compatibility for existing code that references the global variable.
+// New code should use NewRootCmd() instead.
+var rootCmd = NewRootCmd()
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
-func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
-		os.Exit(1)
-	}
+func Execute() error {
+	return NewRootCmd().Execute()
 }
 
 func init() {
 	cobra.OnInitialize(initConfig)
-
-	// Add subcommands
-	rootCmd.AddCommand(NewMemoryCommand())
-	rootCmd.AddCommand(NewDaemonCommand())
-	rootCmd.AddCommand(NewClientCommand())
-	rootCmd.AddCommand(NewMCPCommand())
-	rootCmd.AddCommand(NewConfigCommand())
-	rootCmd.AddCommand(NewCommandsCommand())
-	rootCmd.AddCommand(NewUpdateCommand())
-	rootCmd.AddCommand(NewRoutinesCommand())
-	rootCmd.AddCommand(NewSessionCommand())
-	// Swarm commands
-	rootCmd.AddCommand(NewChatCommand())
-	rootCmd.AddCommand(NewLeadChatCommand())
-	rootCmd.AddCommand(NewTeammateCommand())
-
-	// Flags for mode selection
-	rootCmd.PersistentFlags().BoolP("version", "v", false, "version for nano")
-	rootCmd.Flags().BoolP("tui", "t", false, "force TUI mode even if daemon is running")
-	rootCmd.Flags().BoolP("daemon", "d", false, "force daemon client mode")
-	rootCmd.Flags().Int("timeout", daemon.DefaultTaskTimeoutSeconds, "command timeout in seconds for daemon mode")
-	rootCmd.Flags().String("session-id", "", "session id for daemon mode execution")
-	rootCmd.PersistentFlags().StringP("config", "c", "", "config file path (optional, overrides auto-discovery)")
-	rootCmd.PersistentFlags().String("ui", string(ui.ModeBubbleTea), "TUI backend: bubbletea or tview")
-
-	// Experimental: Bubble Tea non-alt-screen TUI
-	rootCmd.Flags().Bool("tea", false, "use experimental Bubble Tea TUI (non alt-screen)")
-	rootCmd.Flags().Bool("no-banner", false, "disable startup ASCII banner animation in TUI mode")
-
-	// TUI session management flags
-	rootCmd.Flags().Bool("continue", false, "resume the most recent session in the current project (TUI mode)")
-	rootCmd.Flags().String("session", "", "use a specific session id (TUI mode); creates if not exists")
-	rootCmd.Flags().String("team", "", "start TUI in team-lead mode with mailbox support (TUI mode)")
-
-	// SWE-bench compatibility flags
-	rootCmd.Flags().Bool("binary-mode", false, "Enable binary mode for SWE-bench evaluation")
-	rootCmd.Flags().String("output-dir", "", "Output directory for generated files (binary mode)")
-
-	// Permission mode flags
-	rootCmd.Flags().String("permission-mode", "", "permission mode: default, acceptEdits, yolo")
-	rootCmd.Flags().Bool("dangerously-skip-permissions", false, "skip all permission checks (equivalent to --permission-mode=yolo)")
 }
 
 func getUIMode(cmd *cobra.Command) ui.Mode {
@@ -218,6 +235,9 @@ func initConfig() {
 	if _, err := config.LoadConfig(configFile); err != nil {
 		logger.Errorf("Error initializing config: %v", err)
 		_, _ = fmt.Fprintf(os.Stderr, "Error initializing config: %v\n", err)
+		// Note: os.Exit here is acceptable because initConfig is called via cobra.OnInitialize,
+		// which doesn't support error returns. Config initialization failure prevents all commands
+		// from functioning properly, so exiting here is the appropriate behavior.
 		os.Exit(1)
 	}
 }
@@ -387,7 +407,13 @@ func runAgent(cmd *cobra.Command, args []string) {
 	outputDir, _ := cmd.Flags().GetString("output-dir")
 
 	if binaryMode {
-		runBinaryMode(args, outputDir)
+		fmt.Fprintln(os.Stderr,
+			"⚠️  --binary-mode is deprecated; use `nano binary swebench [prompt...]` (or `nano binary query`) instead. "+
+				"This flag will be removed in a future release.")
+		if err := runBinaryMode(args, outputDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -403,7 +429,10 @@ func runAgent(cmd *cobra.Command, args []string) {
 	// Determine execution mode
 	if useDaemon || (!forceTUI && isDaemonRunning()) {
 		// Use daemon mode if explicitly requested or daemon is running
-		runDaemonClientMode(cmd, args)
+		if err := runDaemonClientMode(cmd, args); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -427,6 +456,16 @@ func runAgent(cmd *cobra.Command, args []string) {
 	} else if permMode != "" {
 		cfg.PermissionMode = permMode
 	}
+	if permission.PermissionMode(cfg.PermissionMode) == permission.ModeYOLO {
+		if cfg.Sandbox == nil {
+			cfg.Sandbox = &config.SandboxConfig{}
+		}
+		if cfg.Sandbox.Backend == "" {
+			cfg.Sandbox.Enabled = true
+			cfg.Sandbox.Backend = "docker"
+			logger.Infof("YOLO permission mode selected; defaulting sandbox backend to docker")
+		}
+	}
 
 	// CLI overrides removed - loop detection configuration is now handled entirely through config files
 
@@ -435,10 +474,16 @@ func runAgent(cmd *cobra.Command, args []string) {
 	logger.SetVerbose(cfg.Verbose)
 
 	if useTea {
-		runBubbleTeaMode(cmd, args)
+		if err := runBubbleTeaMode(cmd, args); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	} else {
 		// Use classic tview-based TUI (default or forced)
-		runTUIMode(cmd, args)
+		if err := runTUIMode(cmd, args); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -450,7 +495,7 @@ func isDaemonRunning() bool {
 }
 
 // runDaemonClientMode executes commands via daemon client
-func runDaemonClientMode(cmd *cobra.Command, args []string) {
+func runDaemonClientMode(cmd *cobra.Command, args []string) error {
 	// Default timeout if cmd is nil or flag is not set
 	timeout := daemon.DefaultTaskTimeoutSeconds
 	sessionID := ""
@@ -466,7 +511,7 @@ func runDaemonClientMode(cmd *cobra.Command, args []string) {
 	if len(args) == 0 {
 		color.Yellow("🔗 Daemon is running. Use 'nano client exec \"your command\"' for interactive execution.")
 		color.Blue("💡 Or use 'nano --tui' to force TUI mode.")
-		return
+		return nil
 	}
 
 	// Join all args as a single command
@@ -481,7 +526,7 @@ func runDaemonClientMode(cmd *cobra.Command, args []string) {
 	if err != nil {
 		color.Red("❌ Failed to execute command via daemon: %v", err)
 		color.Yellow("💡 Try 'nano --tui \"%s\"' to run in TUI mode instead.", command)
-		os.Exit(1)
+		return fmt.Errorf("failed to execute command via daemon: %w", err)
 	}
 
 	if response.Success {
@@ -497,8 +542,9 @@ func runDaemonClientMode(cmd *cobra.Command, args []string) {
 		fmt.Println()
 	} else {
 		color.Red("❌ Command failed: %s", response.Error)
-		os.Exit(1)
+		return fmt.Errorf("command failed: %s", response.Error)
 	}
+	return nil
 }
 
 // resolveTUISessionID determines which session ID to use in TUI mode based on flags:
@@ -525,16 +571,16 @@ func resolveTUISessionID(cmd *cobra.Command, ag *agent.Agent) string {
 }
 
 // runTUIMode starts the TUI dashboard mode
-func runTUIMode(cmd *cobra.Command, args []string) {
+func runTUIMode(cmd *cobra.Command, args []string) error {
 	// Acquire TUI mode lock to prevent simultaneous TUI/Daemon execution
 	lock, lockErr := runtime.NewLockFile(runtime.ModeTUI)
 	if lockErr != nil {
 		color.Red("❌ Failed to create TUI lock: %v", lockErr)
-		os.Exit(1)
+		return fmt.Errorf("failed to create TUI lock: %w", lockErr)
 	}
 	if lockErr = lock.Acquire(); lockErr != nil {
 		color.Red("❌ %v", lockErr)
-		os.Exit(1)
+		return fmt.Errorf("failed to acquire TUI lock: %w", lockErr)
 	}
 	defer func() {
 		if lockErr := lock.Release(); lockErr != nil {
@@ -551,13 +597,12 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 		if len(args) > 0 {
 			// This is a fallback and we don't have access to the original cobra command here.
 			// We pass 'nil' and the runDaemonClientMode should handle it gracefully.
-			runDaemonClientMode(nil, args)
-			return
+			return runDaemonClientMode(nil, args)
 		}
 
 		// Otherwise suggest daemon mode
 		color.Yellow("🔗 Consider using daemon mode: 'nano daemon start' then 'nano client exec \"your command\"'")
-		os.Exit(1)
+		return fmt.Errorf("TTY environment not supported for TUI mode")
 	}
 
 	// Enable TUI mode in logger FIRST to prevent any startup logs from appearing in TUI
@@ -647,7 +692,7 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("error initializing engine: %w", err)
 	}
 	agentInstance = eng.Agent
 	defer func() {
@@ -666,6 +711,12 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 	// Wrap the engine's shared scheduler as a TUIScheduler
 	tuiScheduler := agent.NewTUISchedulerFromScheduler(eng.Scheduler, eng.StateStore)
 	agentInstance.SetTUIScheduler(tuiScheduler)
+
+	cronTracker := ui.NewCronStatusTracker()
+	integration.SetCronTracker(cronTracker)
+	integration.SetRoutinesLister(tuiScheduler.FormatTasks)
+	integration.SetRunningStatusLister(cronTracker.FormatDetails)
+	eng.SetCronNotifier(cronTracker.Handle)
 
 	// Start scheduler + watcher through the engine
 	if startErr := eng.Start(); startErr != nil {
@@ -883,23 +934,24 @@ func runTUIMode(cmd *cobra.Command, args []string) {
 	if err != nil {
 		color.Red("TUI Error: %v", err)
 		logger.Errorf("TUI failed with error: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("TUI failed: %w", err)
 	}
 
 	color.Green("👋 TUI session ended")
+	return nil
 }
 
 // runBubbleTeaMode starts the Bubble Tea TUI in non-alt-screen mode
-func runBubbleTeaMode(cmd *cobra.Command, args []string) {
+func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	// Acquire TUI mode lock to prevent simultaneous TUI/Daemon execution
 	lock, lockErr := runtime.NewLockFile(runtime.ModeTUI)
 	if lockErr != nil {
 		color.Red("❌ Failed to create TUI lock: %v", lockErr)
-		os.Exit(1)
+		return fmt.Errorf("failed to create TUI lock: %w", lockErr)
 	}
 	if lockErr = lock.Acquire(); lockErr != nil {
 		color.Red("❌ %v", lockErr)
-		os.Exit(1)
+		return fmt.Errorf("failed to acquire TUI lock: %w", lockErr)
 	}
 	defer func() {
 		if lockErr := lock.Release(); lockErr != nil {
@@ -911,12 +963,11 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 	if !isatty.IsTerminal(os.Stdout.Fd()) {
 		color.Yellow("⚠️  TTY environment not supported for Bubble Tea TUI")
 		if len(args) > 0 {
-			runDaemonClientMode(nil, args)
-			return
+			return runDaemonClientMode(nil, args)
 		}
 		// Escape inner quotes to avoid syntax issues
 		color.Yellow("🔗 Consider using daemon mode: 'nano daemon start' then 'nano client exec \"your command\"'")
-		os.Exit(1)
+		return fmt.Errorf("TTY environment not supported for Bubble Tea TUI")
 	}
 
 	// Enable TUI mode in logger FIRST to avoid any startup logs appearing in TUI
@@ -927,7 +978,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 	cfg := config.Get()
 	if cfg == nil {
 		logger.Error("configuration not initialized")
-		return
+		return fmt.Errorf("configuration not initialized")
 	}
 
 	// Start local-only pprof server for Bubble Tea mode using top-level config only
@@ -1048,7 +1099,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("error initializing engine: %w", err)
 	}
 	agentInstance = eng.Agent
 	defer func() {
@@ -1068,6 +1119,55 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 	// /schedule slash commands keep working in BubbleTea mode.
 	btScheduler := agent.NewTUISchedulerFromScheduler(eng.Scheduler, eng.StateStore)
 	agentInstance.SetTUIScheduler(btScheduler)
+
+	eventStore := daemon.NewTaskEventStore(5000)
+	cronTracker := ui.NewCronStatusTracker()
+	cronTracker.SetOnChange(func() {
+		p.Send(bubbletea.CronStatusMsg{Indicator: cronTracker.FormatIndicator()})
+	})
+	m.SetModelLister(slash.BuildModelLister(cfg))
+	m.SetModelStatusGetter(slash.BuildModelStatusGetter(cfg))
+	m.SetModelSwitcher(slash.BuildModelSwitcher(filepath.Join(cwd, ".nano.yaml")))
+	m.SetModelFallbackHandler(slash.BuildModelFallbackHandler(cfg))
+	m.SetModelDoctor(slash.BuildModelDoctor(cfg))
+	m.SetContextStatusGetter(slash.BuildContextStatusGetter(agentInstance))
+	m.SetDoctorReporter(slash.BuildDoctorReporter(cfg))
+	m.SetEventsQuerier(slash.BuildEventsQuerier(eventStore))
+	m.SetAuditQuerier(slash.BuildAuditQuerier(eventStore))
+	if sm := agentInstance.GetSkillManager(); sm != nil {
+		m.SetSkillLister(sm.ListSkillNames)
+	}
+	m.SetRoutinesLister(btScheduler.FormatTasks)
+	m.SetRunningStatusLister(cronTracker.FormatDetails)
+	m.SetRoutinesAdder(func(description string) string {
+		id, err := btScheduler.AddRoutineFromDescription(description)
+		if err != nil {
+			return fmt.Sprintf("❌ 添加 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已添加 routine %s", id)
+	})
+	m.SetRoutinesRemover(func(taskID string) string {
+		if err := btScheduler.RemoveTask(strings.TrimSpace(taskID)); err != nil {
+			return fmt.Sprintf("❌ 删除 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已删除 routine %s", strings.TrimSpace(taskID))
+	})
+	m.SetRoutinesPauser(func(taskID string) string {
+		if err := btScheduler.PauseTask(strings.TrimSpace(taskID)); err != nil {
+			return fmt.Sprintf("❌ 暂停 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已暂停 routine %s", strings.TrimSpace(taskID))
+	})
+	m.SetRoutinesResumer(func(taskID string) string {
+		if err := btScheduler.ResumeTask(strings.TrimSpace(taskID)); err != nil {
+			return fmt.Sprintf("❌ 恢复 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已恢复 routine %s", strings.TrimSpace(taskID))
+	})
+	eng.SetCronNotifier(func(ev event.StreamEvent) {
+		eventStore.Add(ev)
+		cronTracker.Handle(ev)
+	})
 
 	// Start scheduler + watcher through the engine.
 	if startErr := eng.Start(); startErr != nil {
@@ -1116,11 +1216,14 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 				ctx, cancelFn = context.WithCancel(ctx)
 				go func(in string) {
 					_ = agentInstance.ProcessStream(ctx, in, func(se event.StreamEvent) {
+						eventStore.Add(se)
 						// Forward each event into Bubble Tea synchronously to preserve
 						// ordering. This is safe because we are NOT inside Update()
 						// (the deadlock is prevented by building async tea.Cmd for
 						// confirmation callbacks instead).
 						switch se.Type {
+						case event.EventTypeCronTaskStarted, event.EventTypeCronTaskFinished, event.EventTypeCronTaskProgress:
+							return
 						case event.EventTypeStreamContent:
 							p.Send(bubbletea.Message{Role: "assistant_stream", Content: se.Content})
 						case event.EventTypeContent:
@@ -1156,13 +1259,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 							p.Send(bubbletea.Message{Role: "tool", Content: content})
 						case event.EventTypeTokenStats:
 							if se.TokenStats != nil {
-								stats := bubbletea.TokenStatsUpdate{
-									InputTokens:  se.TokenStats.InputTokens,
-									OutputTokens: se.TokenStats.OutputTokens,
-									TotalTokens:  se.TokenStats.TotalTokens,
-									Peak:         se.TokenStats.PeakTokensPerSecond,
-								}
-								p.Send(stats)
+								p.Send(buildTokenStatsUpdate(se.TokenStats))
 							}
 						case event.EventTypeDone:
 							p.Send(bubbletea.StatusUpdate("完成"))
@@ -1197,8 +1294,23 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) {
 	// Run program (blocks)
 	if _, err := p.Run(); err != nil {
 		color.Red("Bubble Tea TUI error: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("Bubble Tea TUI error: %w", err)
 	}
 
 	color.Green("👋 Bubble Tea TUI session ended")
+	return nil
+}
+
+func buildTokenStatsUpdate(stats *event.TokenStats) bubbletea.TokenStatsUpdate {
+	if stats == nil {
+		return bubbletea.TokenStatsUpdate{}
+	}
+	return bubbletea.TokenStatsUpdate{
+		InputTokens:       stats.InputTokens,
+		OutputTokens:      stats.OutputTokens,
+		TotalTokens:       stats.TotalTokens,
+		Peak:              stats.PeakTokensPerSecond,
+		ContextWindowMax:  stats.ContextWindowMax,
+		ContextUsedTokens: stats.ContextUsedTokens,
+	}
 }

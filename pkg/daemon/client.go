@@ -31,6 +31,25 @@ type Client struct {
 	userAgent string
 }
 
+// EventQuery filters daemon event/audit queries.
+type EventQuery struct {
+	SessionID string
+	RunID     string
+	Type      string
+	Sandbox   bool
+	SinceSeq  int64
+	Limit     int
+}
+
+// EventQueryResponse is returned by /api/v1/events and /api/v1/audit.
+type EventQueryResponse struct {
+	Events    []event.StreamEvent `json:"events"`
+	Count     int                 `json:"count"`
+	SinceSeq  int64               `json:"since_seq"`
+	Limit     int                 `json:"limit"`
+	AuditOnly bool                `json:"audit_only"`
+}
+
 // NewClient creates a new daemon client
 func NewClient(host string, port int, apiKey string) *Client {
 	baseURL := fmt.Sprintf("http://%s:%d/api/v1", normalizeClientHost(host), port)
@@ -568,6 +587,44 @@ func (c *Client) Health() (*HealthResponse, error) {
 func (c *Client) Status() (*StatusResponse, error) {
 	var response StatusResponse
 	err := c.doRequest("GET", "/status", nil, &response)
+	return &response, err
+}
+
+// QueryEvents queries stored daemon events.
+func (c *Client) QueryEvents(query EventQuery) (*EventQueryResponse, error) {
+	return c.queryEventEndpoint("/events", query)
+}
+
+// QueryAudit queries stored daemon audit events.
+func (c *Client) QueryAudit(query EventQuery) (*EventQueryResponse, error) {
+	return c.queryEventEndpoint("/audit", query)
+}
+
+func (c *Client) queryEventEndpoint(path string, query EventQuery) (*EventQueryResponse, error) {
+	values := url.Values{}
+	if query.SessionID != "" {
+		values.Set("session_id", query.SessionID)
+	}
+	if query.RunID != "" {
+		values.Set("run_id", query.RunID)
+	}
+	if query.Type != "" {
+		values.Set("type", query.Type)
+	}
+	if query.Sandbox {
+		values.Set("sandbox", "true")
+	}
+	if query.SinceSeq > 0 {
+		values.Set("since_seq", fmt.Sprintf("%d", query.SinceSeq))
+	}
+	if query.Limit > 0 {
+		values.Set("limit", fmt.Sprintf("%d", query.Limit))
+	}
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var response EventQueryResponse
+	err := c.doRequest("GET", path, nil, &response)
 	return &response, err
 }
 

@@ -3,7 +3,7 @@ package banner
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // RenderFrame renders a frame as a multi-line colored string ready for println.

@@ -3,8 +3,11 @@ package agent
 import (
 	"testing"
 
+	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/skill"
 )
+
+var _ interfaces.ToolGate = (*ProgressiveDisclosure)(nil)
 
 type mockTool struct {
 	name     string

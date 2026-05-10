@@ -57,19 +57,24 @@ type CircuitBreakerConfig struct {
 	BackoffFactor float64
 	// JitterFactor adds randomness to prevent thundering herd (0.0 to 1.0)
 	JitterFactor float64
+	// ExcludeNonFailback skips CB failure counts for non-failback errors.
+	ExcludeNonFailback           bool
+	excludeNonFailbackConfigured bool
 }
 
 // DefaultCircuitBreakerConfig returns sensible defaults
 func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
 	return CircuitBreakerConfig{
-		MaxRetries:       3,
-		FailureThreshold: 5,
-		SuccessThreshold: 2,
-		OpenTimeout:      60 * time.Second,
-		BaseDelay:        2 * time.Second,
-		MaxDelay:         60 * time.Second,
-		BackoffFactor:    2.0,
-		JitterFactor:     0.2,
+		MaxRetries:                   3,
+		FailureThreshold:             5,
+		SuccessThreshold:             2,
+		OpenTimeout:                  60 * time.Second,
+		BaseDelay:                    2 * time.Second,
+		MaxDelay:                     60 * time.Second,
+		BackoffFactor:                2.0,
+		JitterFactor:                 0.2,
+		ExcludeNonFailback:           true,
+		excludeNonFailbackConfigured: true,
 	}
 }
 
@@ -91,6 +96,9 @@ type CircuitBreaker struct {
 
 // NewCircuitBreaker creates a new circuit breaker with the given config
 func NewCircuitBreaker(cfg CircuitBreakerConfig) *CircuitBreaker {
+	if !cfg.excludeNonFailbackConfigured {
+		cfg.ExcludeNonFailback = true
+	}
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
 	}
@@ -274,6 +282,18 @@ func (cb *CircuitBreaker) CalculateRetryDelay(attempt int, httpStatus int) time.
 	return delay
 }
 
+// ShouldRecordCBFailure returns whether an error should count toward
+// the circuit breaker's failure threshold. Auth/quota/context-overflow/
+// aborted/output-format errors must NOT pollute CB health metrics.
+func ShouldRecordCBFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	httpStatus := ExtractHTTPStatus(err)
+	info := NewAPIErrorHandler(nil).AnalyzeError(err, httpStatus)
+	return info != nil && info.ShouldFailback
+}
+
 // IsRetryableError checks if an error from an LLM API call should be retried.
 // It returns true for rate-limit (429), server errors (500, 502, 503, 504),
 // and transient network/timeout errors.
@@ -284,7 +304,20 @@ func IsRetryableError(err error) bool {
 
 	errMsg := strings.ToLower(err.Error())
 
-	// Never retry authentication/authorization/quota errors
+	// Prefer structured classification when it identifies a concrete category.
+	if httpStatus := ExtractHTTPStatus(err); httpStatus > 0 {
+		info := NewAPIErrorHandler(nil).AnalyzeError(err, httpStatus)
+		if info != nil && info.Category != APIErrorCategoryUnknown {
+			return info.Retryable
+		}
+	} else {
+		info := NewAPIErrorHandler(nil).AnalyzeError(err, 0)
+		if info != nil && info.Category != APIErrorCategoryUnknown {
+			return info.Retryable
+		}
+	}
+
+	// Never retry authentication/authorization/quota/semantic errors
 	nonRetryable := []string{
 		"unauthorized",
 		"invalid api key",
@@ -294,8 +327,12 @@ func IsRetryableError(err error) bool {
 		"billing",
 		"permission denied",
 		"context canceled",
+		"request aborted",
 		"model not found",
 		"invalid model",
+	}
+	if isContextOverflowError(errMsg) || isOutputFormatError(errMsg) {
+		return false
 	}
 	for _, s := range nonRetryable {
 		if strings.Contains(errMsg, s) {

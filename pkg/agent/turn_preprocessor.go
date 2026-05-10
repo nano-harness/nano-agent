@@ -37,6 +37,7 @@ func (t *Turn) preprocessInput(ctx context.Context, cfg *config.Config) {
 				MaxArtifactSize: cfg.OpenSpec.MaxArtifactSize,
 			}
 		}),
+		preprocessor.AgentMentionStep(),
 		t.skillPreprocessorStep(ctx, cfg),
 		preprocessor.RoutinesStep(),
 	)
@@ -160,6 +161,7 @@ func (t *Turn) preprocessSkillCommand(ctx context.Context, cfg *config.Config) {
 		// If skills were activated, rebuild system prompt
 		if activated {
 			t.systemPrompt = "" // Force rebuild on next access
+			t.SystemPromptBuilder.InvalidatePromptCache()
 		}
 	}
 }
@@ -190,6 +192,7 @@ func (t *Turn) handleSkillSlashCommand(ctx context.Context, sm *skill.Manager, i
 		logger.Infof("Manually activated skill %q", arg)
 		s := sm.GetByName(arg)
 		t.systemPrompt = "" // Force rebuild
+		t.SystemPromptBuilder.InvalidatePromptCache()
 		t.UserInput = fmt.Sprintf("The user activated skill '%s'. Acknowledge that the skill is now active and briefly describe what it does: %s", arg, s.Description)
 
 	case "off":
@@ -200,6 +203,7 @@ func (t *Turn) handleSkillSlashCommand(ctx context.Context, sm *skill.Manager, i
 		sm.DeactivateSkill(arg) //nolint:errcheck // non-fatal: skill is deactivated in-memory even if persist fails
 		logger.Infof("Deactivated skill %q", arg)
 		t.systemPrompt = "" // Force rebuild
+		t.SystemPromptBuilder.InvalidatePromptCache()
 		t.UserInput = fmt.Sprintf("The user deactivated skill '%s'. Acknowledge that the skill has been deactivated.", arg)
 
 	case "info":
@@ -231,6 +235,7 @@ func (t *Turn) handleSkillSlashCommand(ctx context.Context, sm *skill.Manager, i
 		}
 		logger.Infof("Installed skill %q from %s", installed.Name, arg)
 		t.systemPrompt = "" // Force rebuild
+		t.SystemPromptBuilder.InvalidatePromptCache()
 		t.UserInput = fmt.Sprintf("The user installed skill '%s' from %s. The skill is now available. Briefly describe what it does: %s\n\nAvailable commands: /skill:use %s (to activate), /skill:info %s (for details)",
 			installed.Name, arg, installed.Description, installed.Name, installed.Name)
 

@@ -69,3 +69,43 @@ func (s *CircuitBreakerSuite) TestCircuitBreaker_OpensAfterFailures() {
 	}
 	require.True(s.T(), foundErrorEvent, "expected at least one error event mentioning circuit breaker")
 }
+
+func (s *CircuitBreakerSuite) TestCircuitBreaker_ContextOverflowDoesNotOpen() {
+	s.MockServer.SetDefaultResponse(MockResponse{
+		Error:     400,
+		ErrorBody: `{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}`,
+	})
+
+	llmClient := s.Agent.GetLLMClient()
+	client, ok := llmClient.(*llm.Client)
+	require.True(s.T(), ok, "expected underlying LLM client to be *llm.Client")
+
+	messages := []llm.Message{{Role: "user", Content: "trigger context overflow"}}
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		err := client.StreamCompletion(ctx, messages, func(event.StreamEvent) {})
+		require.Error(s.T(), err)
+		require.NotContains(s.T(), err.Error(), "circuit breaker is open")
+	}
+}
+
+func (s *CircuitBreakerSuite) TestCircuitBreaker_AuthErrorDoesNotOpen() {
+	s.MockServer.SetDefaultResponse(MockResponse{
+		Error:     401,
+		ErrorBody: `{"error":{"message":"invalid api key"}}`,
+	})
+
+	llmClient := s.Agent.GetLLMClient()
+	client, ok := llmClient.(*llm.Client)
+	require.True(s.T(), ok, "expected underlying LLM client to be *llm.Client")
+
+	messages := []llm.Message{{Role: "user", Content: "trigger auth error"}}
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		err := client.StreamCompletion(ctx, messages, func(event.StreamEvent) {})
+		require.Error(s.T(), err)
+		require.NotContains(s.T(), err.Error(), "circuit breaker is open")
+	}
+}

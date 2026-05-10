@@ -3,9 +3,9 @@ package ui
 import (
 	"fmt"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 // Config holds common configuration shared by all UI backends.
@@ -44,7 +44,7 @@ func (f *Factory) Create(mode Mode) (Adapter, error) {
 func (f *Factory) newBubbleTeaAdapter() *BubbleTeaAdapter {
 	return &BubbleTeaAdapter{
 		model:      bubbletea.New(nil, nil, f.cfg.APIBaseURL, f.cfg.WorkingDir),
-		sendCh:     make(chan tea.Msg, 256),
+		sendCh:     make(chan tea.Msg, 1024),
 		showBanner: f.cfg.ShowBanner,
 	}
 }

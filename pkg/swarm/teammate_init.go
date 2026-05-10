@@ -3,6 +3,9 @@ package swarm
 import (
 	"context"
 	"fmt"
+	"strings"
+
+	"github.com/nano-harness/nano-agent/pkg/config"
 )
 
 // InitializeTeammate performs initialization for a teammate agent
@@ -11,17 +14,42 @@ func InitializeTeammate(ctx context.Context, identity *TeammateIdentity) error {
 	if identity == nil {
 		return fmt.Errorf("identity cannot be nil")
 	}
+	_ = ctx
 
-	// TODO: Read team configuration
-	// TODO: Apply permission settings based on team config and identity.Mode
-	// TODO: Set up any teammate-specific constraints
-
-	// For now, just validate the identity
+	// Validate required identity fields.
 	if identity.TeamName == "" {
 		return fmt.Errorf("team name is required")
 	}
 	if identity.AgentName == "" {
 		return fmt.Errorf("agent name is required")
+	}
+	if identity.AgentID == "" {
+		identity.AgentID = identity.AgentName + "@" + identity.TeamName
+	}
+
+	// Apply teammate-specific constraints from the active config layer.
+	// Per-teammate overrides (allowed tools/model/context providers/permission mode)
+	// should already be present on identity (filled by SpawnOptions / agent profiles).
+	cfg := config.Get()
+	if cfg == nil {
+		return nil
+	}
+
+	// Normalize legacy modes to stable values.
+	if identity.PermissionMode != "" {
+		switch strings.ToLower(strings.TrimSpace(identity.PermissionMode)) {
+		case "auto":
+			identity.PermissionMode = "yolo"
+		case "ask":
+			identity.PermissionMode = "default"
+		}
+	}
+
+	// If the mailbox subsystem is disabled, don't apply teammate-specific tool restrictions.
+	// Teammates may still run, but tool allowlists are most meaningful when
+	// team coordination is enabled.
+	if cfg.Mailbox == nil || !cfg.Mailbox.Enabled {
+		identity.AllowedTools = nil
 	}
 
 	return nil

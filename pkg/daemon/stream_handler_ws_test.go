@@ -397,6 +397,108 @@ func TestTeamLeadSessionStreamHandler_ToolApprovalFrame(t *testing.T) {
 	assert.True(t, gotApproved)
 }
 
+func TestTeamLeadSessionStreamHandler_ApproveRejectAliases(t *testing.T) {
+	var approvals []bool
+	session := &TeamLeadSession{
+		ID:          "lead-alpha-chat",
+		TeamName:    "alpha",
+		Store:       NewTaskEventStore(100),
+		Broadcaster: NewEventBroadcaster(),
+		activeTasks: make(map[string]*ActiveTask),
+		approveFunc: func(callID string, approved bool) error {
+			assert.Equal(t, "call-1", callID)
+			approvals = append(approvals, approved)
+			return nil
+		},
+	}
+	server := NewServer(nil, &config.DaemonConfig{
+		Port:       0,
+		Host:       "127.0.0.1",
+		EnableCORS: true,
+		APIKey:     "",
+	})
+	server.teamLeadRegistry = &TeamLeadRegistry{
+		sessions: map[string]*TeamLeadSession{session.ID: session},
+	}
+
+	r := mux.NewRouter()
+	r.HandleFunc("/api/v1/teams/sessions/{id}/stream", server.teamLeadSessionStreamHandler).Methods("GET")
+	ts := httptest.NewServer(r)
+	t.Cleanup(ts.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/teams/sessions/lead-alpha-chat/stream"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	for _, frameType := range []string{"approve", "reject"} {
+		assert.NoError(t, conn.WriteJSON(map[string]interface{}{
+			"type":    frameType,
+			"call_id": "call-1",
+		}))
+		_, msg, err := conn.ReadMessage()
+		assert.NoError(t, err)
+		var ack map[string]interface{}
+		assert.NoError(t, json.Unmarshal(msg, &ack))
+		assert.Equal(t, "tool_approval_ack", ack["type"])
+	}
+	assert.Equal(t, []bool{true, false}, approvals)
+}
+
+func TestTeamLeadSessionStreamHandler_ReplayFrame(t *testing.T) {
+	session := &TeamLeadSession{
+		ID:          "lead-alpha-chat",
+		TeamName:    "alpha",
+		Store:       NewTaskEventStore(100),
+		Broadcaster: NewEventBroadcaster(),
+		activeTasks: make(map[string]*ActiveTask),
+	}
+	session.enrichAndRecordEvent(event.StreamEvent{Type: event.EventTypeContent, Content: "one"})
+	session.enrichAndRecordEvent(event.StreamEvent{Type: event.EventTypeContent, Content: "two"})
+	server := NewServer(nil, &config.DaemonConfig{
+		Port:       0,
+		Host:       "127.0.0.1",
+		EnableCORS: true,
+		APIKey:     "",
+	})
+	server.teamLeadRegistry = &TeamLeadRegistry{
+		sessions: map[string]*TeamLeadSession{session.ID: session},
+	}
+
+	r := mux.NewRouter()
+	r.HandleFunc("/api/v1/teams/sessions/{id}/stream", server.teamLeadSessionStreamHandler).Methods("GET")
+	ts := httptest.NewServer(r)
+	t.Cleanup(ts.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/teams/sessions/lead-alpha-chat/stream"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	assert.NoError(t, conn.WriteJSON(map[string]interface{}{
+		"type":      "replay",
+		"since_seq": 1,
+	}))
+	_, msg1, err := conn.ReadMessage()
+	assert.NoError(t, err)
+	var replayed map[string]interface{}
+	assert.NoError(t, json.Unmarshal(msg1, &replayed))
+	assert.Equal(t, "content", replayed["type"])
+	assert.Equal(t, "two", replayed["content"])
+
+	_, msg2, err := conn.ReadMessage()
+	assert.NoError(t, err)
+	var done map[string]interface{}
+	assert.NoError(t, json.Unmarshal(msg2, &done))
+	assert.Equal(t, "replay_complete", done["type"])
+	assert.Equal(t, float64(2), done["last_seq"])
+	assert.Equal(t, float64(1), done["count"])
+}
+
 func TestClientSubscribeSessionWithResumeSendsToolApproval(t *testing.T) {
 	var gotSubscribe map[string]interface{}
 	var gotApproval map[string]interface{}

@@ -20,10 +20,9 @@ import (
 )
 
 // runBinaryMode executes the agent in binary mode for SWE-bench evaluation
-func runBinaryMode(args []string, outputDir string) {
+func runBinaryMode(args []string, outputDir string) error {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintf(os.Stderr, "Error: prompt required in binary mode\n")
-		os.Exit(1)
+		return fmt.Errorf("prompt required in binary mode")
 	}
 
 	prompt := strings.Join(args, " ")
@@ -31,16 +30,14 @@ func runBinaryMode(args []string, outputDir string) {
 	// Create output directory if specified
 	if outputDir != "" {
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "Error creating output directory: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("error creating output directory: %w", err)
 		}
 	}
 
 	// Get current working directory as project path
 	projectPath, err := os.Getwd()
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error getting current directory: %w", err)
 	}
 
 	// Execute agent in binary mode
@@ -79,8 +76,7 @@ func runBinaryMode(args []string, outputDir string) {
 
 	result, trajectory, err := executeBinaryMode(prompt, projectPath, outputDir)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error executing agent: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error executing agent: %w", err)
 	}
 
 	// Generate patch using PatchGenerator
@@ -88,16 +84,14 @@ func runBinaryMode(args []string, outputDir string) {
 	patchGen := patch.NewGenerator(projectPath, baseCommit)
 	patchContent, err := patchGen.GenerateGitDiff()
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error generating patch: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error generating patch: %w", err)
 	}
 
 	// Save patch file or output to stdout
 	if outputDir != "" {
 		patchPath := filepath.Join(outputDir, "solution.patch")
 		if err := patchGen.SavePatch(patchContent, patchPath); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "Error writing patch file: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("error writing patch file: %w", err)
 		}
 		logger.Infof("Patch saved to: %s", patchPath)
 
@@ -106,15 +100,13 @@ func runBinaryMode(args []string, outputDir string) {
 			trajPath := filepath.Join(outputDir, "trajectory.json")
 			f, err := os.Create(trajPath)
 			if err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "Error creating trajectory file: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("error creating trajectory file: %w", err)
 			}
 			defer func() { _ = f.Close() }()
 			enc := json.NewEncoder(f)
 			enc.SetIndent("", "  ")
 			if err := enc.Encode(trajectory); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "Error writing trajectory file: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("error writing trajectory file: %w", err)
 			}
 			logger.Infof("Trajectory saved to: %s", trajPath)
 		}
@@ -126,6 +118,19 @@ func runBinaryMode(args []string, outputDir string) {
 	if result != "" {
 		_, _ = fmt.Fprintf(os.Stderr, "Agent execution completed\n")
 	}
+
+	return nil
+}
+
+func saveTrajectory(trajectory []trajectoryEvent, path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(trajectory)
 }
 
 // trajectoryEvent captures a simplified event for trajectory logging

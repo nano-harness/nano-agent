@@ -19,8 +19,11 @@ const (
 	CategoryPermission Category = "permission"
 	CategorySkill      Category = "skill"
 	CategoryAgent      Category = "agent"
+	CategoryModel      Category = "model"
+	CategoryObserve    Category = "observe"
 	CategoryRoutines   Category = "routines"
 	CategoryOpenSpec   Category = "openspec"
+	CategoryCheckpoint Category = "checkpoint"
 	CategoryCustom     Category = "custom"
 )
 
@@ -29,8 +32,11 @@ var categoryOrder = []Category{
 	CategoryPermission,
 	CategorySkill,
 	CategoryAgent,
+	CategoryModel,
+	CategoryObserve,
 	CategoryRoutines,
 	CategoryOpenSpec,
+	CategoryCheckpoint,
 	CategoryCustom,
 }
 
@@ -48,7 +54,14 @@ type Command struct {
 	// Namespace is the sub-directory namespace for custom commands.
 	Namespace string `json:"namespace,omitempty"`
 	// AllowedTools lists tool restrictions for custom commands.
-	AllowedTools []string `json:"allowedTools,omitempty"`
+	AllowedTools      []string `json:"allowedTools,omitempty"`
+	PermissionProfile string   `json:"permissionProfile,omitempty"`
+	// Prelude lists leading shell commands (declared as !cmd lines) that should
+	// run through CommandRuntime before the slash command body is submitted.
+	Prelude               []string `json:"prelude,omitempty"`
+	PreludeTimeoutSeconds int      `json:"preludeTimeoutSeconds,omitempty"`
+	PreludeOnError        string   `json:"preludeOnError,omitempty"`
+	PreludeOutput         string   `json:"preludeOutput,omitempty"`
 }
 
 // builtinCommands lists every hard-coded slash command.
@@ -93,6 +106,13 @@ var builtinCommands = []Command{
 		Name:        "think",
 		Description: "切换思考模式（开启/关闭/查看状态）",
 		Usage:       "/think [on|off|status]",
+		Category:    CategoryPermission,
+		Source:      "built-in",
+	},
+	{
+		Name:        "plan",
+		Description: "切换到Plan模式（只读模式，用于安全代码分析）",
+		Usage:       "/plan",
 		Category:    CategoryPermission,
 		Source:      "built-in",
 	},
@@ -192,6 +212,78 @@ var builtinCommands = []Command{
 		Source:      "built-in",
 	},
 
+	// ── model ────────────────────────────────────────────────────────────────
+	{
+		Name:        "models",
+		Description: "列出已知 Provider/Model 能力预设",
+		Usage:       "/models",
+		Category:    CategoryModel,
+		Source:      "built-in",
+	},
+	{
+		Name:        "model list",
+		Description: "列出已知 Provider/Model 能力预设",
+		Usage:       "/model list",
+		Category:    CategoryModel,
+		Source:      "built-in",
+	},
+	{
+		Name:        "model use",
+		Description: "切换当前会话或配置中的主模型",
+		Usage:       "/model use <model>",
+		Category:    CategoryModel,
+		Source:      "built-in",
+	},
+	{
+		Name:        "model status",
+		Description: "查看当前模型、provider、thinking 和 fallback 状态",
+		Usage:       "/model status",
+		Category:    CategoryModel,
+		Source:      "built-in",
+	},
+	{
+		Name:        "model fallback",
+		Description: "查看或管理模型 fallback 路由",
+		Usage:       "/model fallback [list|add|clear]",
+		Category:    CategoryModel,
+		Source:      "built-in",
+	},
+	{
+		Name:        "model doctor",
+		Description: "检查当前或指定模型的能力与上下文配置",
+		Usage:       "/model doctor [model]",
+		Category:    CategoryModel,
+		Source:      "built-in",
+	},
+	{
+		Name:        "context status",
+		Description: "查看当前会话上下文大小、压缩阈值和最近压缩状态",
+		Usage:       "/context status",
+		Category:    CategoryModel,
+		Source:      "built-in",
+	},
+	{
+		Name:        "doctor",
+		Description: "检查模型、事件和运行时配置状态",
+		Usage:       "/doctor",
+		Category:    CategoryObserve,
+		Source:      "built-in",
+	},
+	{
+		Name:        "events",
+		Description: "查询当前 daemon/session 公开事件流",
+		Usage:       "/events [--session <id>] [--since <seq>]",
+		Category:    CategoryObserve,
+		Source:      "built-in",
+	},
+	{
+		Name:        "audit",
+		Description: "查询 sandbox、审批和错误等审计事件",
+		Usage:       "/audit [--session <id>] [--since <seq>]",
+		Category:    CategoryObserve,
+		Source:      "built-in",
+	},
+
 	// ── routines ─────────────────────────────────────────────────────────────
 	{
 		Name:        "routines list",
@@ -216,8 +308,8 @@ var builtinCommands = []Command{
 	},
 	{
 		Name:        "routines status",
-		Description: "查看定时任务运行状态",
-		Usage:       "/routines status [id]",
+		Description: "查看正在运行的定时任务",
+		Usage:       "/routines status",
 		Category:    CategoryRoutines,
 		Source:      "built-in",
 	},
@@ -314,6 +406,28 @@ var builtinCommands = []Command{
 		Category:    CategoryOpenSpec,
 		Source:      "built-in",
 	},
+	// ── checkpoint ───────────────────────────────────────────────────────────
+	{
+		Name:        "checkpoint",
+		Description: "为当前工作目录创建快照",
+		Usage:       "/checkpoint [reason]",
+		Category:    CategoryCheckpoint,
+		Source:      "built-in",
+	},
+	{
+		Name:        "checkpoints",
+		Description: "列出已保存的快照",
+		Usage:       "/checkpoints",
+		Category:    CategoryCheckpoint,
+		Source:      "built-in",
+	},
+	{
+		Name:        "restore",
+		Description: "从快照恢复工作目录",
+		Usage:       "/restore <checkpoint-id>",
+		Category:    CategoryCheckpoint,
+		Source:      "built-in",
+	},
 }
 
 // Registry aggregates built-in and custom slash commands.
@@ -330,14 +444,20 @@ func NewRegistry(cwd string) *Registry {
 	// Load custom commands via the existing CommandManager.
 	mgr := skill.NewCommandManager(cwd)
 	for _, d := range mgr.List() {
+		prelude, _ := skill.ExtractCommandPreludes(d.Body)
 		r.commands = append(r.commands, Command{
-			Name:         d.Name,
-			Description:  d.Description,
-			Usage:        "/" + d.Name,
-			Category:     CategoryCustom,
-			Source:       d.Source,
-			Namespace:    d.Namespace,
-			AllowedTools: d.AllowedTools,
+			Name:                  d.Name,
+			Description:           d.Description,
+			Usage:                 "/" + d.Name,
+			Category:              CategoryCustom,
+			Source:                d.Source,
+			Namespace:             d.Namespace,
+			AllowedTools:          d.AllowedTools,
+			PermissionProfile:     d.PermissionProfile,
+			Prelude:               prelude,
+			PreludeTimeoutSeconds: d.PreludeTimeoutSeconds,
+			PreludeOnError:        d.PreludeOnError,
+			PreludeOutput:         d.PreludeOutput,
 		})
 	}
 

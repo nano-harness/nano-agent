@@ -1,6 +1,8 @@
 package slash_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/nano-harness/nano-agent/pkg/slash"
@@ -19,6 +21,8 @@ func TestNewRegistry_BuiltinCommands(t *testing.T) {
 		"skill:list", "skill:use", "skill:off", "skill:info", "skill:install",
 		"teammates", "teammates:list", "teammates:show",
 		"agents", "agents:list", "agents:show",
+		"models", "model list", "model use", "model status", "model fallback", "model doctor", "context status",
+		"doctor", "events", "audit",
 		"routines list", "routines add", "routines remove", "routines status", "routines pause", "routines resume",
 		"opsx:propose", "opsx:explore", "opsx:new", "opsx:continue", "opsx:ff",
 		"opsx:apply", "opsx:verify", "opsx:sync", "opsx:status",
@@ -44,9 +48,12 @@ func TestNewRegistry_CategoryOrder(t *testing.T) {
 		slash.CategoryPermission: 0,
 		slash.CategorySkill:      1,
 		slash.CategoryAgent:      2,
-		slash.CategoryRoutines:   3,
-		slash.CategoryOpenSpec:   4,
-		slash.CategoryCustom:     5,
+		slash.CategoryModel:      3,
+		slash.CategoryObserve:    4,
+		slash.CategoryRoutines:   5,
+		slash.CategoryOpenSpec:   6,
+		slash.CategoryCheckpoint: 7,
+		slash.CategoryCustom:     8,
 	}
 	for _, cmd := range all {
 		idx := catOrder[cmd.Category]
@@ -133,11 +140,88 @@ func TestNewBuiltinRegistry(t *testing.T) {
 		slash.CategoryPermission,
 		slash.CategorySkill,
 		slash.CategoryAgent,
+		slash.CategoryModel,
+		slash.CategoryObserve,
 		slash.CategoryRoutines,
 		slash.CategoryOpenSpec,
 	} {
 		if !cats[want] {
 			t.Errorf("NewBuiltinRegistry() missing category %q", want)
 		}
+	}
+}
+
+func TestNewRegistry_CustomCommandPermissionMetadata(t *testing.T) {
+	cwd := t.TempDir()
+	cmdDir := filepath.Join(cwd, ".nano", "commands")
+	if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmdDir, "deploy.md"), []byte(`---
+description: Deploy safely
+allowed-tools: [run_shell_command]
+permission-profile: acceptEdits
+---
+Deploy $ARGUMENTS
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := slash.NewRegistry(cwd)
+	var got *slash.Command
+	for _, cmd := range r.All() {
+		if cmd.Name == "deploy" {
+			cmdCopy := cmd
+			got = &cmdCopy
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("custom command not registered")
+	}
+	if len(got.AllowedTools) != 1 || got.AllowedTools[0] != "run_shell_command" {
+		t.Fatalf("AllowedTools = %#v", got.AllowedTools)
+	}
+	if got.PermissionProfile != "acceptEdits" {
+		t.Fatalf("PermissionProfile = %q, want acceptEdits", got.PermissionProfile)
+	}
+}
+
+func TestNewRegistry_CustomCommandPreludeMetadata(t *testing.T) {
+	cwd := t.TempDir()
+	cmdDir := filepath.Join(cwd, ".nano", "commands")
+	if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmdDir, "ship.md"), []byte(`---
+description: Ship with preflight
+prelude_timeout: 7
+prelude_on_error: abort
+prelude_output: full
+---
+!go test ./pkg/slash
+!echo ready
+Ship $ARGUMENTS
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := slash.NewRegistry(cwd)
+	var got *slash.Command
+	for _, cmd := range r.All() {
+		if cmd.Name == "ship" {
+			cmdCopy := cmd
+			got = &cmdCopy
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("custom command not registered")
+	}
+	if len(got.Prelude) != 2 || got.Prelude[0] != "go test ./pkg/slash" || got.Prelude[1] != "echo ready" {
+		t.Fatalf("Prelude = %#v", got.Prelude)
+	}
+	if got.PreludeTimeoutSeconds != 7 || got.PreludeOnError != "abort" || got.PreludeOutput != "full" {
+		t.Fatalf("unexpected prelude options: %#v", got)
 	}
 }

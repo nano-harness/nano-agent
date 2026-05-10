@@ -287,6 +287,7 @@ type Model struct {
 	connectionState  string
 	connectionDetail string
 	swarmRoster      string
+	cronIndicator    string
 
 	// New state management
 	stateManager *StateManager
@@ -325,7 +326,7 @@ type Model struct {
 	// Agent integration
 	inputHandler  func(string)
 	cancelHandler func() bool
-	// newSessionHandler is invoked when the user requests a new session via Ctrl+R.
+	// newSessionHandler is invoked when the user requests a new session via Ctrl+L.
 	newSessionHandler func()
 
 	// Event channel
@@ -379,7 +380,7 @@ func NewModel() *Model {
 		m.renderMutex.Unlock()
 
 		// 统一通过批量渲染队列更新状态栏，确保立即可见
-		m.setStatusBarText(m.stateManager.FormatStatusText())
+		m.updateStatusBar()
 
 		// 同步更新输入框状态 - 当Agent状态变化时自动同步输入框的启用/禁用状态
 		m.updateInputFieldState()
@@ -789,8 +790,8 @@ func (m *Model) setupKeyBindings() {
 			return nil
 		}
 
-		// Ctrl+R: start a new session (clear context)
-		if event.Key() == tcell.KeyCtrlR {
+		// Ctrl+L: start a new session (clear context)
+		if event.Key() == tcell.KeyCtrlL {
 			if m.newSessionHandler != nil {
 				m.newSessionHandler()
 			}
@@ -862,7 +863,7 @@ func (m *Model) UpdateSwarmRoster(roster string) {
 	}
 }
 
-// SetNewSessionHandler sets the handler invoked when user presses Ctrl+R to start a new session.
+// SetNewSessionHandler sets the handler invoked when user presses Ctrl+L to start a new session.
 func (m *Model) SetNewSessionHandler(handler func()) {
 	m.newSessionHandler = handler
 }
@@ -1892,6 +1893,11 @@ func (m *Model) SetAllowlistHandler(h func(toolName string, params map[string]in
 	m.allowlistHandler = h
 }
 
+func (m *Model) SetCronIndicator(s string) {
+	m.cronIndicator = s
+	m.updateStatusBar()
+}
+
 // setStatusBarText 统一的状态栏更新入口，纳入批量渲染与节流
 func (m *Model) setStatusBarText(text string) {
 	if m.statusBar == nil {
@@ -1916,9 +1922,13 @@ func (m *Model) updateChatView() {
 
 func (m *Model) updateStatusBar() {
 	var status strings.Builder
-	// Keyboard shortcuts hint
-	fmt.Fprintf(&status, "%sCtrl+R 新会话 | Ctrl+P 命令 | Ctrl+Z 取消 | Tab 切换 | q 退出%s | ",
-		m.styles.GetColorTag("muted"), m.styles.GetResetTag())
+	if m.cronIndicator != "" {
+		fmt.Fprintf(&status, "%s | ", m.cronIndicator)
+	}
+	// Keyboard shortcuts hint – sourced from the configured keymap so the
+	// status bar stays in sync if bindings change.
+	fmt.Fprintf(&status, "%s%s%s | ",
+		m.styles.GetColorTag("muted"), formatStatusHints(), m.styles.GetResetTag())
 	// Current view (omit default "chat")
 	if m.activeView != "" && m.activeView != "chat" {
 		fmt.Fprintf(&status, "%s%s%s | ", m.styles.GetColorTag("primary"), m.activeView, m.styles.GetResetTag())
@@ -1938,7 +1948,10 @@ func (m *Model) updateStatusBar() {
 
 func (m *Model) updateStatusBarDirect() {
 	if m.stateManager != nil {
-		hint := m.styles.GetColorTag("muted") + "Ctrl+R 新会话 | Ctrl+P 命令 | Ctrl+Z 取消 | Tab 切换 | q 退出" + m.styles.GetResetTag()
+		hint := m.styles.GetColorTag("muted") + formatStatusHints() + m.styles.GetResetTag()
+		if m.cronIndicator != "" {
+			hint = m.cronIndicator + " | " + hint
+		}
 		conn := ""
 		if m.connectionState != "" {
 			conn = fmt.Sprintf(" | [green]● %s[-]", m.connectionState)

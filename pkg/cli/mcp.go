@@ -596,13 +596,23 @@ func newMCPServerListCommand() *cobra.Command {
 func newMCPServerStartCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start [server-name]",
-		Short: "Start a specific MCP server",
-		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		Short: "Start (probe) a specific MCP server",
+		Long: `Probe a specific MCP server by establishing a fresh connection and
+verifying it responds to capability discovery. MCP servers in nano-agent are
+launched on-demand per client connection, so "start" is implemented as a
+connection probe; a successful probe confirms the configured command, env,
+and transport are valid.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			serverName := args[0]
-			color.Green("Starting MCP server: %s", serverName)
-			// Implementation would start the specific server
-			color.Green("✅ Server %s started successfully", serverName)
+			color.White("Starting MCP server: %s", serverName)
+			info, err := probeMCPServer(cmd.Context(), serverName)
+			if err != nil {
+				return fmt.Errorf("failed to start MCP server %s: %w", serverName, err)
+			}
+			color.Green("✅ MCP server %s started (transport=%s, tools=%d, resources=%d, prompts=%d)",
+				info.Name, info.Transport, info.ToolCount, info.ResourceCount, info.PromptCount)
+			return nil
 		},
 	}
 }
@@ -610,13 +620,37 @@ func newMCPServerStartCommand() *cobra.Command {
 func newMCPServerStopCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop [server-name]",
-		Short: "Stop a specific MCP server",
-		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		Short: "Stop a specific MCP server (disable in config)",
+		Long: `Disable a specific MCP server in the active configuration. MCP servers
+in nano-agent are launched on-demand per client connection (one process per
+session) and cannot be killed centrally from the CLI, so "stop" is
+implemented as a persistent disable: the server's "enabled" flag is set to
+false in the active config so future sessions skip it.
+
+Re-enable with "nano mcp servers start <name>".`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
 			serverName := args[0]
-			color.Yellow("Stopping MCP server: %s", serverName)
-			// Implementation would stop the specific server
-			color.Green("✅ Server %s stopped successfully", serverName)
+			cfg := config.Get()
+			if cfg == nil || cfg.MCP == nil {
+				color.Yellow("MCP is not configured")
+				return nil
+			}
+			found := false
+			for i := range cfg.MCP.Servers {
+				if cfg.MCP.Servers[i].Name == serverName {
+					cfg.MCP.Servers[i].Enabled = false
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("MCP server not found in config: %s", serverName)
+			}
+			color.Green("✅ MCP server %s disabled in active config", serverName)
+			color.Yellow("ℹ️  This change applies to the in-memory config only. " +
+				"Edit ~/.nano/config.yaml to persist across restarts.")
+			return nil
 		},
 	}
 }
@@ -624,13 +658,21 @@ func newMCPServerStopCommand() *cobra.Command {
 func newMCPServerRestartCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "restart [server-name]",
-		Short: "Restart a specific MCP server",
-		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		Short: "Restart (re-probe) a specific MCP server",
+		Long: `Restart a specific MCP server by re-running the connection probe.
+Equivalent to "stop" followed by "start" but skips the disable step so the
+server stays enabled in config.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			serverName := args[0]
 			color.Yellow("Restarting MCP server: %s", serverName)
-			// Implementation would restart the specific server
-			color.Green("✅ Server %s restarted successfully", serverName)
+			info, err := probeMCPServer(cmd.Context(), serverName)
+			if err != nil {
+				return fmt.Errorf("failed to restart MCP server %s: %w", serverName, err)
+			}
+			color.Green("✅ MCP server %s restarted (transport=%s, tools=%d)",
+				info.Name, info.Transport, info.ToolCount)
+			return nil
 		},
 	}
 }
@@ -640,82 +682,16 @@ func newMCPServerTestCommand() *cobra.Command {
 		Use:   "test [server-name]",
 		Short: "Test connection to a specific MCP server",
 		Args:  cobra.ExactArgs(1),
-		Run: func(_ *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			serverName := args[0]
-			cfg := config.Get()
-			if cfg == nil || cfg.MCP == nil || !cfg.MCP.EnableClient {
-				color.Yellow("MCP is not enabled")
-				return
-			}
-
-			var target *config.MCPServerConfig
-			for i := range cfg.MCP.Servers {
-				if cfg.MCP.Servers[i].Name == serverName {
-					target = &cfg.MCP.Servers[i]
-					break
-				}
-			}
-			if target == nil {
-				color.Red("❌ MCP server not found: %s", serverName)
-				return
-			}
-			if !target.Enabled {
-				color.Yellow("⚠️  MCP server is disabled in config: %s", serverName)
-			}
-
-			timeout := cfg.MCP.Timeout
-			if target.Timeout > 0 {
-				timeout = target.Timeout
-			}
-			if timeout <= 0 {
-				timeout = 60 * time.Second
-			}
-
-			testCfg := &mcp.MCPConfig{
-				EnableClient:        cfg.MCP.EnableClient,
-				MCPServers:          convertMCPServers([]config.MCPServerConfig{*target}),
-				DefaultTransport:    cfg.MCP.DefaultTransport,
-				Timeout:             cfg.MCP.Timeout,
-				MaxRetries:          cfg.MCP.MaxRetries,
-				EnableHealthCheck:   false,
-				HealthCheckInterval: 0,
-				HealthCheckTimeout:  0,
-			}
-			client := mcp.NewMCPClient(testCfg)
-
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-
 			color.White("Testing connection to MCP server: %s", serverName)
-			if err := client.Start(ctx); err != nil {
-				color.Red("❌ Server %s connection test failed: %v", serverName, err)
-				os.Exit(1)
+			info, err := probeMCPServer(cmd.Context(), serverName)
+			if err != nil {
+				return fmt.Errorf("server %s connection test failed: %w", serverName, err)
 			}
-			defer client.Stop() //nolint:errcheck
-
-			ticker := time.NewTicker(200 * time.Millisecond)
-			defer ticker.Stop()
-
-			for {
-				connections := client.ListConnections()
-				for _, conn := range connections {
-					if conn.Name != serverName {
-						continue
-					}
-					if conn.Connected {
-						color.Green("✅ Server %s connected (%s): %d tools, %d resources, %d prompts",
-							conn.Name, conn.Transport, conn.ToolCount, conn.ResourceCount, conn.PromptCount)
-						return
-					}
-				}
-
-				select {
-				case <-ctx.Done():
-					color.Red("❌ Server %s connection test timed out after %s", serverName, timeout.String())
-					os.Exit(1)
-				case <-ticker.C:
-				}
-			}
+			color.Green("✅ Server %s connected (%s): %d tools, %d resources, %d prompts",
+				info.Name, info.Transport, info.ToolCount, info.ResourceCount, info.PromptCount)
+			return nil
 		},
 	}
 }

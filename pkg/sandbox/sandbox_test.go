@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"context"
 	"runtime"
 	"strings"
 	"testing"
@@ -151,6 +152,191 @@ func TestNew_EnabledReturnsPlatformSandbox(t *testing.T) {
 			t.Errorf("unsupported platform %q should return NoopSandbox", runtime.GOOS)
 		}
 	}
+}
+
+// ── SandboxRuntime adapter ───────────────────────────────────────────────────
+
+func TestRuntime_DisabledPreparesNoopEnvironment(t *testing.T) {
+	rt := NewRuntime(cfg(false), "/workspace")
+	env, err := rt.PrepareCommand(context.Background(), SandboxRequest{
+		Command:    "sh",
+		Args:       []string{"-c", "echo hi"},
+		WorkingDir: "/workspace",
+		Env:        []string{"NANO_TOOL_INPUT={}", "SECRET_TOKEN=hidden"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Enabled {
+		t.Fatal("disabled runtime should not enable process isolation")
+	}
+	if env.Backend != BackendNone || env.BackendDetail != "none" {
+		t.Fatalf("unexpected backend: %s/%s", env.Backend, env.BackendDetail)
+	}
+	if env.Command != "sh" || len(env.Args) != 2 || env.Args[1] != "echo hi" {
+		t.Fatalf("unexpected prepared command: %s %v", env.Command, env.Args)
+	}
+	if env.Network != NetworkInherited {
+		t.Fatalf("disabled runtime network = %s, want %s", env.Network, NetworkInherited)
+	}
+}
+
+func TestRuntime_RecordsNetworkMountsAndFallback(t *testing.T) {
+	c := cfg(true)
+	c.NetworkAccess = false
+	c.ExtraReadOnlyPaths = []string{"/readonly"}
+	c.ExtraWritablePaths = []string{"/writable"}
+	rt := NewRuntime(c, "/workspace")
+	env, err := rt.PrepareCommand(context.Background(), SandboxRequest{
+		Command:    "sh",
+		Args:       []string{"-c", "echo hi"},
+		WorkingDir: "/workspace",
+		Env:        []string{"NANO_TOOL_INPUT={}", "SECRET_TOKEN=hidden"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Network != NetworkDenied {
+		t.Fatalf("network = %s, want %s", env.Network, NetworkDenied)
+	}
+	if len(env.Mounts) != 3 {
+		t.Fatalf("mount count = %d, want 3: %#v", len(env.Mounts), env.Mounts)
+	}
+	if env.Mounts[0].HostPath != "/workspace" || env.Mounts[0].Mode != MountReadWrite {
+		t.Fatalf("workspace mount not recorded as rw: %#v", env.Mounts[0])
+	}
+	if !env.Enabled {
+		if fallback, _ := env.Metadata["fallback"].(bool); !fallback {
+			t.Fatalf("expected fallback metadata when enabled config falls back to noop: %#v", env.Metadata)
+		}
+	}
+}
+
+func TestRuntime_DockerBackendPreparesOneShotContainer(t *testing.T) {
+	c := cfg(true)
+	c.Backend = string(BackendDocker)
+	c.NetworkAccess = false
+	c.DockerImage = "nano-test:latest"
+	c.ExtraReadOnlyPaths = []string{"/readonly"}
+
+	rt := NewRuntime(c, "/workspace")
+	env, err := rt.PrepareCommand(context.Background(), SandboxRequest{
+		Command:    "sh",
+		Args:       []string{"-c", "echo hi"},
+		WorkingDir: "/workspace",
+		Env:        []string{"NANO_TOOL_INPUT={}", "SECRET_TOKEN=hidden"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Backend != BackendDocker || !env.Enabled {
+		t.Fatalf("backend = %s enabled=%v, want docker enabled", env.Backend, env.Enabled)
+	}
+	if env.Command != "docker" {
+		t.Fatalf("command = %q, want docker", env.Command)
+	}
+	if !containsStr(env.Args, "--network") || !containsStr(env.Args, "none") {
+		t.Fatalf("docker args missing network none: %#v", env.Args)
+	}
+	if !containsStr(env.Args, "/workspace:/workspace:rw") {
+		t.Fatalf("docker args missing workspace mount: %#v", env.Args)
+	}
+	if !containsStr(env.Args, "/readonly:/readonly:ro") {
+		t.Fatalf("docker args missing readonly mount: %#v", env.Args)
+	}
+	if !containsStr(env.Args, "nano-test:latest") {
+		t.Fatalf("docker args missing image: %#v", env.Args)
+	}
+	if !containsStr(env.Args, "NANO_TOOL_INPUT={}") {
+		t.Fatalf("docker args missing nano env: %#v", env.Args)
+	}
+	if containsStr(env.Args, "SECRET_TOKEN=hidden") {
+		t.Fatalf("docker args leaked non-NANO env: %#v", env.Args)
+	}
+}
+
+func TestRuntime_DockerBackendPreparesSessionContainer(t *testing.T) {
+	c := cfg(true)
+	c.Backend = string(BackendDocker)
+	c.NetworkAccess = false
+	c.DockerLifecycle = "session"
+	c.DockerImage = "nano-test:latest"
+
+	rt := NewRuntime(c, "/workspace")
+	env, err := rt.PrepareCommand(context.Background(), SandboxRequest{
+		Command:    "sh",
+		Args:       []string{"-c", "echo hi"},
+		WorkingDir: "/workspace",
+		Env:        []string{"NANO_TOOL_INPUT={}", "SECRET_TOKEN=hidden"},
+		Metadata: map[string]interface{}{
+			"sandbox_session_id": "sess-123",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Command != "sh" || len(env.Args) != 2 || env.Args[0] != "-c" {
+		t.Fatalf("persistent command = %q %#v, want sh -c", env.Command, env.Args)
+	}
+	script := env.Args[1]
+	for _, want := range []string{"docker inspect", "'docker' 'run'", "--name", "'docker' 'exec'", "nano-session-sess-123"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("persistent script missing %q: %s", want, script)
+		}
+	}
+	if strings.Contains(script, "--rm") {
+		t.Fatalf("persistent script should not use --rm: %s", script)
+	}
+	if strings.Contains(script, "SECRET_TOKEN=hidden") {
+		t.Fatalf("persistent script leaked non-NANO env: %s", script)
+	}
+	if env.Metadata["lifecycle"] != "session" || env.Metadata["container_name"] == "" {
+		t.Fatalf("missing lifecycle metadata: %#v", env.Metadata)
+	}
+}
+
+func TestRuntime_PublishesSandboxEvents(t *testing.T) {
+	c := cfg(true)
+	c.Backend = string(BackendDocker)
+	pub := &recordingPublisher{}
+	rt := NewRuntimeWithEventPublisher(c, "/workspace", pub)
+
+	env, err := rt.PrepareCommand(context.Background(), SandboxRequest{
+		Command:    "sh",
+		Args:       []string{"-c", "echo hi"},
+		WorkingDir: "/workspace",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Cleanup(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		EventTypeSandboxDecisionCreated,
+		EventTypeSandboxEnvironmentCreated,
+		EventTypeSandboxEnvironmentCleaned,
+	}
+	if len(pub.events) != len(want) {
+		t.Fatalf("published %d events, want %d: %#v", len(pub.events), len(want), pub.events)
+	}
+	for i, wantType := range want {
+		if pub.events[i].Type != wantType {
+			t.Fatalf("event %d type = %s, want %s", i, pub.events[i].Type, wantType)
+		}
+		if pub.events[i].Metadata["sandbox"] == nil {
+			t.Fatalf("event %d missing sandbox metadata: %#v", i, pub.events[i])
+		}
+	}
+}
+
+type recordingPublisher struct {
+	events []Event
+}
+
+func (p *recordingPublisher) PublishSandboxEvent(ev Event) {
+	p.events = append(p.events, ev)
 }
 
 // ── Linux BwrapSandbox (args only, no real execution) ────────────────────────

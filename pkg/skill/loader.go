@@ -321,3 +321,55 @@ func (m *Manager) InstallSkill(ctx context.Context, source string) (*Skill, erro
 
 	return installed, nil
 }
+
+// RemoveSkill removes a personal skill installation and refreshes discovery.
+// Project skills are source-controlled declarations and are not removed by the
+// runtime extension manager.
+func (m *Manager) RemoveSkill(name string) error {
+	if name == "" {
+		return fmt.Errorf("skill name cannot be empty")
+	}
+	if m.personalDir == "" {
+		return fmt.Errorf("personal skills directory is not configured")
+	}
+	if err := m.Discover(); err != nil {
+		return fmt.Errorf("discover skills before remove: %w", err)
+	}
+	sk := m.GetByName(name)
+	if sk == nil {
+		return fmt.Errorf("skill %q not found", name)
+	}
+	if sk.Scope != ScopePersonal {
+		return fmt.Errorf("skill %q is %s-scoped and cannot be removed by the runtime extension manager", name, sk.Scope)
+	}
+	if sk.SourcePath == "" {
+		return fmt.Errorf("skill %q has no source path", name)
+	}
+	skillDir := filepath.Dir(sk.SourcePath)
+	personalAbs, err := filepath.Abs(m.personalDir)
+	if err != nil {
+		return fmt.Errorf("resolve personal skills directory: %w", err)
+	}
+	skillAbs, err := filepath.Abs(skillDir)
+	if err != nil {
+		return fmt.Errorf("resolve skill directory: %w", err)
+	}
+	rel, err := filepath.Rel(personalAbs, skillAbs)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+		return fmt.Errorf("refusing to remove skill outside personal skills directory: %s", skillDir)
+	}
+	if err := os.RemoveAll(skillAbs); err != nil {
+		return fmt.Errorf("remove skill %q: %w", name, err)
+	}
+	delete(m.activeSkills, name)
+	if m.stateStore != nil {
+		m.stateStore.SetActiveSkills(m.getActiveSkillNames())
+		if err := m.stateStore.Save(); err != nil {
+			return fmt.Errorf("save active skills state: %w", err)
+		}
+	}
+	if err := m.Discover(); err != nil {
+		return fmt.Errorf("re-discover after remove: %w", err)
+	}
+	return nil
+}

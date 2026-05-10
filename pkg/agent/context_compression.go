@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -17,18 +16,6 @@ import (
 // maxToolResultBytes is the per-message cap for tool result content before truncation.
 const maxToolResultBytes = 4096
 
-// ContextCompressor compresses context
-type ContextCompressor struct {
-	llmClient llm.StreamClient
-}
-
-// NewContextCompressor creates a new context compressor
-func NewContextCompressor(llmClient llm.StreamClient) *ContextCompressor {
-	return &ContextCompressor{
-		llmClient: llmClient,
-	}
-}
-
 // CompressionInfo tracks compression statistics like Gemini CLI
 // inspired by google-gemini/gemini-cli ChatCompressionInfo
 type CompressionInfo struct {
@@ -40,6 +27,20 @@ type CompressionInfo struct {
 	MessagesAfter    int     `json:"messages_after"`
 	TriggeredBy      string  `json:"triggered_by"`
 	Summary          string  `json:"summary"`
+}
+
+// ContextStatus reports the current transcript/context budget state for a
+// session or turn. It is designed for CLI/daemon control surfaces.
+type ContextStatus struct {
+	MessageCount       int              `json:"message_count"`
+	EstimatedTokens    int              `json:"estimated_tokens"`
+	MaxTokens          int              `json:"max_tokens"`
+	ThresholdTokens    int              `json:"threshold_tokens"`
+	ThresholdRatio     float64          `json:"threshold_ratio"`
+	PreserveRatio      float64          `json:"preserve_ratio"`
+	ShouldCompress     bool             `json:"should_compress"`
+	CompressionEnabled bool             `json:"compression_enabled"`
+	LastCompression    *CompressionInfo `json:"last_compression,omitempty"`
 }
 
 // CompressionStrategy implements advanced context compression based on Gemini CLI patterns
@@ -159,6 +160,23 @@ func (cs *CompressionStrategy) ShouldCompress(messages []llm.Message, currentTok
 	shouldCompress := currentTokens > int(float64(cs.maxTokens)*cs.thresholdRatio)
 	logger.Infof("Should compress: %v (threshold: %d tokens)", shouldCompress, int(float64(cs.maxTokens)*cs.thresholdRatio))
 	return shouldCompress
+}
+
+// Status estimates the current context budget without mutating messages.
+func (cs *CompressionStrategy) Status(messages []llm.Message, systemPrompt string, last *CompressionInfo) ContextStatus {
+	currentTokens := cs.EstimateTokenCountWithSystemPrompt(messages, systemPrompt)
+	thresholdTokens := int(float64(cs.maxTokens) * cs.thresholdRatio)
+	return ContextStatus{
+		MessageCount:       len(messages),
+		EstimatedTokens:    currentTokens,
+		MaxTokens:          cs.maxTokens,
+		ThresholdTokens:    thresholdTokens,
+		ThresholdRatio:     cs.thresholdRatio,
+		PreserveRatio:      cs.preserveRatio,
+		ShouldCompress:     cs.ShouldCompress(messages, currentTokens),
+		CompressionEnabled: true,
+		LastCompression:    last,
+	}
 }
 
 // SegmentHistory intelligently segments conversation history
@@ -415,28 +433,6 @@ func (cs *CompressionStrategy) TruncateLargeToolResultsSmart(messages []llm.Mess
 	return result, savedBytes
 }
 
-// TruncateLargeToolResults trims oversized tool result messages in-place (local operation, no API).
-// Messages whose content exceeds maxToolResultBytes are replaced with a shorter placeholder that
-// retains the first portion of the content plus a truncation notice.
-func (cs *CompressionStrategy) TruncateLargeToolResults(messages []llm.Message) ([]llm.Message, int) {
-	result := make([]llm.Message, len(messages))
-	copy(result, messages)
-	savedBytes := 0
-	for i, msg := range result {
-		if msg.Role != "tool" {
-			continue
-		}
-		if len(msg.Content) <= maxToolResultBytes {
-			continue
-		}
-		original := len(msg.Content)
-		truncated := msg.Content[:maxToolResultBytes]
-		result[i].Content = truncated + fmt.Sprintf("\n...[truncated %d bytes]", original-maxToolResultBytes)
-		savedBytes += original - len(result[i].Content)
-	}
-	return result, savedBytes
-}
-
 // RemoveOldMessages drops the oldest non-system messages (up to removeCount pairs) from
 // the conversation. It never removes the system message or the most recent minKeep messages.
 // Returns the trimmed message list and the number of messages removed.
@@ -569,13 +565,6 @@ func (cs *CompressionStrategy) localCompress(messages []llm.Message, targetSavin
 	return messages, saved
 }
 
-// ClearOldToolResults replaces old tool result content with a placeholder,
-// always keeping the most recent protectRecent tool messages intact.
-func (cs *CompressionStrategy) ClearOldToolResults(messages []llm.Message, protectRecent int) []llm.Message {
-	result, _ := cs.ClearOldToolResultsWithCount(messages, protectRecent)
-	return result
-}
-
 // ClearOldToolResultsWithCount replaces old tool result content with a placeholder,
 // always keeping the most recent protectRecent tool messages intact.
 // Returns the updated messages and the number of messages whose content was cleared.
@@ -606,41 +595,6 @@ func (cs *CompressionStrategy) ClearOldToolResultsWithCount(messages []llm.Messa
 		}
 	}
 	return result, cleared
-}
-
-// RebuildContextAfterCompression builds a continuation context string
-// after compression by combining the summary with recently edited file contents.
-func (cs *CompressionStrategy) RebuildContextAfterCompression(
-	summary string,
-	recentFiles []string,
-	maxFiles int,
-	maxTokensPerFile int,
-) string {
-	var sb strings.Builder
-	sb.WriteString("This session continues from a previous conversation.\n\n")
-	sb.WriteString(summary)
-
-	maxCharsPerFile := maxTokensPerFile * 4 // rough token-to-char estimate
-	count := 0
-	for _, path := range recentFiles {
-		if count >= maxFiles {
-			break
-		}
-		// recentFiles are paths of files recently edited during the session;
-		// they are produced internally (not from user input), so path traversal
-		// risk is low. Callers should still validate paths before passing them.
-		data, err := os.ReadFile(path) //nolint:gosec
-		if err != nil {
-			continue
-		}
-		content := string(data)
-		if len(content) > maxCharsPerFile {
-			content = content[:maxCharsPerFile] + fmt.Sprintf("\n...[truncated, showing first %d chars]", maxCharsPerFile)
-		}
-		fmt.Fprintf(&sb, "\n\n## File: %s\n\n```\n%s\n```", path, content)
-		count++
-	}
-	return sb.String()
 }
 
 // GenerateSummary creates a structured XML summary like Gemini CLI
@@ -796,6 +750,11 @@ func (cs *CompressionStrategy) EstimateTokenCount(messages []llm.Message) int {
 // EstimateTokenCountWithSystemPrompt estimates tokens including system prompt
 func (cs *CompressionStrategy) EstimateTokenCountWithSystemPrompt(messages []llm.Message, systemPrompt string) int {
 	messageTokens := cs.EstimateTokenCount(messages)
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			return messageTokens
+		}
+	}
 
 	if cs.tokenCounter != nil {
 		systemTokens := cs.tokenCounter.CountTokens(systemPrompt)

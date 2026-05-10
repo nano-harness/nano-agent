@@ -11,9 +11,11 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/memory"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
 	agentruntime "github.com/nano-harness/nano-agent/pkg/runtime"
 	"github.com/nano-harness/nano-agent/pkg/skill"
 	"github.com/nano-harness/nano-agent/pkg/tools"
@@ -41,6 +43,7 @@ type agentBootstrap struct {
 	stateStore        *config.StateStore
 	permissionManager *permission.Manager
 	skillManager      *skill.Manager
+	hookEngine        *middleware.HookEngine
 }
 
 func buildAgentBootstrap(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool) (*agentBootstrap, error) {
@@ -61,6 +64,12 @@ func buildAgentBootstrap(cfg *config.Config, approvalHandler func(*ToolCallInfo)
 	permissionManager := newAgentPermissionManager(cfg, workingDir)
 	toolScheduler.SetPermissionManager(permissionManager)
 	skillManager := newAgentSkillManager(cfg, workingDir, stateStore)
+	hookEngine := newAgentHookEngine(cfg, workingDir)
+
+	// Wire hook engine into components
+	toolScheduler.SetHookEngine(hookEngine)
+	toolScheduler.SetWorkDir(workingDir)
+	sessionManager.SetHookEngine(hookEngine)
 
 	return &agentBootstrap{
 		workingDir:        workingDir,
@@ -74,6 +83,7 @@ func buildAgentBootstrap(cfg *config.Config, approvalHandler func(*ToolCallInfo)
 		stateStore:        stateStore,
 		permissionManager: permissionManager,
 		skillManager:      skillManager,
+		hookEngine:        hookEngine,
 	}, nil
 }
 
@@ -115,16 +125,18 @@ func newAgentToolboxConfig(cfg *config.Config, workingDir string) *tools.Toolbox
 	}
 
 	toolboxConfig := &tools.ToolboxConfig{
-		WorkingDirectory: workingDir,
-		Timeout:          cfg.ResponseTimeout,
-		MaxFileSize:      cfg.MaxFileSize,
-		MaxResponseSize:  cfg.MaxFileSize,
-		UserAgent:        "nano/1.0",
-		AllowedCommands:  cfg.AllowedCommands,
-		BlockedCommands:  cfg.BlockedCommands,
-		WebSearchAPIKeys: webAPIKeys,
-		EnableMCP:        cfg.EnableMCP,
-		MCPConfig:        convertMCPConfig(cfg.MCP),
+		WorkingDirectory:      workingDir,
+		Timeout:               cfg.ResponseTimeout,
+		MaxFileSize:           cfg.MaxFileSize,
+		MaxResponseSize:       cfg.MaxFileSize,
+		UserAgent:             "nano/1.0",
+		AllowedCommands:       cfg.AllowedCommands,
+		BlockedCommands:       cfg.BlockedCommands,
+		SensitiveReadPaths:    cfg.SensitiveReadPaths,
+		ArbitraryExecCommands: cfg.ArbitraryExecCommands,
+		WebSearchAPIKeys:      webAPIKeys,
+		EnableMCP:             cfg.EnableMCP,
+		MCPConfig:             convertMCPConfig(cfg.MCP),
 
 		ReadFileMaxLines:    cfg.ReadFileMaxLines,
 		SearchMaxResults:    cfg.SearchMaxResults,
@@ -153,12 +165,21 @@ func newAgentToolboxConfig(cfg *config.Config, workingDir string) *tools.Toolbox
 }
 
 func newAgentLLMClient(cfg *config.Config, toolbox *tools.Toolbox) llm.LLMClient {
-	return llm.NewClient(
-		cfg.APIKey,
-		cfg.BaseURL,
-		cfg.Model,
-		toolbox.List(),
-	)
+	primary, fallbacks, err := llm.ResolveRoutes(cfg)
+	if err != nil {
+		logger.Warnf("failed to resolve model routes; falling back to legacy client: %v", err)
+		return llm.NewClient(
+			cfg.APIKey,
+			cfg.BaseURL,
+			cfg.Model,
+			toolbox.List(),
+		)
+	}
+	if len(fallbacks) == 0 {
+		return llm.NewClient(primary.APIKey, primary.BaseURL, primary.Model, toolbox.List())
+	}
+	routes := append([]llm.ResolvedRoute{primary}, fallbacks...)
+	return llm.NewMultiRouteClient(routes, toolbox.List(), cfg)
 }
 
 func newAgentMemoryManager(cfg *config.Config, workingDir string) *memory.Manager {
@@ -377,4 +398,68 @@ func newPreloadedSystemPromptBuilder(cfg *config.Config, workingDir string, tool
 		preloadSPB.PreloadUserInfo()
 	}
 	return preloadSPB
+}
+
+func newAgentHookEngine(cfg *config.Config, workingDir string) *middleware.HookEngine {
+	var hooks []middleware.Hook
+	if cfg.Security != nil {
+		for _, hookCfg := range cfg.Security.Hooks {
+			if !hookCfg.Enabled {
+				continue
+			}
+
+			hooks = append(hooks, middleware.Hook{
+				Name:          hookCfg.Name,
+				Event:         hookservice.Event(hookCfg.Event),
+				Pattern:       hookCfg.Pattern,
+				Command:       hookCfg.Command,
+				FailurePolicy: hookservice.FailurePolicy(hookCfg.FailurePolicy),
+				EnvWhitelist:  hookCfg.EnvWhitelist,
+				Async:         hookCfg.Async,
+				AsyncRewake:   hookCfg.AsyncRewake,
+				Once:          hookCfg.Once,
+				StatusMessage: hookCfg.StatusMessage,
+			})
+		}
+	}
+
+	firewallEnabled := cfg.Firewall == nil || cfg.Firewall.Enabled
+	if len(hooks) == 0 && !firewallEnabled {
+		return nil
+	}
+
+	hookEngine := middleware.NewHookEngine(hooks)
+	if firewallEnabled {
+		hookEngine.RegisterProgrammaticHook(permission.NewFirewallHook(newAgentFirewallConfig(cfg.Firewall)))
+	}
+	return hookEngine
+}
+
+func newAgentFirewallConfig(cfg *config.FirewallConfig) permission.FirewallConfig {
+	firewallConfig := permission.DefaultFirewallConfig()
+	if cfg == nil {
+		return firewallConfig
+	}
+	if cfg.SeverityThreshold != "" {
+		firewallConfig.SeverityThreshold = permission.Severity(cfg.SeverityThreshold)
+	}
+	if cfg.FailurePolicy != "" {
+		firewallConfig.FailurePolicy = cfg.FailurePolicy
+	}
+	firewallConfig.CustomPatterns = convertFirewallPatterns(cfg.CustomPatterns)
+	firewallConfig.Overrides = append([]string(nil), cfg.Overrides...)
+	return firewallConfig
+}
+
+func convertFirewallPatterns(patterns []config.DangerousCommandPattern) []permission.DangerousCommandRule {
+	var rules []permission.DangerousCommandRule
+	for _, p := range patterns {
+		rules = append(rules, permission.DangerousCommandRule{
+			Pattern:  p.Pattern,
+			Reason:   p.Reason,
+			Severity: permission.Severity(p.Severity),
+			Category: p.Category,
+		})
+	}
+	return rules
 }

@@ -130,6 +130,12 @@ func TestAddMember(t *testing.T) {
 		IsActive:  true,
 		SessionID: "session-r1",
 		Kind:      KindInProcess,
+		Sandbox: SandboxPolicy{
+			Backend:   "docker",
+			Lifecycle: "task",
+			Scope:     "subagent",
+			SessionID: "session-r1",
+		},
 	}
 
 	err = AddMember(name, member)
@@ -162,6 +168,9 @@ func TestAddMember(t *testing.T) {
 	}
 	if m.Kind != member.Kind {
 		t.Errorf("Kind: got %q, want %q", m.Kind, member.Kind)
+	}
+	if m.Sandbox.Backend != "docker" || m.Sandbox.Lifecycle != "task" || m.Sandbox.Scope != "subagent" {
+		t.Errorf("Sandbox: got %#v", m.Sandbox)
 	}
 }
 

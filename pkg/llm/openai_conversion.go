@@ -1,6 +1,9 @@
 package llm
 
 import (
+	"strings"
+
+	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/openai/openai-go/v3"
 )
 
@@ -25,5 +28,41 @@ func (c *Client) convertMessages(messages []Message) []openai.ChatCompletionMess
 }
 
 func (c *Client) convertTools() []openai.ChatCompletionToolUnionParam {
-	return c.messageConverter().ConvertTools()
+	return NewToolSchemaConverter().ConvertTools(selectToolsForLLM(c.tools, c.toolGate))
+}
+
+var coreExposedCategories = map[interfaces.ToolCategory]bool{ //nolint:gochecknoglobals
+	interfaces.CategoryFileSystem: true,
+	interfaces.CategoryShell:      true,
+	interfaces.CategoryAgent:      true,
+}
+
+var alwaysExposedToolNames = map[string]bool{ //nolint:gochecknoglobals
+	"discover_tools":  true,
+	"discover_skills": true,
+}
+
+func selectToolsForLLM(allTools []interfaces.Tool, gate interfaces.ToolGate) []interfaces.Tool {
+	if len(allTools) == 0 {
+		return nil
+	}
+	selected := make([]interfaces.Tool, 0, len(allTools))
+	for _, tool := range allTools {
+		if tool == nil {
+			continue
+		}
+		name := tool.Name()
+		if alwaysExposedToolNames[name] {
+			selected = append(selected, tool)
+			continue
+		}
+		if !strings.HasPrefix(name, "mcp_") && coreExposedCategories[tool.Category()] {
+			selected = append(selected, tool)
+			continue
+		}
+		if gate != nil && gate.ShouldExpose(name) {
+			selected = append(selected, tool)
+		}
+	}
+	return selected
 }

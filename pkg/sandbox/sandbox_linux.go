@@ -44,6 +44,12 @@ func newBwrapSandbox(cfg *config.SandboxConfig, workingDir string) Sandbox {
 // IsEnabled always returns true for a BwrapSandbox (bwrap was found).
 func (b *BwrapSandbox) IsEnabled() bool { return true }
 
+// Backend returns the native backend family.
+func (b *BwrapSandbox) Backend() Backend { return BackendNative }
+
+// BackendDetail returns the concrete Linux backend.
+func (b *BwrapSandbox) BackendDetail() string { return "bwrap" }
+
 // WrapCommand transforms (cmd, args) into a bwrap-wrapped invocation.
 //
 // The resulting argument list follows the pattern:

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -20,9 +21,11 @@ type TeamLeadRegistry struct {
 	mu       sync.RWMutex
 
 	// Cleanup configuration
-	idleTimeout time.Duration
-	stopChan    chan struct{}
-	cleanupDone chan struct{}
+	idleTimeout    time.Duration
+	stopChan       chan struct{}
+	cleanupDone    chan struct{}
+	stopOnce       sync.Once
+	sessionManager *agent.SessionManager
 }
 
 // NewTeamLeadRegistry creates a new registry for team-lead sessions
@@ -42,6 +45,34 @@ func NewTeamLeadRegistry(idleTimeout time.Duration) *TeamLeadRegistry {
 	go registry.cleanupLoop()
 
 	return registry
+}
+
+// SetSessionManager links daemon team sessions to the agent session lifecycle.
+func (r *TeamLeadRegistry) SetSessionManager(sm *agent.SessionManager) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sessionManager = sm
+}
+
+// OnSessionLifecycle implements agent.LifecycleHook.
+func (r *TeamLeadRegistry) OnSessionLifecycle(ctx context.Context, sessionID string, ev agent.SessionLifecycleEvent, meta map[string]interface{}) error {
+	if ev != agent.SessionLifecycleBeforeCleanup && ev != agent.SessionLifecycleBeforeShutdown {
+		return nil
+	}
+	if _, exists := r.Get(sessionID); !exists {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Remove(sessionID) }()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		if errors.Is(err, ErrTeamLeadSessionNotFound) {
+			return nil
+		}
+		return err
+	}
 }
 
 // GetOrCreate gets an existing session or creates a new one
@@ -120,10 +151,15 @@ func (r *TeamLeadRegistry) Count() int {
 
 // Shutdown gracefully shuts down all sessions and stops the registry
 func (r *TeamLeadRegistry) Shutdown() error {
+	return r.ShutdownWithTimeout(0)
+}
+
+// ShutdownWithTimeout gracefully shuts down all sessions, bounding per-session drain by timeout.
+func (r *TeamLeadRegistry) ShutdownWithTimeout(timeout time.Duration) error {
 	logger.Info("Shutting down team-lead registry")
 
 	// Stop cleanup goroutine
-	close(r.stopChan)
+	r.stopOnce.Do(func() { close(r.stopChan) })
 	<-r.cleanupDone
 
 	// Shutdown all sessions
@@ -136,8 +172,25 @@ func (r *TeamLeadRegistry) Shutdown() error {
 	r.mu.Unlock()
 
 	// Shutdown each session
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
 	for _, session := range sessions {
-		if err := session.Shutdown(); err != nil {
+		var err error
+		if deadline.IsZero() {
+			err = session.Shutdown()
+		} else {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				session.CancelActiveTasks()
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), remaining)
+			err = session.ShutdownCtx(ctx)
+			cancel()
+		}
+		if err != nil {
 			logger.Warnf("Error shutting down session %s: %v", session.ID, err)
 		}
 	}
@@ -168,13 +221,26 @@ func (r *TeamLeadRegistry) cleanupIdleSessions() {
 	r.mu.Lock()
 	now := time.Now()
 	toRemove := make([]string, 0)
+	sm := r.sessionManager
 
 	for sessionID, session := range r.sessions {
 		session.mu.RLock()
 		lastActive := session.LastActiveAt
 		session.mu.RUnlock()
 
-		if now.Sub(lastActive) > r.idleTimeout {
+		expired := now.Sub(lastActive) > r.idleTimeout
+		if sm != nil {
+			if agentSession, ok := sm.GetSession(sessionID); ok && agentSession != nil {
+				state := agentSession.GetState()
+				switch state {
+				case agent.SessionStateAwaitingInput:
+					expired, _ = agentSession.IsExpiredByState(now, r.idleTimeout, agent.DefaultAwaitingInputTTL)
+				case agent.SessionStateSuspended:
+					expired = false
+				}
+			}
+		}
+		if expired {
 			toRemove = append(toRemove, sessionID)
 			logger.Infof("Session %s idle for %v, scheduling for removal", sessionID, now.Sub(lastActive))
 		}

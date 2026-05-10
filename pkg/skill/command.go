@@ -16,6 +16,7 @@ type CommandDef struct {
 	Namespace             string
 	Description           string
 	AllowedTools          []string
+	PermissionProfile     string
 	Source                string
 	Body                  string
 	PreludeTimeoutSeconds int
@@ -35,6 +36,7 @@ type CommandManager struct {
 type commandFrontmatter struct {
 	Description           string   `yaml:"description"`
 	AllowedTools          []string `yaml:"allowed-tools"`
+	PermissionProfile     string   `yaml:"permission-profile"`
 	PreludeTimeoutSeconds int      `yaml:"prelude_timeout"`
 	PreludeOnError        string   `yaml:"prelude_on_error"`
 	PreludeOutput         string   `yaml:"prelude_output"`
@@ -90,12 +92,13 @@ func (m *CommandManager) loadAll() {
 			ns := commandNamespaceOf(dir, path)
 			src := commandSourceOf(dir, m.cwd, m.home)
 			m.commands[name] = &CommandDef{
-				Name:         name,
-				Namespace:    ns,
-				Description:  fm.Description,
-				AllowedTools: fm.AllowedTools,
-				Source:       src,
-				Body:         trimCommandLeadingNewline(body),
+				Name:              name,
+				Namespace:         ns,
+				Description:       fm.Description,
+				AllowedTools:      fm.AllowedTools,
+				PermissionProfile: strings.TrimSpace(fm.PermissionProfile),
+				Source:            src,
+				Body:              trimCommandLeadingNewline(body),
 				PreludeTimeoutSeconds: func() int {
 					if fm.PreludeTimeoutSeconds > 0 {
 						return fm.PreludeTimeoutSeconds

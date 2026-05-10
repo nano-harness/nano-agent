@@ -123,6 +123,16 @@ func (pd *ProgressiveDisclosure) MarkExpanded(toolName string) {
 	}
 }
 
+// ShouldExpose reports whether a tool has been expanded and should be sent as a full schema.
+func (pd *ProgressiveDisclosure) ShouldExpose(toolName string) bool {
+	if pd == nil {
+		return false
+	}
+	pd.mu.RLock()
+	defer pd.mu.RUnlock()
+	return pd.expandedTools[toolName]
+}
+
 // BuildToolDirectory returns the Layer-1 directory string for all indexed tools.
 func (pd *ProgressiveDisclosure) BuildToolDirectory() string {
 	pd.mu.RLock()

@@ -2,12 +2,17 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
+	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/nano-harness/nano-agent/pkg/tools"
 )
 
 type turnExecutor struct {
@@ -24,8 +29,39 @@ func newTurnExecutor(turn *Turn) *turnExecutor {
 
 func (e *turnExecutor) Execute(ctx context.Context) error {
 	t := e.turn
+	ctx = context.WithValue(ctx, interfaces.TurnContextKey{}, interfaces.TurnContext{SessionID: t.SessionID})
 	logger.Infof("Starting turn execution: %s", t.ID)
 	t.StartTime = time.Now()
+
+	// Dispatch UserPromptSubmit hook
+	if t.hookEngine != nil {
+		hookParams := map[string]interface{}{
+			"user_input": t.UserInput,
+			"turn_id":    t.ID,
+			"session_id": t.SessionID,
+		}
+		hookDecision, err := t.hookEngine.Execute(ctx, middleware.HookUserPromptSubmit, "user_prompt", hookParams)
+		if err != nil {
+			logger.Warnf("UserPromptSubmit hook execution error: %v", err)
+		}
+		if hookDecision != nil {
+			switch hookDecision.Action {
+			case middleware.ActionBlock:
+				// Hook blocked the user prompt
+				logger.Warnf("User prompt blocked by hook: %s", hookDecision.Reason)
+				return fmt.Errorf("user prompt blocked by hook: %s", hookDecision.Reason)
+			case middleware.ActionConfirm:
+				// Hook requires confirmation (though this is unusual for user input)
+				logger.Infof("User prompt requires confirmation per hook: %s", hookDecision.Reason)
+			case middleware.ActionAllow:
+				// Hook allows - apply any modifications to the user input
+				if modifiedInput, ok := hookDecision.ModifiedParams["user_input"].(string); ok && modifiedInput != "" {
+					logger.Infof("User input modified by hook: %s -> %s", t.UserInput, modifiedInput)
+					t.UserInput = modifiedInput
+				}
+			}
+		}
+	}
 
 	if t.agentConfig != nil && t.agentConfig.Turn != nil && t.agentConfig.Turn.MaxDuration > 0 {
 		var cancel context.CancelFunc
@@ -60,6 +96,53 @@ func (e *turnExecutor) Execute(ctx context.Context) error {
 	if err := t.saveConversationMemory(); err != nil {
 		logger.Warnf("Failed to save conversation memory: %v", err)
 	}
+
+	// M1F: Stop / StopFailure hooks fire at turn termination. Hooks may signal
+	// that the agent should keep going by returning ActionBlock; in that case
+	// the executor returns ErrContinueRequested so a higher layer can decide.
+	if t.hookEngine != nil {
+		stopEvent := middleware.HookStop
+		status := "success"
+		if turnErr != nil {
+			stopEvent = middleware.HookStopFailure
+			status = "failed"
+		}
+		stopParams := map[string]interface{}{
+			"turn_id":          t.ID,
+			"session_id":       t.SessionID,
+			"transcript_path":  "",
+			"cwd":              t.WorkingDir,
+			"hook_event_name":  "Stop",
+			"stop_hook_active": false,
+			"iteration":        0,
+			"status":           status,
+			"iterations":       t.CompletionCriteria.CurrentIteration,
+		}
+		if t.transcript != nil {
+			stopParams["transcript_path"] = t.transcript.Path()
+		}
+		if t.ralphContext != nil {
+			stopParams["stop_hook_active"] = t.ralphContext.IsActive()
+			stopParams["iteration"] = t.ralphContext.Iteration()
+		}
+		if dec, herr := t.hookEngine.Execute(ctx, stopEvent, "turn_stop", stopParams); herr != nil {
+			logger.Warnf("Stop hook execution error: %v", herr)
+		} else if dec != nil {
+			if msg, ok := dec.AuditMetadata["systemMessage"].(string); ok && msg != "" && t.eventHandler != nil {
+				t.eventHandler(event.NewStreamEvent(event.EventTypeWarning, "agent_turn").WithContent(msg))
+			}
+			if dec.Action == middleware.ActionBlock {
+				if t.ralphContext != nil && t.ralphContext.IsActive() {
+					logger.Warnf("Stop hook returned block while stop_hook_active=true for session %s iteration %d; ignoring to prevent infinite loop", t.SessionID, t.ralphContext.Iteration())
+				} else {
+					logger.Infof("Stop hook requested continuation: %s", dec.Reason)
+					t.continuationReason = dec.Reason
+					turnErr = ErrContinueRequested
+				}
+			}
+		}
+	}
+
 	e.emitter.executorState("closing", map[string]interface{}{
 		"iterations": t.CompletionCriteria.CurrentIteration,
 	})
@@ -161,16 +244,108 @@ func (e *turnExecutor) executeTools(ctx context.Context, toolsToExecute []ToolTo
 	if len(toolsToExecute) == 0 {
 		return make(map[string]*interfaces.ToolResult)
 	}
-	toolResults, err := t.executeToolCallsInParallel(ctx, toolsToExecute)
+	remainingTools, toolResults := e.handleTaskDoneTools(toolsToExecute)
+	if len(remainingTools) == 0 {
+		return toolResults
+	}
+	executedResults, err := t.executeToolCallsInParallel(ctx, remainingTools)
 	if err != nil {
 		logger.Errorf("Tool execution infrastructure error: %v", err)
-		toolResults = t.buildFallbackResults(toolsToExecute, err)
+		executedResults = t.buildFallbackResults(remainingTools, err)
 		t.CompletionCriteria.ErrorCount++
 	}
-	if toolResults == nil {
-		toolResults = make(map[string]*interfaces.ToolResult)
+	for id, result := range executedResults {
+		toolResults[id] = result
 	}
 	return toolResults
+}
+
+func (e *turnExecutor) handleTaskDoneTools(toolsToExecute []ToolToExecute) ([]ToolToExecute, map[string]*interfaces.ToolResult) {
+	t := e.turn
+	results := make(map[string]*interfaces.ToolResult)
+	remaining := make([]ToolToExecute, 0, len(toolsToExecute))
+	for _, tool := range toolsToExecute {
+		if strings.TrimSpace(tool.Name) != "task_done" {
+			remaining = append(remaining, tool)
+			continue
+		}
+		status, summary := parseTaskDoneArguments(tool.Parameters)
+		success := status == "" || strings.EqualFold(status, "success") || strings.EqualFold(status, "completed")
+		if t.eventHandler != nil {
+			t.eventHandler(event.StreamEvent{
+				Type:   event.EventTypeToolUse,
+				Source: "agent_turn",
+				ToolUse: &event.ToolUse{
+					ID:         tool.ID,
+					ToolName:   tool.Name,
+					Parameters: tool.Parameters,
+					Status:     "executing",
+				},
+			})
+			t.eventHandler(event.StreamEvent{
+				Type: event.EventTypeToolResult,
+				ToolResult: &tools.ToolResult{
+					ID:      tool.ID,
+					Content: "task_done acknowledged",
+				},
+			})
+		}
+		reason := summary
+		if reason == "" {
+			reason = "task_done"
+		}
+		t.MarkTaskCompleted(reason)
+		if t.eventHandler != nil {
+			t.eventHandler(event.StreamEvent{
+				Type:   event.EventTypeToolUse,
+				Source: "agent_turn",
+				ToolUse: &event.ToolUse{
+					ID:       tool.ID,
+					ToolName: tool.Name,
+					Status:   "success",
+					Result:   reason,
+				},
+			})
+		}
+		results[tool.ID] = &interfaces.ToolResult{
+			Success:     success,
+			LLMContent:  "Task completion signal received: " + reason,
+			UserContent: reason,
+			Metadata: map[string]interface{}{
+				"tool_name": "task_done",
+				"status":    status,
+			},
+		}
+	}
+	return remaining, results
+}
+
+func parseTaskDoneArguments(params map[string]interface{}) (status string, summary string) {
+	if v, ok := params["status"].(string); ok {
+		status = v
+	}
+	if v, ok := params["summary"].(string); ok {
+		summary = v
+	}
+	if summary == "" {
+		if v, ok := params["message"].(string); ok {
+			summary = v
+		}
+	}
+	// Compatibility layer: mock LLMs and provider adapters may preserve raw
+	// function-call argument JSON under __raw when the provider-native payload
+	// cannot be safely decoded into the standard parameter map before this
+	// parser runs. Decode that raw JSON here so task_done remains an internal
+	// completion signal even without a registered concrete tool implementation.
+	if len(params) == 1 {
+		if raw, ok := params["__raw"].(string); ok {
+			var decoded map[string]interface{}
+			if json.Unmarshal([]byte(raw), &decoded) == nil {
+				return parseTaskDoneArguments(decoded)
+			}
+		}
+	}
+	return status, summary
 }
 
 func (e *turnExecutor) keepRunningForUnreadMailbox(ctx context.Context) {
