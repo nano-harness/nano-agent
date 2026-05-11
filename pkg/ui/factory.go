@@ -14,6 +14,8 @@ type Config struct {
 	WorkingDir string
 	// ShowBanner controls whether to play the animated banner on TUI startup. Default true.
 	ShowBanner bool
+	// UseFullscreen enables fullscreen mode with virtual scrolling (alt-screen).
+	UseFullscreen bool
 }
 
 // Factory creates UI adapters.
@@ -42,10 +44,16 @@ func (f *Factory) Create(mode Mode) (Adapter, error) {
 // ─── Bubble Tea adapter ──────────────────────────────────────────────────────
 
 func (f *Factory) newBubbleTeaAdapter() *BubbleTeaAdapter {
+	var model tea.Model
+	if f.cfg.UseFullscreen {
+		model = bubbletea.NewFullscreenModel(f.cfg.WorkingDir, f.cfg.APIBaseURL)
+	} else {
+		model = bubbletea.New(nil, nil, f.cfg.APIBaseURL, f.cfg.WorkingDir)
+	}
 	return &BubbleTeaAdapter{
-		model:      bubbletea.New(nil, nil, f.cfg.APIBaseURL, f.cfg.WorkingDir),
+		model:      model,
 		sendCh:     make(chan tea.Msg, 1024),
-		showBanner: f.cfg.ShowBanner,
+		showBanner: f.cfg.ShowBanner && !f.cfg.UseFullscreen, // No banner in fullscreen mode
 	}
 }
 

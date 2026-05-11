@@ -30,6 +30,7 @@ type PersistedTask struct {
 	Source    string `json:"source"`     // "tui", "daemon", "conversation"
 	CreatedAt string `json:"created_at"` // RFC3339
 	MaxRuns   int    `json:"max_runs,omitempty"`
+	Paused    bool   `json:"paused,omitempty"`
 }
 
 // StateStore manages persistent runtime state separate from configuration.
@@ -189,6 +190,19 @@ func (s *StateStore) RemoveTask(id string) {
 	}
 	s.state.ScheduledTasks = tasks
 	s.dirty = true
+}
+
+// SetTaskPaused updates the paused state of a task by ID.
+func (s *StateStore) SetTaskPaused(id string, paused bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.ScheduledTasks {
+		if s.state.ScheduledTasks[i].ID == id {
+			s.state.ScheduledTasks[i].Paused = paused
+			s.dirty = true
+			return
+		}
+	}
 }
 
 // GetTasks returns a copy of the persisted task list.

@@ -177,14 +177,6 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opt
 			logger.Debugf("engine: cron task %s event [%s]: %s", taskID, se.Type, se.Content)
 		}
 
-		// Apply cron-specific approval handler
-		origHandler := agentInstance.GetToolScheduler().GetApprovalHandler()
-		cronHandler := buildCronApprovalHandler(cronCfg.PermissionPolicy)
-		if cronHandler != nil {
-			agentInstance.SetApprovalHandler(cronHandler)
-			defer agentInstance.SetApprovalHandler(origHandler)
-		}
-
 		// Apply turn timeout
 		timeout := cronCfg.TurnTimeout
 		if timeout == 0 {
@@ -192,6 +184,10 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opt
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
+		cronHandler := buildCronApprovalHandler(cronCfg.PermissionPolicy)
+		if cronHandler != nil {
+			ctx = agent.WithApprovalHandler(ctx, cronHandler)
+		}
 
 		started := time.Now()
 		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskStarted, taskID, command, meta.SessionID, true, 0, nil))
@@ -353,19 +349,16 @@ func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo)
 			logger.Debugf("engine: cron task %s event [%s]: %s", taskID, se.Type, se.Content)
 		}
 
-		origHandler := agentInstance.GetToolScheduler().GetApprovalHandler()
-		cronHandler := buildCronApprovalHandler(cronCfg.PermissionPolicy)
-		if cronHandler != nil {
-			agentInstance.SetApprovalHandler(cronHandler)
-			defer agentInstance.SetApprovalHandler(origHandler)
-		}
-
 		timeout := cronCfg.TurnTimeout
 		if timeout == 0 {
 			timeout = 10 * time.Minute
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
+		cronHandler := buildCronApprovalHandler(cronCfg.PermissionPolicy)
+		if cronHandler != nil {
+			ctx = agent.WithApprovalHandler(ctx, cronHandler)
+		}
 
 		started := time.Now()
 		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskStarted, taskID, command, meta.SessionID, true, 0, nil))

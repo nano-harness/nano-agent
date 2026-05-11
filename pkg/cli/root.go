@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -24,6 +25,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/ui"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea/banner"
+	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
 	"github.com/nano-harness/nano-agent/pkg/version"
 	"github.com/fatih/color"
@@ -172,6 +174,9 @@ Usage:
 	// Experimental: Bubble Tea non-alt-screen TUI
 	cmd.Flags().Bool("tea", false, "use experimental Bubble Tea TUI (non alt-screen)")
 	cmd.Flags().Bool("no-banner", false, "disable startup ASCII banner animation in TUI mode")
+
+	// Experimental: Fullscreen TUI with virtual scrolling (alt-screen mode)
+	cmd.Flags().Bool("milktea", false, "use fullscreen TUI with virtual scrolling (alt-screen mode)")
 
 	// TUI session management flags
 	cmd.Flags().Bool("continue", false, "resume the most recent session in the current project (TUI mode)")
@@ -425,6 +430,15 @@ func runAgent(cmd *cobra.Command, args []string) {
 
 	// Decide which TUI to use early to enable TUI mode logging
 	useTea, _ := cmd.Flags().GetBool("tea")
+	useMilkTea, _ := cmd.Flags().GetBool("milktea")
+
+	// Validate flag combinations
+	if useTea && useMilkTea {
+		fmt.Fprintf(os.Stderr, "错误: 不能同时使用 --tea 和 --milktea 标志\n")
+		fmt.Fprintf(os.Stderr, "提示: 使用 --milktea 来启动全屏 TUI (alt-screen 模式)\n")
+		fmt.Fprintf(os.Stderr, "     使用 --tea 来启动内联 Bubble Tea TUI (非 alt-screen 模式)\n")
+		os.Exit(1)
+	}
 
 	// Determine execution mode
 	if useDaemon || (!forceTUI && isDaemonRunning()) {
@@ -437,7 +451,7 @@ func runAgent(cmd *cobra.Command, args []string) {
 	}
 
 	// Enable TUI mode logging BEFORE any other initialization if we're going to use TUI
-	if useTea || forceTUI {
+	if useTea || useMilkTea || forceTUI {
 		logger.SetTUIMode(true)
 		defer logger.SetTUIMode(false)
 	}
@@ -473,7 +487,7 @@ func runAgent(cmd *cobra.Command, args []string) {
 	logger.Infof("Initializing agent with verbose=%v", cfg.Verbose)
 	logger.SetVerbose(cfg.Verbose)
 
-	if useTea {
+	if useTea || useMilkTea {
 		if err := runBubbleTeaMode(cmd, args); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -1021,11 +1035,20 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	cwd, _ = os.Getwd()
 	apiBaseURL := cfg.BaseURL
 
-	// Create Bubble Tea model
-	m := bubbletea.New(submitCh, cancelCh, apiBaseURL, cwd)
+	// Check for fullscreen mode flag
+	useFullscreen, _ := cmd.Flags().GetBool("milktea")
 
-	// Prepare program without Alt Screen for natural terminal scrolling
-	p := tea.NewProgram(m)
+	// Create Bubble Tea model (fullscreen or inline)
+	var m tea.Model
+	if useFullscreen {
+		m = bubbletea.NewFullscreenModel(cwd, apiBaseURL)
+	} else {
+		m = bubbletea.New(submitCh, cancelCh, apiBaseURL, cwd)
+	}
+
+	// Prepare program (fullscreen models set AltScreen in their View() return)
+	var p *tea.Program
+	p = tea.NewProgram(m)
 
 	// Predeclare agentInstance for use in approval handler
 	var agentInstance *agent.Agent
@@ -1125,45 +1148,49 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	cronTracker.SetOnChange(func() {
 		p.Send(bubbletea.CronStatusMsg{Indicator: cronTracker.FormatIndicator()})
 	})
-	m.SetModelLister(slash.BuildModelLister(cfg))
-	m.SetModelStatusGetter(slash.BuildModelStatusGetter(cfg))
-	m.SetModelSwitcher(slash.BuildModelSwitcher(filepath.Join(cwd, ".nano.yaml")))
-	m.SetModelFallbackHandler(slash.BuildModelFallbackHandler(cfg))
-	m.SetModelDoctor(slash.BuildModelDoctor(cfg))
-	m.SetContextStatusGetter(slash.BuildContextStatusGetter(agentInstance))
-	m.SetDoctorReporter(slash.BuildDoctorReporter(cfg))
-	m.SetEventsQuerier(slash.BuildEventsQuerier(eventStore))
-	m.SetAuditQuerier(slash.BuildAuditQuerier(eventStore))
-	if sm := agentInstance.GetSkillManager(); sm != nil {
-		m.SetSkillLister(sm.ListSkillNames)
+
+	// Only wire capabilities for inline model (fullscreen model doesn't support these yet)
+	if inlineModel, ok := m.(*bubbletea.Model); ok {
+		inlineModel.SetModelLister(slash.BuildModelLister(cfg))
+		inlineModel.SetModelStatusGetter(slash.BuildModelStatusGetter(cfg))
+		inlineModel.SetModelSwitcher(slash.BuildModelSwitcher(filepath.Join(cwd, ".nano.yaml")))
+		inlineModel.SetModelFallbackHandler(slash.BuildModelFallbackHandler(cfg))
+		inlineModel.SetModelDoctor(slash.BuildModelDoctor(cfg))
+		inlineModel.SetContextStatusGetter(slash.BuildContextStatusGetter(agentInstance))
+		inlineModel.SetDoctorReporter(slash.BuildDoctorReporter(cfg))
+		inlineModel.SetEventsQuerier(slash.BuildEventsQuerier(eventStore))
+		inlineModel.SetAuditQuerier(slash.BuildAuditQuerier(eventStore))
+		if sm := agentInstance.GetSkillManager(); sm != nil {
+			inlineModel.SetSkillLister(sm.ListSkillNames)
+		}
+		inlineModel.SetRoutinesLister(btScheduler.FormatTasks)
+		inlineModel.SetRunningStatusLister(cronTracker.FormatDetails)
+		inlineModel.SetRoutinesAdder(func(description string) string {
+			id, err := btScheduler.AddRoutineFromDescription(description)
+			if err != nil {
+				return fmt.Sprintf("❌ 添加 routine 失败：%v", err)
+			}
+			return fmt.Sprintf("✅ 已添加 routine %s", id)
+		})
+		inlineModel.SetRoutinesRemover(func(taskID string) string {
+			if err := btScheduler.RemoveTask(strings.TrimSpace(taskID)); err != nil {
+				return fmt.Sprintf("❌ 删除 routine 失败：%v", err)
+			}
+			return fmt.Sprintf("✅ 已删除 routine %s", strings.TrimSpace(taskID))
+		})
+		inlineModel.SetRoutinesPauser(func(taskID string) string {
+			if err := btScheduler.PauseTask(strings.TrimSpace(taskID)); err != nil {
+				return fmt.Sprintf("❌ 暂停 routine 失败：%v", err)
+			}
+			return fmt.Sprintf("✅ 已暂停 routine %s", strings.TrimSpace(taskID))
+		})
+		inlineModel.SetRoutinesResumer(func(taskID string) string {
+			if err := btScheduler.ResumeTask(strings.TrimSpace(taskID)); err != nil {
+				return fmt.Sprintf("❌ 恢复 routine 失败：%v", err)
+			}
+			return fmt.Sprintf("✅ 已恢复 routine %s", strings.TrimSpace(taskID))
+		})
 	}
-	m.SetRoutinesLister(btScheduler.FormatTasks)
-	m.SetRunningStatusLister(cronTracker.FormatDetails)
-	m.SetRoutinesAdder(func(description string) string {
-		id, err := btScheduler.AddRoutineFromDescription(description)
-		if err != nil {
-			return fmt.Sprintf("❌ 添加 routine 失败：%v", err)
-		}
-		return fmt.Sprintf("✅ 已添加 routine %s", id)
-	})
-	m.SetRoutinesRemover(func(taskID string) string {
-		if err := btScheduler.RemoveTask(strings.TrimSpace(taskID)); err != nil {
-			return fmt.Sprintf("❌ 删除 routine 失败：%v", err)
-		}
-		return fmt.Sprintf("✅ 已删除 routine %s", strings.TrimSpace(taskID))
-	})
-	m.SetRoutinesPauser(func(taskID string) string {
-		if err := btScheduler.PauseTask(strings.TrimSpace(taskID)); err != nil {
-			return fmt.Sprintf("❌ 暂停 routine 失败：%v", err)
-		}
-		return fmt.Sprintf("✅ 已暂停 routine %s", strings.TrimSpace(taskID))
-	})
-	m.SetRoutinesResumer(func(taskID string) string {
-		if err := btScheduler.ResumeTask(strings.TrimSpace(taskID)); err != nil {
-			return fmt.Sprintf("❌ 恢复 routine 失败：%v", err)
-		}
-		return fmt.Sprintf("✅ 已恢复 routine %s", strings.TrimSpace(taskID))
-	})
 	eng.SetCronNotifier(func(ev event.StreamEvent) {
 		eventStore.Add(ev)
 		cronTracker.Handle(ev)
@@ -1174,113 +1201,92 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 		logger.Warnf("Engine start failed: %v", startErr)
 	}
 
-	// Register allowlist handler so "始终允许" adds a rule to the session allowlist.
-	m.SetAllowlistHandler(func(toolName string, params map[string]interface{}) {
-		if pm := agentInstance.GetPermissionManager(); pm != nil {
-			rules := permission.BuildAllowlistRules(toolName, params)
-			for _, rule := range rules {
-				pm.GetSessionAllowlist().AddRule(rule)
-				// Persist the rule to disk
-				if _, err := allowlistStore.AddRuleForWorkdir(cwd, rule.RawPattern); err != nil {
-					logger.Warnf("Failed to persist allowlist rule %q: %v", rule.RawPattern, err)
+	// Register allowlist handler so "始终允许" adds a rule to the session allowlist (inline model only).
+	if inlineModel, ok := m.(*bubbletea.Model); ok {
+		inlineModel.SetAllowlistHandler(func(toolName string, params map[string]interface{}) {
+			if pm := agentInstance.GetPermissionManager(); pm != nil {
+				rules := permission.BuildAllowlistRules(toolName, params)
+				for _, rule := range rules {
+					pm.GetSessionAllowlist().AddRule(rule)
+					// Persist the rule to disk
+					if _, err := allowlistStore.AddRuleForWorkdir(cwd, rule.RawPattern); err != nil {
+						logger.Warnf("Failed to persist allowlist rule %q: %v", rule.RawPattern, err)
+					}
 				}
 			}
-		}
-	})
+		})
 
-	// Wire permission manager and tool names into the Bubble Tea model
-	m.SetPermissionManager(agentInstance.GetPermissionManager())
-	// Wire persistent allowlist store for /disallow cleanup
-	m.SetPersistentAllowlist(allowlistStore, cwd)
-	// Wire engine so /think command works
-	m.SetEngine(eng)
-	// Wire new session handler so Ctrl+R / /clear work
-	m.SetNewSessionHandler(func() string {
-		return agentInstance.StartNewSession()
-	})
+		// Wire permission manager and tool names into the Bubble Tea model
+		inlineModel.SetPermissionManager(agentInstance.GetPermissionManager())
+		// Wire persistent allowlist store for /disallow cleanup
+		inlineModel.SetPersistentAllowlist(allowlistStore, cwd)
+		// Wire engine so /think command works
+		inlineModel.SetEngine(eng)
+		// Wire new session handler so Ctrl+R / /clear work
+		inlineModel.SetNewSessionHandler(func() string {
+			return agentInstance.StartNewSession()
+		})
+	}
 	allTools := agentInstance.GetToolbox().List()
 	toolNames := make([]string, 0, len(allTools))
 	for _, t := range allTools {
 		toolNames = append(toolNames, t.Name())
 	}
-	m.SetAvailableToolNames(toolNames)
+	if inlineModel, ok := m.(*bubbletea.Model); ok {
+		inlineModel.SetAvailableToolNames(toolNames)
+	}
 
 	// Stream bridge: forward agent events to Bubble Tea
-	var cancelFn context.CancelFunc
+	streamCtx, cancelStreams := context.WithCancel(context.Background())
+	defer cancelStreams()
+	var (
+		cancelMu sync.Mutex
+		cancelFn context.CancelFunc
+	)
+	cancelCurrent := func() {
+		cancelMu.Lock()
+		defer cancelMu.Unlock()
+		if cancelFn != nil {
+			cancelFn()
+			cancelFn = nil
+		}
+	}
+	startStream := func(in string) {
+		cancelMu.Lock()
+		if cancelFn != nil {
+			cancelFn()
+		}
+		ctx, cancel := context.WithCancel(streamCtx)
+		cancelFn = cancel
+		cancelMu.Unlock()
+
+		go func() {
+			_ = agentInstance.ProcessStream(ctx, in, func(se event.StreamEvent) {
+				forwardBubbleTeaStreamEvent(p, eventStore, se)
+			})
+		}()
+	}
+
+	// For fullscreen model, bind the outbound handler
+	if fullscreenModel, ok := m.(*bubbletea.FullscreenModel); ok {
+		fullscreenModel.BindOutbound(func(out eventsource.Outbound) error {
+			if out.Kind == "user_message" {
+				startStream(out.Text)
+			}
+			return nil
+		})
+	}
+
+	// For inline model, use channels
 	go func() {
 		for {
 			select {
 			case txt := <-submitCh:
-				// Start processing
-				ctx := context.Background()
-				ctx, cancelFn = context.WithCancel(ctx)
-				go func(in string) {
-					_ = agentInstance.ProcessStream(ctx, in, func(se event.StreamEvent) {
-						eventStore.Add(se)
-						// Forward each event into Bubble Tea synchronously to preserve
-						// ordering. This is safe because we are NOT inside Update()
-						// (the deadlock is prevented by building async tea.Cmd for
-						// confirmation callbacks instead).
-						switch se.Type {
-						case event.EventTypeCronTaskStarted, event.EventTypeCronTaskFinished, event.EventTypeCronTaskProgress:
-							return
-						case event.EventTypeStreamContent:
-							p.Send(bubbletea.Message{Role: "assistant_stream", Content: se.Content})
-						case event.EventTypeContent:
-							if se.Source != "llm_client" {
-								p.Send(bubbletea.Message{Role: "assistant_stream", Content: se.Content})
-							}
-						case event.EventTypeError:
-							p.Send(bubbletea.Message{Role: "error", Content: se.Error})
-						case event.EventTypeThinking:
-							p.Send(bubbletea.ThinkingMsg{
-								Title:          se.Content,
-								Reasoning:      se.Reasoning,
-								ReasoningDelta: se.ReasoningDelta,
-								Metadata:       se.Metadata,
-							})
-						case event.EventTypeToolUse:
-							toolName := se.ToolUse.ToolName
-							params := se.ToolUse.Parameters
-							result := se.ToolUse.Result
-
-							var content string
-							if result == "" {
-								content = fmt.Sprintf("正在调用工具: %s\n参数: %v", toolName, params)
-							} else {
-								// Truncate result for display, handling multi-byte characters
-								runes := []rune(result)
-								if len(runes) > 500 {
-									result = string(runes[:500]) + "..."
-								}
-								content = fmt.Sprintf("工具: %s 调用完成\n结果: %s", toolName, result)
-							}
-
-							p.Send(bubbletea.Message{Role: "tool", Content: content})
-						case event.EventTypeTokenStats:
-							if se.TokenStats != nil {
-								p.Send(buildTokenStatsUpdate(se.TokenStats))
-							}
-						case event.EventTypeDone:
-							p.Send(bubbletea.StatusUpdate("完成"))
-						case event.EventTypeCompression:
-							orig := se.Metadata["original_tokens"]
-							cmp := se.Metadata["compressed_tokens"]
-							ratio := se.Metadata["compression_ratio"]
-							before := se.Metadata["messages_before"]
-							after := se.Metadata["messages_after"]
-							trigger := se.Metadata["triggered_by"]
-							summary := se.Metadata["summary_full"]
-							content := fmt.Sprintf("🗜️ 上下文压缩: %v → %v tokens (减少 %.2f%%)\n消息数: %v → %v，触发: %v\n摘要: %v",
-								orig, cmp, (1.0-float64FromAny(ratio))*100, before, after, trigger, truncatePreview(summary))
-							p.Send(bubbletea.Message{Role: "system", Content: content})
-						}
-					})
-				}(txt)
+				startStream(txt)
 			case <-cancelCh:
-				if cancelFn != nil {
-					cancelFn()
-				}
+				cancelCurrent()
+			case <-streamCtx.Done():
+				return
 			}
 		}
 	}()
@@ -1299,6 +1305,66 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 
 	color.Green("👋 Bubble Tea TUI session ended")
 	return nil
+}
+
+func forwardBubbleTeaStreamEvent(p *tea.Program, eventStore *daemon.TaskEventStore, se event.StreamEvent) {
+	eventStore.Add(se)
+	switch se.Type {
+	case event.EventTypeCronTaskStarted, event.EventTypeCronTaskFinished, event.EventTypeCronTaskProgress:
+		return
+	case event.EventTypeStreamContent:
+		p.Send(bubbletea.Message{Role: "assistant_stream", Content: se.Content})
+	case event.EventTypeContent:
+		if se.Source != "llm_client" {
+			p.Send(bubbletea.Message{Role: "assistant_stream", Content: se.Content})
+		}
+	case event.EventTypeError:
+		p.Send(bubbletea.Message{Role: "error", Content: se.Error})
+	case event.EventTypeThinking:
+		p.Send(bubbletea.ThinkingMsg{
+			Title:          se.Content,
+			Reasoning:      se.Reasoning,
+			ReasoningDelta: se.ReasoningDelta,
+			Metadata:       se.Metadata,
+		})
+	case event.EventTypeToolUse:
+		if se.ToolUse == nil {
+			return
+		}
+		toolName := se.ToolUse.ToolName
+		params := se.ToolUse.Parameters
+		result := se.ToolUse.Result
+
+		var content string
+		if result == "" {
+			content = fmt.Sprintf("正在调用工具: %s\n参数: %v", toolName, params)
+		} else {
+			runes := []rune(result)
+			if len(runes) > 500 {
+				result = string(runes[:500]) + "..."
+			}
+			content = fmt.Sprintf("工具: %s 调用完成\n结果: %s", toolName, result)
+		}
+
+		p.Send(bubbletea.Message{Role: "tool", Content: content})
+	case event.EventTypeTokenStats:
+		if se.TokenStats != nil {
+			p.Send(buildTokenStatsUpdate(se.TokenStats))
+		}
+	case event.EventTypeDone:
+		p.Send(bubbletea.StatusUpdate("完成"))
+	case event.EventTypeCompression:
+		orig := se.Metadata["original_tokens"]
+		cmp := se.Metadata["compressed_tokens"]
+		ratio := se.Metadata["compression_ratio"]
+		before := se.Metadata["messages_before"]
+		after := se.Metadata["messages_after"]
+		trigger := se.Metadata["triggered_by"]
+		summary := se.Metadata["summary_full"]
+		content := fmt.Sprintf("🗜️ 上下文压缩: %v → %v tokens (减少 %.2f%%)\n消息数: %v → %v，触发: %v\n摘要: %v",
+			orig, cmp, (1.0-float64FromAny(ratio))*100, before, after, trigger, truncatePreview(summary))
+		p.Send(bubbletea.Message{Role: "system", Content: content})
+	}
 }
 
 func buildTokenStatsUpdate(stats *event.TokenStats) bubbletea.TokenStatsUpdate {

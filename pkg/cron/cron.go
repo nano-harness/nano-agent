@@ -248,6 +248,10 @@ func (s *Scheduler) LoadPersistedTasks() error {
 
 	tasks := s.stateStore.GetTasks()
 	for _, pt := range tasks {
+		if pt.Paused {
+			logger.Infof("cron: skipped paused persisted task %s (%s)", pt.ID, pt.CronExpr)
+			continue
+		}
 		// Explicitly copy loop-variable fields into locals so the closure
 		// captures fresh values for each iteration.
 		taskID := pt.ID
@@ -349,6 +353,58 @@ func (s *Scheduler) ScheduleTaskWithSource(cronExpr, command, source string, max
 	return s.scheduleTask(cronExpr, command, source, maxRuns)
 }
 
+// ScheduleExistingTask registers an existing persisted task without adding a new
+// StateStore entry. It is used when resuming a paused persisted task by ID.
+func (s *Scheduler) ScheduleExistingTask(id, cronExpr, command, source string, maxRuns int, createdAt time.Time) (*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.tasks[id]; exists {
+		return nil, fmt.Errorf("cron: task already scheduled: %s", id)
+	}
+
+	var runCount atomic.Int64
+	entryID, err := s.cron.AddFunc(cronExpr, func() {
+		if maxRuns > 0 {
+			n := runCount.Add(1)
+			if n > int64(maxRuns) {
+				return
+			}
+			if n == int64(maxRuns) {
+				go func() {
+					s.mu.Lock()
+					if t, ok := s.tasks[id]; ok {
+						s.cron.Remove(t.EntryID)
+						delete(s.tasks, id)
+					}
+					s.mu.Unlock()
+					s.removePersistedTask(id)
+				}()
+			}
+		}
+		s.runTaskOnce(id, command, source, false)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cron: invalid expression %q: %w", cronExpr, err)
+	}
+
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	t := &Task{
+		ID:        id,
+		CronExpr:  cronExpr,
+		Command:   command,
+		Source:    source,
+		MaxRuns:   maxRuns,
+		CreatedAt: createdAt,
+		EntryID:   entryID,
+	}
+	s.tasks[id] = t
+	logger.Infof("cron: existing task %s scheduled (%s)", id, cronExpr)
+	return t, nil
+}
+
 func (s *Scheduler) scheduleTask(cronExpr, command, source string, maxRuns int) (*Task, error) {
 	s.mu.Lock()
 
@@ -401,6 +457,16 @@ func (s *Scheduler) scheduleTask(cronExpr, command, source string, maxRuns int) 
 
 // RemoveTask cancels and removes a task by its ID.
 func (s *Scheduler) RemoveTask(taskID string) error {
+	return s.removeTask(taskID, true)
+}
+
+// UnscheduleTask cancels and removes a task from the live scheduler without
+// deleting its persisted StateStore entry.
+func (s *Scheduler) UnscheduleTask(taskID string) error {
+	return s.removeTask(taskID, false)
+}
+
+func (s *Scheduler) removeTask(taskID string, persist bool) error {
 	s.mu.Lock()
 
 	t, ok := s.tasks[taskID]
@@ -413,7 +479,9 @@ func (s *Scheduler) RemoveTask(taskID string) error {
 	logger.Infof("cron: task %s removed", taskID)
 	s.mu.Unlock()
 
-	s.removePersistedTask(taskID)
+	if persist {
+		s.removePersistedTask(taskID)
+	}
 	return nil
 }
 

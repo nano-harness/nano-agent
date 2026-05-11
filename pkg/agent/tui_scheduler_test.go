@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -153,5 +154,95 @@ func TestTUIScheduler_AddPauseResumeRemove(t *testing.T) {
 	}
 	if err := ts.RemoveTask(tasks[0].ID); err != nil {
 		t.Fatalf("RemoveTask: %v", err)
+	}
+}
+
+func TestTUIScheduler_PausePersistence(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	ss := config.NewStateStore(statePath)
+	if err := ss.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := NewTUIScheduler(ss, func(cmd string) error { return nil })
+	if err := ts.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := ts.ScheduleCron("0 0 0 1 1 *", "persist-paused")
+	if err != nil {
+		t.Fatalf("ScheduleCron: %v", err)
+	}
+	if err := ts.PauseTask(task.ID); err != nil {
+		t.Fatalf("PauseTask: %v", err)
+	}
+	if len(ts.ListTasks()) != 0 {
+		t.Fatalf("expected no live tasks after pause")
+	}
+	tasks := ss.GetTasks()
+	if len(tasks) != 1 {
+		t.Fatalf("expected paused task to remain persisted, got %d", len(tasks))
+	}
+	if tasks[0].ID != task.ID || !tasks[0].Paused {
+		t.Fatalf("expected persisted task %s to be paused, got %+v", task.ID, tasks[0])
+	}
+
+	if err := ts.ResumeTask(task.ID); err != nil {
+		t.Fatalf("ResumeTask: %v", err)
+	}
+	tasks = ss.GetTasks()
+	if len(tasks) != 1 {
+		t.Fatalf("expected resumed task to remain persisted, got %d", len(tasks))
+	}
+	if tasks[0].ID != task.ID || tasks[0].Paused {
+		t.Fatalf("expected persisted task %s to be unpaused, got %+v", task.ID, tasks[0])
+	}
+	if live := ts.ListTasks(); len(live) != 1 || live[0].ID != task.ID {
+		t.Fatalf("expected resumed live task %s, got %+v", task.ID, live)
+	}
+	ts.Stop()
+}
+
+func TestTUIScheduler_StartLoadsPausedTasksWithoutScheduling(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	ss := config.NewStateStore(statePath)
+	if err := ss.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := NewTUIScheduler(ss, func(cmd string) error { return nil })
+	if err := ts.Start(); err != nil {
+		t.Fatal(err)
+	}
+	task, err := ts.ScheduleCron("0 0 0 1 1 *", "paused-after-restart")
+	if err != nil {
+		t.Fatalf("ScheduleCron: %v", err)
+	}
+	if err := ts.PauseTask(task.ID); err != nil {
+		t.Fatalf("PauseTask: %v", err)
+	}
+	ts.Stop()
+
+	reloadedStore := config.NewStateStore(statePath)
+	if err := reloadedStore.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	reloaded := NewTUIScheduler(reloadedStore, func(cmd string) error { return nil })
+	if err := reloaded.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer reloaded.Stop()
+
+	if live := reloaded.ListTasks(); len(live) != 0 {
+		t.Fatalf("expected paused task not to be scheduled, got %+v", live)
+	}
+	paused, ok := reloaded.pausedTasks[task.ID]
+	if !ok {
+		t.Fatalf("expected paused task %s to be loaded", task.ID)
+	}
+	if paused.Command != "paused-after-restart" {
+		t.Fatalf("expected paused command to be restored, got %+v", paused)
 	}
 }

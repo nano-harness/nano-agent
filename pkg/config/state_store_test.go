@@ -132,6 +132,45 @@ func TestStateStore_RemoveTask(t *testing.T) {
 	}
 }
 
+func TestStateStore_SetTaskPaused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	s := NewStateStore(path)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	s.AddTask(PersistedTask{ID: "t1", CronExpr: "* * * * *", Command: "cmd1"})
+	s.SetTaskPaused("t1", true)
+
+	tasks := s.GetTasks()
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	if !tasks[0].Paused {
+		t.Fatalf("expected task to be paused")
+	}
+
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	s2 := NewStateStore(path)
+	if err := s2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tasks = s2.GetTasks()
+	if len(tasks) != 1 || !tasks[0].Paused {
+		t.Fatalf("expected persisted paused task, got %+v", tasks)
+	}
+
+	s2.SetTaskPaused("t1", false)
+	tasks = s2.GetTasks()
+	if len(tasks) != 1 || tasks[0].Paused {
+		t.Fatalf("expected resumed task to be unpaused, got %+v", tasks)
+	}
+}
+
 func TestStateStore_MCPStatus(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")

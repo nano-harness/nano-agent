@@ -419,6 +419,44 @@ func TestToolScheduler_ConfirmShellCommand_TriggersApproval(t *testing.T) {
 	}
 }
 
+func TestToolScheduler_ContextApprovalHandler(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+
+	globalApprovalCalled := false
+	contextApprovalCalled := false
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     func(_ event.StreamEvent) {},
+		RecoveryStrategy: NewToolRecoveryStrategy(nil),
+		ApprovalHandler: func(_ *ToolCallInfo) bool {
+			globalApprovalCalled = true
+			return false
+		},
+	})
+
+	ctx := WithApprovalHandler(context.Background(), func(_ *ToolCallInfo) bool {
+		contextApprovalCalled = true
+		return true
+	})
+	if _, err := ts.ExecuteParallel(ctx, []ToolToExecute{{
+		ID:         "context-approval-1",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "sleep 0 && sleep 0"},
+	}}); err != nil {
+		t.Fatalf("ExecuteParallel: %v", err)
+	}
+
+	if !contextApprovalCalled {
+		t.Fatal("context approval handler should have been called")
+	}
+	if globalApprovalCalled {
+		t.Fatal("global approval handler should not be called when context handler exists")
+	}
+}
+
 func TestToolScheduler_ApproveAlways_AddsToAllowlist(t *testing.T) {
 	ensureConfigLoaded(t)
 

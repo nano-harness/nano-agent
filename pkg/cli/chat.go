@@ -115,7 +115,15 @@ func runChat(cmd *cobra.Command, args []string) error {
 		src = eventsource.NewInProcess(eng, sessionID, eng.Agent.GetPermissionManager())
 	}
 
-	adapter, err := ui.NewFactory(ui.Config{APIBaseURL: cfg.BaseURL, ShowBanner: true}).Create(uiMode)
+	// Check for fullscreen mode flag
+	useFullscreen, _ := cmd.Flags().GetBool("milktea")
+
+	adapter, err := ui.NewFactory(ui.Config{
+		APIBaseURL:    cfg.BaseURL,
+		ShowBanner:    true,
+		UseFullscreen: useFullscreen,
+		WorkingDir:    cwd,
+	}).Create(uiMode)
 	if err != nil {
 		return err
 	}

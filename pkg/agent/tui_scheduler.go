@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/cron"
@@ -21,6 +22,7 @@ type TaskInfo struct {
 	CronExpr string
 	Command  string
 	Source   string
+	MaxRuns  int
 }
 
 // TUIScheduler wraps the cron Scheduler and StateStore for TUI-mode scheduling.
@@ -65,6 +67,7 @@ func (ts *TUIScheduler) Start() error {
 	if err := ts.scheduler.LoadPersistedTasks(); err != nil {
 		logger.Warnf("TUIScheduler: could not reload persisted tasks: %v", err)
 	}
+	ts.loadPausedPersistedTasks()
 	return nil
 }
 
@@ -123,15 +126,21 @@ func (ts *TUIScheduler) PauseTask(taskID string) error {
 			CronExpr: t.CronExpr,
 			Command:  t.Command,
 			Source:   t.Source,
+			MaxRuns:  t.MaxRuns,
 		}
-		return ts.scheduler.RemoveTask(taskID)
+		if err := ts.scheduler.UnscheduleTask(taskID); err != nil {
+			return err
+		}
+		if ts.stateStore != nil {
+			ts.stateStore.SetTaskPaused(taskID, true)
+			_ = ts.stateStore.Save()
+		}
+		return nil
 	}
 	return fmt.Errorf("task not found: %s", taskID)
 }
 
-// ResumeTask re-adds a task previously paused by PauseTask. The resumed live
-// task receives a fresh scheduler ID because the underlying scheduler generates
-// IDs and has no per-entry pause/resume primitive.
+// ResumeTask re-adds a task previously paused by PauseTask with its persisted ID.
 func (ts *TUIScheduler) ResumeTask(taskID string) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
@@ -139,10 +148,28 @@ func (ts *TUIScheduler) ResumeTask(taskID string) error {
 	if !ok {
 		return fmt.Errorf("paused task not found: %s", taskID)
 	}
-	if _, err := ts.scheduler.ScheduleTaskWithSource(task.CronExpr, task.Command, task.Source, 0); err != nil {
+	createdAt := time.Now()
+	if ts.stateStore != nil {
+		for _, persisted := range ts.stateStore.GetTasks() {
+			if persisted.ID != taskID {
+				continue
+			}
+			if parsed, err := time.Parse(time.RFC3339, persisted.CreatedAt); err == nil {
+				createdAt = parsed
+			} else if persisted.CreatedAt != "" {
+				logger.Warnf("TUIScheduler: could not parse persisted task %s created_at %q: %v", taskID, persisted.CreatedAt, err)
+			}
+			break
+		}
+	}
+	if _, err := ts.scheduler.ScheduleExistingTask(task.ID, task.CronExpr, task.Command, task.Source, task.MaxRuns, createdAt); err != nil {
 		return err
 	}
 	delete(ts.pausedTasks, taskID)
+	if ts.stateStore != nil {
+		ts.stateStore.SetTaskPaused(taskID, false)
+		_ = ts.stateStore.Save()
+	}
 	return nil
 }
 
@@ -210,6 +237,27 @@ func (ts *TUIScheduler) FormatTasks() string {
 // Scheduler returns the underlying cron.Scheduler for direct use in tools.
 func (ts *TUIScheduler) Scheduler() *cron.Scheduler {
 	return ts.scheduler
+}
+
+func (ts *TUIScheduler) loadPausedPersistedTasks() {
+	if ts.stateStore == nil {
+		return
+	}
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for _, task := range ts.stateStore.GetTasks() {
+		if !task.Paused {
+			continue
+		}
+		ts.pausedTasks[task.ID] = TaskInfo{
+			ID:       task.ID,
+			CronExpr: task.CronExpr,
+			Command:  task.Command,
+			Source:   task.Source,
+			MaxRuns:  task.MaxRuns,
+		}
+	}
 }
 
 // expandInterval converts compact suffixes to words for ParseNaturalSchedule.

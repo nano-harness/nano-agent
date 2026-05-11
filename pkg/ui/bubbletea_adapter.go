@@ -18,7 +18,7 @@ import (
 
 // BubbleTeaAdapter wraps pkg/ui/bubbletea as a ui.Adapter.
 type BubbleTeaAdapter struct {
-	model   *bubbletea.Model
+	model   tea.Model
 	program *tea.Program
 
 	// sendCh serializes all program.Send calls so that event ordering is
@@ -36,7 +36,14 @@ func (a *BubbleTeaAdapter) Run(ctx context.Context, src eventsource.EventSource)
 		})
 	}
 
-	a.model.BindOutbound(src.Send)
+	// Bind outbound channel based on model type
+	if binder, ok := a.model.(interface {
+		BindOutbound(func(eventsource.Outbound) error)
+	}); ok {
+		binder.BindOutbound(src.Send)
+	}
+
+	// Create program (fullscreen models set AltScreen in their View() return)
 	a.program = tea.NewProgram(a.model)
 
 	childCtx, cancel := context.WithCancel(ctx)
@@ -155,26 +162,34 @@ func (a *BubbleTeaAdapter) sendEvent(e event.StreamEvent) {
 				ToolInfo: req.toolInfo,
 				// Callback handles "同意" (yes) and "拒绝" (no).
 				Callback: func(approved bool) {
-					_ = a.model.SendOutbound(eventsource.Outbound{
-						Kind: "approval",
-						Approval: &eventsource.ApprovalDecision{
-							CallID: callID,
-							Allow:  approved,
-						},
-					})
+					if sender, ok := a.model.(interface {
+						SendOutbound(eventsource.Outbound) error
+					}); ok {
+						_ = sender.SendOutbound(eventsource.Outbound{
+							Kind: "approval",
+							Approval: &eventsource.ApprovalDecision{
+								CallID: callID,
+								Allow:  approved,
+							},
+						})
+					}
 				},
 				// AlwaysCallback handles "始终允许": sends Allow:true with Always:true so
 				// the daemon can persist the rule. The model's allowlistHandler (if wired)
 				// is still invoked afterwards to update the local session allowlist.
 				AlwaysCallback: func() {
-					_ = a.model.SendOutbound(eventsource.Outbound{
-						Kind: "approval",
-						Approval: &eventsource.ApprovalDecision{
-							CallID: callID,
-							Allow:  true,
-							Always: true,
-						},
-					})
+					if sender, ok := a.model.(interface {
+						SendOutbound(eventsource.Outbound) error
+					}); ok {
+						_ = sender.SendOutbound(eventsource.Outbound{
+							Kind: "approval",
+							Approval: &eventsource.ApprovalDecision{
+								CallID: callID,
+								Allow:  true,
+								Always: true,
+							},
+						})
+					}
 				},
 			})
 		}
@@ -205,111 +220,156 @@ func (a *BubbleTeaAdapter) Stop() {
 }
 
 // ── Capability setters ───────────────────────────────────────────────────────
-// These methods forward configuration to the underlying bubbletea.Model so
-// that callers using BubbleTeaAdapter via the Adapter interface can still wire
-// runtime capabilities such as the permission manager and engine.
+// These methods forward configuration to the underlying bubbletea.Model (inline mode only).
+// Fullscreen model does not support these capabilities yet.
 
 // SetPermissionManager enables /yolo, /permission, /allow, /disallow, /permissions
 // slash commands and Shift+Tab permission-mode cycling.
 func (a *BubbleTeaAdapter) SetPermissionManager(mgr *permission.Manager) {
-	a.model.SetPermissionManager(mgr)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetPermissionManager(mgr)
+	}
 }
 
 // SetPersistentAllowlist enables /disallow to remove rules from persistent storage.
 func (a *BubbleTeaAdapter) SetPersistentAllowlist(store *permission.PersistentAllowlistStore, workdir string) {
-	a.model.SetPersistentAllowlist(store, workdir)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetPersistentAllowlist(store, workdir)
+	}
 }
 
 // SetEngine enables /think and other engine-level slash commands.
 func (a *BubbleTeaAdapter) SetEngine(eng *engine.Engine) {
-	a.model.SetEngine(eng)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetEngine(eng)
+	}
 }
 
 // SetAllowlistHandler registers the callback invoked when the user selects
 // "始终允许" to add a rule to the local session allowlist.
 func (a *BubbleTeaAdapter) SetAllowlistHandler(h func(toolName string, params map[string]interface{})) {
-	a.model.SetAllowlistHandler(h)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetAllowlistHandler(h)
+	}
 }
 
 // SetAvailableToolNames provides tool names used for Tab completion of /allow <tool>.
 func (a *BubbleTeaAdapter) SetAvailableToolNames(names []string) {
-	a.model.SetAvailableToolNames(names)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetAvailableToolNames(names)
+	}
 }
 
 // SetNewSessionHandler registers the callback invoked by Ctrl+L / /clear.
 func (a *BubbleTeaAdapter) SetNewSessionHandler(h func() string) {
-	a.model.SetNewSessionHandler(h)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetNewSessionHandler(h)
+	}
 }
 
 // SetTeamName scopes /teammates and /agents slash commands to the given team.
 func (a *BubbleTeaAdapter) SetTeamName(name string) {
-	a.model.SetTeamName(name)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetTeamName(name)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelLister(fn func() string) {
-	a.model.SetModelLister(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelLister(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetSkillLister(fn func() string) {
-	a.model.SetSkillLister(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetSkillLister(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelStatusGetter(fn func() string) {
-	a.model.SetModelStatusGetter(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelStatusGetter(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelSwitcher(fn func(string) string) {
-	a.model.SetModelSwitcher(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelSwitcher(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelFallbackHandler(fn func(string) string) {
-	a.model.SetModelFallbackHandler(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelFallbackHandler(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelDoctor(fn func(string) string) {
-	a.model.SetModelDoctor(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelDoctor(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetContextStatusGetter(fn func() string) {
-	a.model.SetContextStatusGetter(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetContextStatusGetter(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetDoctorReporter(fn func() string) {
-	a.model.SetDoctorReporter(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetDoctorReporter(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetEventsQuerier(fn func(string) string) {
-	a.model.SetEventsQuerier(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetEventsQuerier(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetAuditQuerier(fn func(string) string) {
-	a.model.SetAuditQuerier(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetAuditQuerier(fn)
+	}
 }
 
 // SetRoutinesLister wires the callback for /routines list.
 func (a *BubbleTeaAdapter) SetRoutinesLister(fn func() string) {
-	a.model.SetRoutinesLister(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRoutinesLister(fn)
+	}
 }
 
 // SetRunningStatusLister wires the callback for /routines status.
 func (a *BubbleTeaAdapter) SetRunningStatusLister(fn func() string) {
-	a.model.SetRunningStatusLister(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRunningStatusLister(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetRoutinesAdder(fn func(string) string) {
-	a.model.SetRoutinesAdder(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRoutinesAdder(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetRoutinesRemover(fn func(string) string) {
-	a.model.SetRoutinesRemover(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRoutinesRemover(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetRoutinesPauser(fn func(string) string) {
-	a.model.SetRoutinesPauser(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRoutinesPauser(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetRoutinesResumer(fn func(string) string) {
-	a.model.SetRoutinesResumer(fn)
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRoutinesResumer(fn)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

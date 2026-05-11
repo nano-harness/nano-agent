@@ -23,6 +23,8 @@ import (
 // toolCallIDKey is the context key for storing the tool call ID
 type toolCallIDKey struct{}
 
+type ctxKeyApprovalHandler struct{}
+
 // WithToolCallID injects the tool call ID into the context
 func WithToolCallID(ctx context.Context, id string) context.Context {
 	if id == "" {
@@ -37,6 +39,17 @@ func ToolCallIDFromContext(ctx context.Context) string {
 		return id
 	}
 	return ""
+}
+
+// WithApprovalHandler returns a derived context carrying a per-request approval handler.
+func WithApprovalHandler(ctx context.Context, handler func(*ToolCallInfo) bool) context.Context {
+	return context.WithValue(ctx, ctxKeyApprovalHandler{}, handler)
+}
+
+// approvalHandlerFromCtx extracts the per-request approval handler from ctx, or nil.
+func approvalHandlerFromCtx(ctx context.Context) func(*ToolCallInfo) bool {
+	h, _ := ctx.Value(ctxKeyApprovalHandler{}).(func(*ToolCallInfo) bool)
+	return h
 }
 
 // ToolCallStatus represents the status of a tool call
@@ -834,9 +847,29 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 
 		// Handle approval flow
 		if toolCall.RequiresApproval {
-			if ts.approvalHandlerV2 != nil {
+			ctxApprovalHandler := approvalHandlerFromCtx(ctx)
+			ts.mutex.RLock()
+			approvalHandlerV2 := ts.approvalHandlerV2
+			approvalHandler := ts.approvalHandler
+			ts.mutex.RUnlock()
+			if ctxApprovalHandler != nil {
 				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
-				switch ts.approvalHandlerV2(toolCall) {
+				if ctxApprovalHandler(toolCall) {
+					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+				} else {
+					tr := &interfaces.ToolResult{
+						Success:     false,
+						Error:       "cancelled by approval policy",
+						Metadata:    map[string]interface{}{"status": "cancelled", "reason": "approval_policy_declined"},
+						LLMContent:  "Tool execution was cancelled by approval policy.",
+						UserContent: "Tool execution was cancelled by approval policy.",
+					}
+					tr = ts.normalizeToolResultFields(toolCall.Name, tr, nil)
+					ts.setStatus(tool.ID, StatusCancelled, tr, fmt.Errorf("cancelled by approval policy"))
+				}
+			} else if approvalHandlerV2 != nil {
+				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
+				switch approvalHandlerV2(toolCall) {
 				case ApprovalApproveAlways:
 					ts.addAllowlistRules(toolCall)
 					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
@@ -853,10 +886,10 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 					tr = ts.normalizeToolResultFields(toolCall.Name, tr, nil)
 					ts.setStatus(tool.ID, StatusCancelled, tr, fmt.Errorf("cancelled by user"))
 				}
-			} else if ts.approvalHandler != nil {
+			} else if approvalHandler != nil {
 				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
 				// In TUI mode the handler is async; true means sync-approved.
-				if ts.approvalHandler(toolCall) {
+				if approvalHandler(toolCall) {
 					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
 				}
 				// else: remain in StatusAwaitingApproval until HandleConfirmationResponse is called
