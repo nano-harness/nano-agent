@@ -73,14 +73,14 @@ func GetLogger() *zap.SugaredLogger { //nolint:revive
 			home, homeErr := os.UserHomeDir()
 			if homeErr != nil || home == "" {
 				// Fall back to plain temp directory when home is unavailable
-				path = filepath.Join(os.TempDir(), "nano-agent-debug.log")
+				path = filepath.Join(os.TempDir(), "nano.log")
 			} else {
 				nanoDir := filepath.Join(home, ".nano")
 				if mkdirErr := os.MkdirAll(nanoDir, 0o700); mkdirErr != nil {
 					fmt.Fprintf(os.Stderr, "failed to create log directory %q: %v; falling back to temp dir\n", nanoDir, mkdirErr)
-					path = filepath.Join(os.TempDir(), "nano-agent-debug.log")
+					path = filepath.Join(os.TempDir(), "nano.log")
 				} else {
-					path = filepath.Join(nanoDir, "nano-agent-debug.log")
+					path = filepath.Join(nanoDir, "nano.log")
 				}
 			}
 		}

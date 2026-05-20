@@ -11,25 +11,93 @@ import (
 
 // FSBridge bridges nano-agent filesystem tools to ACP fs/* operations
 type FSBridge struct {
-	acpSessionID string
-	transport    *Transport
-	workdir      string
+	acpSessionID    string
+	transport       *Transport
+	workdir         string
+	fsMode          FSMode
+	clientHasFSCaps bool
 }
 
 // NewFSBridge creates a new filesystem bridge
-func NewFSBridge(acpSessionID string, transport *Transport, workdir string) *FSBridge {
+func NewFSBridge(acpSessionID string, transport *Transport, workdir string, fsMode FSMode, clientHasFSCaps bool) *FSBridge {
 	return &FSBridge{
-		acpSessionID: acpSessionID,
-		transport:    transport,
-		workdir:      workdir,
+		acpSessionID:    acpSessionID,
+		transport:       transport,
+		workdir:         workdir,
+		fsMode:          fsMode,
+		clientHasFSCaps: clientHasFSCaps,
 	}
 }
 
 // ReadFile implements ACP fs/read operation
+// Depending on FSMode, reads from Client or local filesystem
 func (b *FSBridge) ReadFile(ctx context.Context, path string) (string, error) {
+	// Decide whether to use ACP RPC or local filesystem
+	useRPC := b.shouldUseRPC()
+
+	if useRPC {
+		return b.readFileFromClient(ctx, path, 0, 0)
+	}
+	return b.readFileLocal(ctx, path)
+}
+
+// shouldUseRPC determines whether to use RPC based on FSMode and client capabilities
+func (b *FSBridge) shouldUseRPC() bool {
+	switch b.fsMode {
+	case FSModeACP:
+		return true
+	case FSModeLocal:
+		return false
+	case FSModeAuto:
+		return b.clientHasFSCaps
+	default:
+		return false
+	}
+}
+
+// readFileFromClient sends fs/read_text_file RPC to the Client
+func (b *FSBridge) readFileFromClient(ctx context.Context, path string, line, limit int) (string, error) {
+	if !b.clientHasFSCaps {
+		return "", fmt.Errorf("client does not support fs capabilities")
+	}
+
+	logger.Infof("ACP: Reading file from client: %s", path)
+
+	params := map[string]interface{}{
+		"sessionId": b.acpSessionID,
+		"path":      path,
+	}
+	if line > 0 {
+		params["line"] = line
+	}
+	if limit > 0 {
+		params["limit"] = limit
+	}
+
+	resp, err := b.transport.SendRPCRequest("fs/read_text_file", params)
+	if err != nil {
+		return "", fmt.Errorf("RPC call failed: %w", err)
+	}
+
+	// Extract content from response
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("invalid response format")
+	}
+
+	content, ok := resultMap["content"].(string)
+	if !ok {
+		return "", fmt.Errorf("content field missing or not a string")
+	}
+
+	return content, nil
+}
+
+// readFileLocal reads file from local filesystem
+func (b *FSBridge) readFileLocal(ctx context.Context, path string) (string, error) {
 	absPath := b.resolvePath(path)
 
-	logger.Infof("ACP: Reading file: %s", absPath)
+	logger.Infof("ACP: Reading file locally: %s", absPath)
 
 	// Check if file exists
 	info, err := os.Stat(absPath)
@@ -54,10 +122,55 @@ func (b *FSBridge) ReadFile(ctx context.Context, path string) (string, error) {
 }
 
 // WriteFile implements ACP fs/write operation
+// Depending on FSMode, writes to Client or local filesystem
 func (b *FSBridge) WriteFile(ctx context.Context, path string, content string) error {
+	// Decide whether to use ACP RPC or local filesystem
+	useRPC := b.shouldUseRPC()
+
+	if useRPC {
+		return b.writeFileToClient(ctx, path, content)
+	}
+	return b.writeFileLocal(ctx, path, content)
+}
+
+// writeFileToClient sends fs/write_text_file RPC to the Client
+func (b *FSBridge) writeFileToClient(ctx context.Context, path, content string) error {
+	if !b.clientHasFSCaps {
+		return fmt.Errorf("client does not support fs capabilities")
+	}
+
+	logger.Infof("ACP: Writing file to client: %s", path)
+
+	params := map[string]interface{}{
+		"sessionId": b.acpSessionID,
+		"path":      path,
+		"content":   content,
+	}
+
+	resp, err := b.transport.SendRPCRequest("fs/write_text_file", params)
+	if err != nil {
+		return fmt.Errorf("RPC call failed: %w", err)
+	}
+
+	// Check success
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid response format")
+	}
+
+	success, _ := resultMap["success"].(bool)
+	if !success {
+		return fmt.Errorf("write operation failed")
+	}
+
+	return nil
+}
+
+// writeFileLocal writes file to local filesystem
+func (b *FSBridge) writeFileLocal(ctx context.Context, path string, content string) error {
 	absPath := b.resolvePath(path)
 
-	logger.Infof("ACP: Writing file: %s", absPath)
+	logger.Infof("ACP: Writing file locally: %s", absPath)
 
 	// Ensure parent directory exists
 	dir := filepath.Dir(absPath)

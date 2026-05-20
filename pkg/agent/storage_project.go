@@ -174,6 +174,7 @@ func (s *ProjectSessionStorage) SaveSession(session *Session) error {
 		LastSeq:           maxSeqFromEvents(events, lastDiskSeq),
 		State:             string(session.GetState()),
 		LastCompactionSeq: session.LastCompactionSeq,
+		Goal:              session.Goal,
 	}
 	session.LastPersistedSeq = maxSeqFromEvents(events, lastDiskSeq)
 
@@ -223,6 +224,19 @@ func (s *ProjectSessionStorage) LoadSession(id string) (*Session, error) {
 		session.LastCompactionSeq = entry.LastCompactionSeq
 		if entry.State != "" {
 			session.State = SessionState(entry.State)
+		}
+		if entry.Goal != nil {
+			session.Goal = entry.Goal
+			session.goalContext = NewGoalContextFromState(nil, entry.Goal)
+			session.goalContext.SetOnChange(func(state GoalState) {
+				session.mutex.Lock()
+				defer session.mutex.Unlock()
+				if state.Condition == "" && !state.Active && state.AchievedAt == nil {
+					session.Goal = nil
+					return
+				}
+				session.Goal = &state
+			})
 		}
 	}
 	if session.State == "" {
@@ -540,7 +554,10 @@ func (s *ProjectSessionStorage) loadIndex() ([]SessionIndexEntry, error) {
 
 	var index []SessionIndexEntry
 	if err := json.Unmarshal(data, &index); err != nil {
-		return nil, fmt.Errorf("failed to parse index: %w", err)
+		// Log warning but return empty index for fault tolerance
+		// This allows operations to continue even with corrupted index files
+		logger.Warnf("Failed to parse index file at %s: %v. Returning empty index for fault tolerance.", s.indexPath, err)
+		return []SessionIndexEntry{}, nil
 	}
 
 	return index, nil

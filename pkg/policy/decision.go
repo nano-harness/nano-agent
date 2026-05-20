@@ -5,11 +5,8 @@ import "fmt"
 type Action string
 
 const (
-	ActionContinue   Action = "continue"
-	ActionTerminate  Action = "terminate"
-	ActionRequestLLM Action = "request_llm"
-	ActionExecute    Action = "execute"
-	ActionComplete   Action = "complete"
+	ActionContinue  Action = "continue"
+	ActionTerminate Action = "terminate"
 )
 
 type Decision struct {

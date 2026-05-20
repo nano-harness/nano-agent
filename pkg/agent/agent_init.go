@@ -176,7 +176,7 @@ func newAgentLLMClient(cfg *config.Config, toolbox *tools.Toolbox) llm.LLMClient
 		)
 	}
 	if len(fallbacks) == 0 {
-		return llm.NewClient(primary.APIKey, primary.BaseURL, primary.Model, toolbox.List())
+		return llm.NewClientForRoute(primary, toolbox.List(), cfg)
 	}
 	routes := append([]llm.ResolvedRoute{primary}, fallbacks...)
 	return llm.NewMultiRouteClient(routes, toolbox.List(), cfg)
@@ -354,6 +354,7 @@ func newAgentSkillManager(cfg *config.Config, workingDir string, stateStore *con
 	if stateStore != nil {
 		sm.SetStateStore(stateStore)
 	}
+	sm.EnableBuiltinSkills(cfg.Skills.AutoActivate)
 	if err := sm.Discover(); err != nil {
 		logger.Warnf("Failed to discover skills: %v", err)
 		return nil
@@ -365,6 +366,11 @@ func newAgentSkillManager(cfg *config.Config, workingDir string, stateStore *con
 			if err := sm.ActivateSkill(skillName); err != nil {
 				logger.Warnf("Failed to restore active skill %q: %v", skillName, err)
 			}
+		}
+	}
+	for _, skillName := range cfg.Skills.AutoActivate {
+		if err := sm.ActivateSkill(skillName); err != nil {
+			logger.Warnf("Failed to auto-activate skill %q: %v", skillName, err)
 		}
 	}
 
@@ -408,18 +414,58 @@ func newAgentHookEngine(cfg *config.Config, workingDir string) *middleware.HookE
 				continue
 			}
 
-			hooks = append(hooks, middleware.Hook{
+			// Default to command type if not specified
+			hookType := hookservice.HookType(hookCfg.Type)
+			if hookType == "" {
+				hookType = hookservice.HookTypeCommand
+			}
+
+			h := middleware.Hook{
 				Name:          hookCfg.Name,
 				Event:         hookservice.Event(hookCfg.Event),
 				Pattern:       hookCfg.Pattern,
+				Type:          hookType,
 				Command:       hookCfg.Command,
+				Enabled:       hookCfg.Enabled,
 				FailurePolicy: hookservice.FailurePolicy(hookCfg.FailurePolicy),
 				EnvWhitelist:  hookCfg.EnvWhitelist,
 				Async:         hookCfg.Async,
 				AsyncRewake:   hookCfg.AsyncRewake,
 				Once:          hookCfg.Once,
 				StatusMessage: hookCfg.StatusMessage,
-			})
+			}
+
+			// Translate HTTP sub-config
+			if hookCfg.HTTP != nil {
+				h.HTTPConfig = &hookservice.HTTPHookConfig{
+					URL:            hookCfg.HTTP.URL,
+					Method:         hookCfg.HTTP.Method,
+					Headers:        hookCfg.HTTP.Headers,
+					URLAllowlist:   hookCfg.HTTP.URLAllowlist,
+					AllowedEnvVars: hookCfg.HTTP.AllowedEnvVars,
+					TimeoutSeconds: hookCfg.HTTP.TimeoutSeconds,
+					MaxResponseKB:  hookCfg.HTTP.MaxResponseKB,
+				}
+			}
+
+			// Translate Prompt sub-config
+			if hookCfg.Prompt != nil {
+				h.PromptConfig = &hookservice.PromptHookConfig{
+					Prompt:    hookCfg.Prompt.Prompt,
+					Model:     hookCfg.Prompt.Model,
+					MaxTokens: hookCfg.Prompt.MaxTokens,
+				}
+			}
+
+			// Translate Agent sub-config
+			if hookCfg.Agent != nil {
+				h.AgentConfig = &hookservice.AgentHookConfig{
+					Agent: hookCfg.Agent.Agent,
+					Task:  hookCfg.Agent.Task,
+				}
+			}
+
+			hooks = append(hooks, h)
 		}
 	}
 

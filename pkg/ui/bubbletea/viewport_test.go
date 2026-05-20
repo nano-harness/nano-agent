@@ -76,6 +76,8 @@ func TestViewportPageScroll(t *testing.T) {
 
 func TestViewportVisibleRange(t *testing.T) {
 	vp := NewViewportState(10)
+	// Disable overscan to test pure visible-range semantics.
+	vp.OverscanRows = 0
 
 	// Test with 5 messages of varying heights
 	heights := []int{2, 3, 5, 4, 6} // total = 20 lines
@@ -99,6 +101,74 @@ func TestViewportVisibleRange(t *testing.T) {
 	// Should start somewhere in the middle
 	if start < 1 || start > 2 {
 		t.Errorf("Expected start index 1 or 2, got %d", start)
+	}
+}
+
+// TestViewportVisibleRangeOverscan verifies the default OverscanRows widens
+// the materialized range above and below the literal viewport.
+func TestViewportVisibleRangeOverscan(t *testing.T) {
+	vp := NewViewportState(10)
+	// 200 messages of height 1 — total 200 lines, well beyond overscan.
+	heights := make([]int, 200)
+	for i := range heights {
+		heights[i] = 1
+	}
+	vp.SetTotalHeight(200)
+	vp.ScrollOffset = 100
+	vp.IsSticky = false
+
+	start, end := vp.VisibleRange(heights)
+	// With ScrollOffset=100, ViewportHeight=10, OverscanRows=80 by default:
+	//   viewportTop    = 100 - 80 = 20
+	//   viewportBottom = 100 + 10 + 80 = 190
+	// So range should be roughly [20, 190).
+	if start != 20 {
+		t.Errorf("expected start ~20 with overscan, got %d", start)
+	}
+	if end != 190 {
+		t.Errorf("expected end ~190 with overscan, got %d", end)
+	}
+}
+
+// TestViewportVisibleRangeMaxMounted verifies the MaxMounted cap.
+func TestViewportVisibleRangeMaxMounted(t *testing.T) {
+	vp := NewViewportState(10)
+	vp.MaxMounted = 50
+	heights := make([]int, 1000)
+	for i := range heights {
+		heights[i] = 1
+	}
+	vp.SetTotalHeight(1000)
+	vp.ScrollOffset = 500
+	vp.IsSticky = false
+
+	start, end := vp.VisibleRange(heights)
+	if end-start > 50 {
+		t.Errorf("expected at most 50 mounted messages, got %d (start=%d end=%d)", end-start, start, end)
+	}
+}
+
+// TestViewportVisibleRangeBinarySearch sanity-checks that the binary search
+// produces the same start/end as the prior linear scan on a 10k-message list.
+func TestViewportVisibleRangeBinarySearch(t *testing.T) {
+	vp := NewViewportState(40)
+	vp.OverscanRows = 0
+	vp.MaxMounted = 0
+	heights := make([]int, 10000)
+	for i := range heights {
+		heights[i] = 1
+	}
+	vp.SetTotalHeight(10000)
+	vp.ScrollOffset = 7777
+	vp.IsSticky = false
+
+	start, end := vp.VisibleRange(heights)
+	if start != vp.ScrollOffset {
+		t.Errorf("expected start=%d, got %d", vp.ScrollOffset, start)
+	}
+	wantEnd := vp.ScrollOffset + vp.ViewportHeight
+	if end != wantEnd {
+		t.Errorf("expected end=%d, got %d", wantEnd, end)
 	}
 }
 

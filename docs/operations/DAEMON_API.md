@@ -4,6 +4,18 @@
 
 本文面向 Web/桌面客户端实现者，描述 nano daemon 的 REST 与 WebSocket 协议。当前版本为 v5，覆盖 daemon 模式新增的模型发现、MCP、命令、记忆、监控、会话生命周期、team-lead 与 scheduler API。自动化场景优先使用 `nano daemon execute --json`；交互式 UI 建议通过 WebSocket 消费事件流。
 
+
+## Binary engine contract
+
+For orchestrators that do not need a long-lived daemon, use `nano binary exec`. It accepts prompt args, or reads the prompt from stdin when args are omitted:
+
+```bash
+cat prompt.txt | nano binary exec
+nano binary exec < prompt.txt
+```
+
+Binary mode appends a `<<<NANO_RESULT>>>` JSON summary by default and supports `NANO_BINARY_RESULT_FORMAT=plain|json|both`, semantic exit codes, `--sandbox=auto|on|off`, and `--on-exit-cmd`. See `docs/integration/EMBED_AS_ENGINE.md` for the full embedding contract.
+
 ## 1. 协议总览
 
 | 项 | 说明 |
@@ -26,6 +38,7 @@
 | GET | `/api/v1/status` | 是 | 是 | daemon/agent 状态 |
 | GET | `/api/v1/models` | 是 | 是 | 列出已知模型提供商预设 |
 | GET | `/api/v1/models/doctor` | 是 | 是 | 检查当前模型配置归属与识别结果 |
+| GET | `/api/v1/model/routes` | 是 | 是 | 列出当前配置的模型路由与健康状态 |
 | GET | `/api/v1/events?since_seq=N` | 是 | 是 | 查询 active task / team session 事件 |
 | GET | `/api/v1/audit?since_seq=N` | 是 | 是 | 查询 sandbox、审批、权限和错误审计事件 |
 | GET | `/api/v1/mcp/status` | 是 | 是 | MCP 开关、连接、资源、提示与工具统计 |
@@ -82,14 +95,25 @@ export interface StatusResponse { agent_status: string; mcp_enabled: boolean; me
 ```bash
 curl -H "X-API-Key: $NANO_API_KEY" http://127.0.0.1:8080/api/v1/models
 curl -H "X-API-Key: $NANO_API_KEY" http://127.0.0.1:8080/api/v1/models/doctor
+curl -H "X-API-Key: $NANO_API_KEY" http://127.0.0.1:8080/api/v1/model/routes
 ```
 
 ```ts
 export interface ModelsResponse { providers: unknown[] }
 export interface ModelDoctorResponse { configured_model: unknown; provider: string; base_url: string; known: boolean }
+export interface ModelRouteInfo {
+  name: string;
+  provider: string;
+  model: string;
+  base_url: string;
+  profile: string;
+  breaker_state: 'closed' | 'open' | 'half_open' | 'unavailable';
+  metrics: Record<string, unknown>;
+}
+export type ModelRoutesResponse = ModelRouteInfo[];
 ```
 
-`/models` 返回内置 provider presets；`/models/doctor` 根据当前 `base_url` 与 `model` 推断 provider，适合设置页诊断。
+`/models` 返回内置 provider presets；`/models/doctor` 根据当前 `base_url` 与 `model` 推断 provider，适合设置页诊断；`/model/routes` 返回当前配置的模型路由列表及其熔断器状态与健康指标，适合监控与故障排查。
 
 ### 3.3 MCP
 
@@ -556,7 +580,7 @@ export type ServerFrame = StreamEvent | ToolApprovalRequestFrame | ToolApprovalA
 
 ## 10. 兼容性与版本
 
-v5 在 v4 Web 客户端指南基础上补齐 daemon 模式新增 REST API：`models`、`mcp`、`commands`、`memory`、`metrics`、`system/health`、session stats/context/state/resume、team-lead get/delete/execute/cancel/events 与 scheduler tasks；WebSocket 文档同步补充 `lead_input_ack`、`cancel_ack`、`tool_approval_ack`、`status`、`completion.last_seq`、`images` 与当前鉴权方式。
+v5 在 v4 Web 客户端指南基础上补齐 daemon 模式新增 REST API：`models`、`models/doctor`、`model/routes`（模型路由与熔断器健康状态）、`mcp`、`commands`、`memory`、`metrics`、`system/health`、session stats/context/state/resume、team-lead get/delete/execute/cancel/events 与 scheduler tasks；WebSocket 文档同步补充 `lead_input_ack`、`cancel_ack`、`tool_approval_ack`、`status`、`completion.last_seq`、`images` 与当前鉴权方式。
 
 v4 破坏性变更：删除旧 Adapter `SendEvent/SubmitChannel/CancelChannel`；删除 `lead-chat --plain` 与 readline 纯文本输出；删除 daemon stream-exec 的 `fmt.Print` 渲染分支；脚本应迁移到 `nano daemon execute --json`。
 

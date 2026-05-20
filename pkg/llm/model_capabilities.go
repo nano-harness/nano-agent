@@ -76,6 +76,16 @@ var modelCapabilitiesRegistry = map[string]modelCapabilityEntry{ //nolint:gochec
 	"mxbai-embed-large":      {"ollama", "mxbai Embed Large", ModelCapabilities{Embedding: true}},
 	"text-embedding-3-small": {"openai", "Text Embedding 3 Small", ModelCapabilities{Embedding: true}},
 	"text-embedding-3-large": {"openai", "Text Embedding 3 Large", ModelCapabilities{Embedding: true}},
+	// Anthropic Claude models
+	"claude-opus-4.6":   {"anthropic", "Claude Opus 4.6", chatCapabilities(capReasoning, capVision, capParallelToolCalls, capLongContext)},
+	"claude-sonnet-4.6": {"anthropic", "Claude Sonnet 4.6", chatCapabilities(capReasoning, capVision, capParallelToolCalls, capLongContext)},
+	"claude-sonnet-4.5": {"anthropic", "Claude Sonnet 4.5", chatCapabilities(capReasoning, capVision, capParallelToolCalls, capLongContext)},
+	"claude-sonnet-4":   {"anthropic", "Claude Sonnet 4", chatCapabilities(capVision, capParallelToolCalls, capLongContext)},
+	"claude-haiku-4.5":  {"anthropic", "Claude Haiku 4.5", chatCapabilities(capVision, capLongContext)},
+	"claude-3.7-sonnet": {"anthropic", "Claude 3.7 Sonnet", chatCapabilities(capReasoning, capVision, capLongContext)},
+	"claude-3-5-sonnet": {"anthropic", "Claude 3.5 Sonnet", chatCapabilities(capVision, capLongContext)},
+	"claude-3-5-haiku":  {"anthropic", "Claude 3.5 Haiku", chatCapabilities(capVision, capLongContext)},
+	"claude-3-opus":     {"anthropic", "Claude 3 Opus", chatCapabilities(capVision, capLongContext)},
 }
 
 var providerPresetDefinitions = []struct { //nolint:gochecknoglobals
@@ -86,6 +96,7 @@ var providerPresetDefinitions = []struct { //nolint:gochecknoglobals
 	models      []string
 }{
 	{"openai", "OpenAI", defaultOpenAIBaseURL, "OPENAI_API_KEY", []string{"gpt-5.4", "gpt-5", "gpt-4.1", "gpt-4o", "o3", "o4-mini", "text-embedding-3-small", "text-embedding-3-large"}},
+	{"anthropic", "Anthropic", "https://api.anthropic.com", "ANTHROPIC_API_KEY", []string{"claude-opus-4.6", "claude-sonnet-4.6", "claude-sonnet-4.5", "claude-haiku-4.5"}},
 	{"moonshot", "Moonshot / Kimi", "https://api.moonshot.cn/v1", "MOONSHOT_API_KEY", []string{"kimi-k2.5", "kimi-k2-0905", "kimi-k2"}},
 	{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", []string{"deepseek-chat", "deepseek-v3.2", "deepseek-r1"}},
 	{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY", []string{"gemini-2.5-pro", "gemini-2.5-flash"}},
@@ -194,6 +205,8 @@ func InferProviderID(baseURL, modelName string) string {
 	switch {
 	case lowerURL == "" || lowerURL == defaultOpenAIBaseURL:
 		return "openai"
+	case strings.Contains(lowerURL, "anthropic"):
+		return "anthropic"
 	case strings.Contains(lowerURL, "moonshot"):
 		return "moonshot"
 	case strings.Contains(lowerURL, "deepseek"):

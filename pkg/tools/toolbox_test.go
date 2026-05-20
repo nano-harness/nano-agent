@@ -372,3 +372,47 @@ func TestToolboxConcurrency(t *testing.T) {
 		t.Errorf("expected 10 results, got %d", count)
 	}
 }
+
+func TestMCPToolNameResolution(t *testing.T) {
+	// This test verifies that toolbox.Get() can resolve MCP tools by their original name
+	// even when they are registered with the mcp_<server>_ prefix.
+
+	// Skip if we can't create a simple mock environment
+	tempDir, err := os.MkdirTemp("", "toolbox_mcp_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	toolbox := NewToolbox(tempDir, nil, nil)
+
+	// Test 1: Non-existent tool should return false
+	t.Run("non-existent tool", func(t *testing.T) {
+		_, exists := toolbox.Get("nonexistent_tool")
+		if exists {
+			t.Error("Expected tool to not exist")
+		}
+	})
+
+	// Test 2: Existing built-in tool should be found
+	t.Run("existing built-in tool", func(t *testing.T) {
+		tool, exists := toolbox.Get("read_file")
+		if !exists {
+			t.Error("Expected to find read_file tool")
+		}
+		if tool == nil {
+			t.Error("Expected non-nil tool")
+		}
+	})
+
+	// Test 3: resolveMCPToolByOriginalName with no MCP client should return nil, false
+	t.Run("resolve MCP tool without MCP client", func(t *testing.T) {
+		tool, exists := toolbox.resolveMCPToolByOriginalName("some.tool")
+		if exists {
+			t.Error("Expected no match without MCP client")
+		}
+		if tool != nil {
+			t.Error("Expected nil tool without MCP client")
+		}
+	})
+}

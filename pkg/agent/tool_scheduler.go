@@ -52,6 +52,20 @@ func approvalHandlerFromCtx(ctx context.Context) func(*ToolCallInfo) bool {
 	return h
 }
 
+// sessionIDFromContext 读取 turn_executor 注入的 TurnContext.SessionID。
+// 工具相关 hook（PreToolUse/PostToolUse/PostToolUseFailure）的 params 不包含
+// session_id；外部 hook（如 clawd-on-desk）依赖该字段路由事件到正确的 session。
+// 见 pkg/agent/turn_executor.go:32 的 context.WithValue。
+func sessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if tc, ok := ctx.Value(interfaces.TurnContextKey{}).(interfaces.TurnContext); ok {
+		return tc.SessionID
+	}
+	return ""
+}
+
 // ToolCallStatus represents the status of a tool call
 type ToolCallStatus string
 
@@ -102,19 +116,20 @@ type ToolCallInfo struct {
 
 // ToolScheduler manages parallel execution of tools with advanced state management
 type ToolScheduler struct {
-	toolbox           *tools.Toolbox
-	eventHandler      func(event.StreamEvent)
-	recovery          *ToolRecoveryStrategy
-	toolCalls         map[string]*ToolCallInfo
-	mutex             sync.RWMutex
-	onUpdate          func([]*ToolCallInfo)
-	onComplete        func([]*ToolCallInfo)
-	outputHandler     func(string, string)     // callID, output chunk
-	approvalHandler   func(*ToolCallInfo) bool // returns true if approved
-	approvalHandlerV2 func(*ToolCallInfo) ApprovalDecision
-	allowedExact      map[string]struct{}
-	allowedPatterns   []string
-	permissionManager *permission.Manager
+	toolbox               *tools.Toolbox
+	eventHandler          func(event.StreamEvent)
+	recovery              *ToolRecoveryStrategy
+	toolCalls             map[string]*ToolCallInfo
+	mutex                 sync.RWMutex
+	onUpdate              func([]*ToolCallInfo)
+	onComplete            func([]*ToolCallInfo)
+	outputHandler         func(string, string)     // callID, output chunk
+	approvalHandler       func(*ToolCallInfo) bool // returns true if approved
+	approvalHandlerV2     func(*ToolCallInfo) ApprovalDecision
+	allowedExact          map[string]struct{}
+	allowedPatterns       []string
+	permissionManager     *permission.Manager
+	progressiveDisclosure *ProgressiveDisclosure
 	// securityDecisions caches the pre-computed security Decision for each tool
 	// call ID so it can be injected into the execution context.
 	securityDecisions map[string]*middleware.Decision
@@ -183,6 +198,13 @@ func (ts *ToolScheduler) SetWorkDir(dir string) {
 	ts.mutex.Lock()
 	defer ts.mutex.Unlock()
 	ts.workDir = dir
+}
+
+// SetProgressiveDisclosure sets the ProgressiveDisclosure instance for schema auto-injection.
+func (ts *ToolScheduler) SetProgressiveDisclosure(pd *ProgressiveDisclosure) {
+	ts.mutex.Lock()
+	defer ts.mutex.Unlock()
+	ts.progressiveDisclosure = pd
 }
 
 func (ts *ToolScheduler) addAllowlistRules(call *ToolCallInfo) {
@@ -451,7 +473,54 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 		// Check if tool exists
 		toolInstance, exists := ts.toolbox.Get(tool.Name)
 		if !exists {
-			tr := &interfaces.ToolResult{
+			// Try schema auto-injection for MCP tools in ProgressiveDisclosure
+			tr := ts.trySchemaAutoInjection(tool.Name)
+			if tr != nil {
+				// Schema injection succeeded, return structured result
+				ts.mutex.Lock()
+				ts.toolCalls[tool.ID] = toolCall
+				ts.mutex.Unlock()
+				if ts.eventHandler != nil {
+					start := event.NewStreamEvent(event.EventTypeWorkerStart, "agent_tool_scheduler")
+					start.WorkerID = toolCall.ID
+					start = start.WithContent(toolCall.Name)
+					start = start.WithMetadata("status", string(toolCall.Status))
+					ts.eventHandler(start)
+
+					ts.eventHandler(event.StreamEvent{
+						Type: event.EventTypeToolCall,
+						ToolCalls: []*tools.ToolCall{{
+							ID:        toolCall.ID,
+							Name:      toolCall.Name,
+							Arguments: toolCall.Parameters,
+						}},
+					})
+					ts.eventHandler(event.StreamEvent{
+						Type: event.EventTypeToolResult,
+						ToolResult: &tools.ToolResult{
+							ID:      toolCall.ID,
+							Content: tr.LLMContent,
+							Error:   "",
+						},
+					})
+					ts.eventHandler(event.StreamEvent{
+						Type:   event.EventTypeToolUse,
+						Source: "agent_turn",
+						ToolUse: &event.ToolUse{
+							ID:         toolCall.ID,
+							ToolName:   toolCall.Name,
+							Parameters: toolCall.Parameters,
+							Status:     string(StatusSuccess),
+							Result:     tr.UserContent,
+						},
+					})
+				}
+				ts.setStatus(tool.ID, StatusSuccess, tr, nil)
+				continue
+			}
+
+			// Tool not found and no schema injection possible
+			tr = &interfaces.ToolResult{
 				Success:     false,
 				Error:       "tool not found",
 				Metadata:    map[string]interface{}{"code": "tool_not_found", "tool_name": tool.Name},
@@ -506,7 +575,14 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 		ts.mutex.RUnlock()
 		hookRequiresApproval := false
 		if hookEngine != nil {
-			hookDecision, err := hookEngine.Execute(ctx, middleware.HookPreToolUse, tool.Name, tool.Parameters)
+			preParams := make(map[string]interface{}, len(tool.Parameters)+1)
+			for k, v := range tool.Parameters {
+				preParams[k] = v
+			}
+			if sid := sessionIDFromContext(ctx); sid != "" {
+				preParams["session_id"] = sid
+			}
+			hookDecision, err := hookEngine.Execute(ctx, middleware.HookPreToolUse, tool.Name, preParams)
 			if err != nil {
 				logger.Warnf("PreToolUse hook execution error for tool %s: %v", tool.Name, err)
 			}
@@ -1480,9 +1556,12 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 		if execResult.Error != nil {
 			hookEvent = middleware.HookPostToolUseFailure
 		}
-		hookParams := make(map[string]interface{})
+		hookParams := make(map[string]interface{}, len(toolCall.Parameters)+3)
 		for k, v := range toolCall.Parameters {
 			hookParams[k] = v
+		}
+		if sid := sessionIDFromContext(callCtx); sid != "" {
+			hookParams["session_id"] = sid
 		}
 		if execResult.Result != nil {
 			hookParams["_result"] = execResult.Result
@@ -1837,5 +1916,56 @@ func (ts *ToolScheduler) ClearSpecificToolCalls(toolIDs []string) {
 				logger.Infof("Cleared completed tool call %s", id)
 			}
 		}
+	}
+}
+
+// trySchemaAutoInjection attempts to auto-inject the schema for an MCP tool
+// that exists in the ProgressiveDisclosure index but hasn't been expanded yet.
+// Returns a structured ToolResult if injection succeeds, nil otherwise.
+func (ts *ToolScheduler) trySchemaAutoInjection(toolName string) *interfaces.ToolResult {
+	ts.mutex.RLock()
+	pd := ts.progressiveDisclosure
+	ts.mutex.RUnlock()
+
+	if pd == nil {
+		return nil
+	}
+
+	// Check if tool exists in ProgressiveDisclosure index
+	summary, exists := pd.GetTool(toolName)
+	if !exists {
+		return nil
+	}
+
+	// Mark as expanded so next prompt includes full schema
+	pd.MarkExpanded(toolName)
+	logger.Infof("Auto-injected schema for tool '%s' into context", toolName)
+
+	// Build structured response telling LLM to retry
+	canonicalName := ""
+	if ts.toolbox != nil && ts.toolbox.IsMCPEnabled() {
+		serverName, tool, found := ts.toolbox.GetMCPToolByOriginalName(toolName)
+		if found && tool != nil {
+			canonicalName = (*tool).Name()
+			logger.Debugf("Resolved canonical name for '%s': %s (server: %s)", toolName, canonicalName, serverName)
+		}
+	}
+
+	message := fmt.Sprintf("Tool '%s' was not in active schema set. Schema has now been loaded into your toolbox. Please call the tool again with the same arguments on your next turn.", toolName)
+	if canonicalName != "" && canonicalName != toolName {
+		message = fmt.Sprintf("Tool '%s' schema has been loaded. Note: the registered name is '%s'. Please retry your call.", toolName, canonicalName)
+	}
+
+	return &interfaces.ToolResult{
+		Success: true,
+		Metadata: map[string]interface{}{
+			"status":         "schema_injected",
+			"tool_name":      toolName,
+			"canonical_name": canonicalName,
+			"server":         summary.Server,
+			"category":       summary.Category,
+		},
+		LLMContent:  message,
+		UserContent: fmt.Sprintf("工具 '%s' 的 schema 已加载，请在下一轮重试。", toolName),
 	}
 }

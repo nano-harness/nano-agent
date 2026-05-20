@@ -83,18 +83,54 @@ func (c *MockACPClient) ReadNotification() (*RPCNotification, error) {
 	return &notif, nil
 }
 
+// Initialize calls initialize
+func (c *MockACPClient) Initialize() (*InitializeResult, error) {
+	params := InitializeParams{
+		ProtocolVersion: ProtocolVersion,
+		ClientCapabilities: ClientCapabilities{
+			FS: &FSCapabilities{
+				ReadTextFile:  true,
+				WriteTextFile: true,
+			},
+			Terminal: true,
+		},
+		ClientInfo: ClientInfo{
+			Name:    "mock-client",
+			Title:   "Mock ACP Client",
+			Version: "1.0.0",
+		},
+	}
+
+	resp, err := c.SendRequest("initialize", params, "init-1")
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("RPC error: %s", resp.Error.Message)
+	}
+
+	var result InitializeResult
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
 // SessionNew calls session/new
 func (c *MockACPClient) SessionNew(cwd string) (*SessionNewResult, error) {
 	params := SessionNewParams{
 		CWD: cwd,
 		Capabilities: SessionCapabilities{
-			FS: &FSCapabilities{
-				Read:  true,
-				Write: true,
-			},
-			Terminal: &TerminalCapabilities{
-				Run: true,
-			},
+			Resume: emptyObj,
+			Close:  emptyObj,
+			List:   emptyObj,
 		},
 	}
 
@@ -120,26 +156,64 @@ func (c *MockACPClient) SessionNew(cwd string) (*SessionNewResult, error) {
 	return &result, nil
 }
 
-// SessionUpdate calls session/update and collects events
-func (c *MockACPClient) SessionUpdate(sessionID, message string) error {
-	params := SessionUpdateParams{
+// SessionPrompt calls session/prompt and collects events
+func (c *MockACPClient) SessionPrompt(sessionID, message string) (*SessionPromptResult, error) {
+	params := SessionPromptParams{
 		SessionID: sessionID,
-		Message: MessageContent{
-			Role:    "user",
-			Content: message,
+		Prompt: []ContentBlock{
+			{
+				Type: "text",
+				Text: message,
+			},
 		},
 	}
 
-	resp, err := c.SendRequest("session/update", params, 2)
+	resp, err := c.SendRequest("session/prompt", params, 2)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if resp.Error != nil {
-		return fmt.Errorf("RPC error: %s", resp.Error.Message)
+		return nil, fmt.Errorf("RPC error: %s", resp.Error.Message)
 	}
 
-	return nil
+	var result SessionPromptResult
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// SessionCancel sends a session/cancel notification
+func (c *MockACPClient) SessionCancel(sessionID string) error {
+	params := SessionCancelParams{
+		SessionID: sessionID,
+	}
+
+	// Notifications don't have an ID
+	notif := RPCNotification{
+		JSONRPC: "2.0",
+		Method:  "session/cancel",
+		Params:  params,
+	}
+
+	data, err := json.Marshal(notif)
+	if err != nil {
+		return fmt.Errorf("marshal notification: %w", err)
+	}
+
+	c.mu.Lock()
+	data = append(data, '\n')
+	_, err = c.writer.Write(data)
+	c.mu.Unlock()
+
+	return err
 }
 
 // SessionClose calls session/close

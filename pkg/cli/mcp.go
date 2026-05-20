@@ -45,7 +45,6 @@ func NewMCPCommand() *cobra.Command {
 
 	// Add enhanced subcommands
 	mcpCmd.AddCommand(newMCPStatusCommand())
-	mcpCmd.AddCommand(newMCPConfigCommand())
 	mcpCmd.AddCommand(newMCPAddCommand())
 	mcpCmd.AddCommand(newMCPAuthCommand())
 	mcpCmd.AddCommand(newMCPToolsCommand())
@@ -74,24 +73,6 @@ func newMCPStatusCommand() *cobra.Command {
 
 	cmd.Flags().Bool("verbose", false, "Show verbose status information")
 	cmd.Flags().BoolP("json", "j", false, "Output status in JSON format")
-	return cmd
-}
-
-// newMCPConfigCommand creates an interactive configuration command
-func newMCPConfigCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "config",
-		Short: "Interactive MCP configuration wizard",
-		Long: `Launch an interactive wizard to configure MCP servers:
-  • Add predefined servers (filesystem, git, web search, etc.)
-  • Configure custom servers with various transports
-  • Set authentication and security options
-  • Test server connections during setup`,
-		Run: runMCPConfig,
-	}
-
-	cmd.Flags().StringP("output", "o", "", "Save configuration to specific file")
-	cmd.Flags().BoolP("dry-run", "d", false, "Show configuration without saving")
 	return cmd
 }
 
@@ -381,61 +362,6 @@ func newMCPServersCommand() *cobra.Command {
 	cmd.AddCommand(newMCPServerTestCommand())
 
 	return cmd
-}
-
-// runMCPConfig runs the interactive MCP configuration wizard
-func runMCPConfig(cmd *cobra.Command, _ []string) {
-	wizard := mcp.NewConfigWizard()
-	wizCfg, err := wizard.Run()
-	if err != nil {
-		color.Red("❌ Configuration wizard failed: %v", err)
-		return
-	}
-
-	// Handle dry-run flag
-	if dryRun, _ := cmd.Flags().GetBool("dry-run"); dryRun {
-		out := struct {
-			EnableMCP bool              `yaml:"enable_mcp"`
-			MCP       *config.MCPConfig `yaml:"mcp"`
-		}{
-			EnableMCP: wizCfg.EnableClient,
-			MCP:       convertWizardMCPToConfig(wizCfg),
-		}
-		data, _ := yaml.Marshal(out)
-		fmt.Println("Configuration (dry-run, YAML):")
-		fmt.Println(string(data))
-		return
-	}
-
-	// Save configuration
-	outputFile, _ := cmd.Flags().GetString("output")
-	if outputFile == "" {
-		color.Green("✅ MCP configuration completed successfully!")
-	} else {
-		// Save YAML to the specified output path
-		out := struct {
-			EnableMCP bool              `yaml:"enable_mcp"`
-			MCP       *config.MCPConfig `yaml:"mcp"`
-		}{
-			EnableMCP: wizCfg.EnableClient,
-			MCP:       convertWizardMCPToConfig(wizCfg),
-		}
-		data, err := yaml.Marshal(out)
-		if err != nil {
-			color.Red("❌ Failed to marshal configuration: %v", err)
-			return
-		}
-		dir := filepath.Dir(outputFile)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			color.Red("❌ Failed to create directory %s: %v", dir, err)
-			return
-		}
-		if err := os.WriteFile(outputFile, data, 0644); err != nil {
-			color.Red("❌ Failed to write configuration to %s: %v", outputFile, err)
-			return
-		}
-		color.Green("✅ Configuration saved to: %s", outputFile)
-	}
 }
 
 // runMCPTools lists available MCP tools
@@ -1246,47 +1172,4 @@ func persistConfig(cfg *config.Config, configFile string) error {
 		return err
 	}
 	return os.WriteFile(configFile, data, 0o644)
-}
-
-// Helper: convert wizard MCP config (pkg/mcp) to global config MCP (pkg/config)
-func convertWizardMCPToConfig(m *mcp.MCPConfig) *config.MCPConfig {
-	if m == nil {
-		return nil
-	}
-
-	var tls *config.MCPTLSConfig
-	if m.TLSConfig != nil {
-		tls = &config.MCPTLSConfig{
-			Enabled:    m.TLSConfig.Enabled,
-			CertFile:   m.TLSConfig.CertFile,
-			KeyFile:    m.TLSConfig.KeyFile,
-			CAFile:     m.TLSConfig.CAFile,
-			SkipVerify: m.TLSConfig.SkipVerify,
-		}
-	}
-
-	servers := make([]config.MCPServerConfig, 0, len(m.MCPServers))
-	for _, s := range m.MCPServers {
-		servers = append(servers, config.MCPServerConfig{
-			Name:        s.Name,
-			Description: s.Description,
-			Command:     s.Command,
-			URL:         s.URL,
-			Transport:   s.Transport,
-			Headers:     s.Headers,
-			Enabled:     s.Enabled,
-			Timeout:     s.Timeout,
-		})
-	}
-
-	return &config.MCPConfig{
-		EnableClient:     m.EnableClient,
-		Servers:          servers,
-		DefaultTransport: m.DefaultTransport,
-		Timeout:          m.Timeout,
-		MaxRetries:       m.MaxRetries,
-		EnableAuth:       m.EnableAuth,
-		AuthTokens:       m.AuthTokens,
-		TLS:              tls,
-	}
 }

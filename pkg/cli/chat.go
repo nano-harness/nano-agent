@@ -177,6 +177,13 @@ func runChat(cmd *cobra.Command, args []string) error {
 			}
 			return fmt.Sprintf("✅ 已恢复 routine %s", strings.TrimSpace(taskID))
 		})
+		btAdapter.SetRoutinesRunner(func(taskID string) string {
+			taskID = strings.TrimSpace(taskID)
+			if err := btScheduler.Scheduler().RunTaskNow(taskID); err != nil {
+				return fmt.Sprintf("❌ 触发 routine 失败：%v", err)
+			}
+			return fmt.Sprintf("✅ 已触发 routine %s 立即执行", taskID)
+		})
 		btAdapter.SetNewSessionHandler(func() string {
 			return eng.Agent.StartNewSession()
 		})
@@ -208,11 +215,11 @@ func runChat(cmd *cobra.Command, args []string) error {
 	return adapter.Run(ctx, src)
 }
 
-// signalContext returns a context that is cancelled on SIGINT or SIGTERM
+// signalContext returns a context that is cancelled on SIGINT, SIGTERM, or SIGPIPE
 func signalContext() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGPIPE)
 
 	go func() {
 		<-sigCh

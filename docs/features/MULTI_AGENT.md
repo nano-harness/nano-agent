@@ -21,13 +21,13 @@ Profiles are loaded by `pkg/agentprofile`.
 
 ## Explicit invocation
 
-User input can explicitly target a profile:
+User input can explicitly target a profile via a slash command:
 
 ```text
-@reviewer check pkg/agent for regressions
+/reviewer check pkg/agent for regressions
 ```
 
-The preprocessor rewrites this to a `spawn_teammate` request with profile defaults.
+The slash dispatcher rewrites this to a `spawn_teammate` request with profile defaults. The `@` prefix is now reserved for file references.
 
 ## Teammate permissions
 

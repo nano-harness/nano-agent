@@ -224,6 +224,10 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 		var lastThinkingSendTime time.Time
 		const thinkingSendInterval = 300 * time.Millisecond
 		var lastSentReasoningLen int
+		// firstThinkingSent ensures the very first reasoning_content chunk is
+		// always forwarded to the UI immediately so fast reasoning streams
+		// cannot be entirely swallowed by the 300ms throttle window.
+		firstThinkingSent := false
 		var finishReason string
 		truncated := false
 
@@ -275,9 +279,15 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 					if reasoningStr, ok := deltaMap["reasoning_content"].(string); ok && reasoningStr != "" {
 						assembler.AddReasoning(reasoningStr)
 						// Send streaming thinking event with throttling to enable real-time display.
-						// Content is intentionally left empty to avoid overwriting any more
-						// informative title set by the initial thinking event.
-						if time.Since(lastThinkingSendTime) >= thinkingSendInterval {
+						// The first reasoning chunk is sent immediately so fast reasoning
+						// streams (that finish within the throttle window) are still
+						// visible in the UI. Subsequent chunks are throttled to avoid
+						// high-frequency redraws.
+						//
+						// ReasoningDelta only contains the unsent tail to prevent the UI
+						// from double-appending content; Reasoning contains the cumulative
+						// content so any consumer that prefers replace-semantics still works.
+						if !firstThinkingSent || time.Since(lastThinkingSendTime) >= thinkingSendInterval {
 							fullContent := assembler.Reasoning()
 							delta := fullContent[lastSentReasoningLen:]
 							sanitizedOnEvent(event.StreamEvent{
@@ -287,6 +297,7 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 							})
 							lastSentReasoningLen = len(fullContent)
 							lastThinkingSendTime = time.Now()
+							firstThinkingSent = true
 						}
 					}
 				}
@@ -819,8 +830,12 @@ func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []
 		}
 	}
 
-	// Send final thinking event with reasoning content if available
-	if reasoning != "" && reasoningActive {
+	// Send final thinking event with reasoning content if available.
+	// We emit the complete event whenever reasoning was actually received
+	// (even if reasoning was not explicitly enabled in config) so the UI
+	// can always backfill a missed first frame and properly persist the
+	// thinking message into scrollback.
+	if reasoning != "" {
 		finalThinkingEvent := event.StreamEvent{
 			Type:      event.EventTypeThinking,
 			Content:   "思考完成",
@@ -892,198 +907,6 @@ func finishMetadata(truncated bool, finishReason string) map[string]interface{} 
 		metadata["finish_reason"] = finishReason
 	}
 	return metadata
-}
-
-// CompressionConfig holds configuration for conversation compression
-type CompressionConfig struct {
-	MaxTokens             int
-	CompressionThreshold  float64
-	PreserveRecentTurns   int
-	EnableAutoCompression bool
-}
-
-// StreamingConversation manages a streaming conversation with tool support and compression
-// Inspired by google-gemini/gemini-cli's conversation management
-type StreamingConversation struct {
-	client                *Client
-	messages              []Message
-	onEvent               func(event.StreamEvent)
-	compressionConfig     CompressionConfig
-	lastCompressionInfo   map[string]interface{} //nolint:unused
-	enableAutoCompression bool
-	compressionThreshold  float64
-	maxConversationTurns  int
-	apiErrorHandler       *APIErrorHandler
-}
-
-// NewStreamingConversation creates a new streaming conversation
-func NewStreamingConversation(client *Client, systemPrompt string, onEvent func(event.StreamEvent)) *StreamingConversation {
-	messages := []Message{}
-	if systemPrompt != "" {
-		messages = append(messages, Message{
-			Role:    "system",
-			Content: systemPrompt,
-		})
-	}
-
-	// Get global config for context management
-	globalConfig := config.Get()
-
-	// Infer model profile from configured model name for dynamic context window sizing.
-	// Pass the model name as-is (empty string allowed); InferModelProfile applies
-	// its own conservative default when the model is unknown or empty.
-	modelName := ""
-	if globalConfig != nil {
-		modelName = globalConfig.Model
-	}
-	profile := InferModelProfile(modelName)
-
-	// Derive compression parameters from the inferred profile
-	maxTokens := int(float64(profile.ContextWindow) * 0.95) // 5% headroom
-	compressionThreshold := profile.ThresholdRatio
-	preserveRecentTurns := 6
-	enableAutoCompression := true
-
-	if globalConfig != nil {
-		// If the user explicitly specified a context window, recompute from it
-		if globalConfig.ContextConfig.ModelContextWindow > 0 {
-			overrideProfile := ComputeProfileFromContextWindow(globalConfig.ContextConfig.ModelContextWindow)
-			maxTokens = int(float64(overrideProfile.ContextWindow) * 0.95)
-			compressionThreshold = overrideProfile.ThresholdRatio
-		}
-		// User explicit max_tokens is the absolute highest priority
-		if v := globalConfig.ContextConfig.MaxTokens; v > 0 {
-			maxTokens = v
-		}
-		if r := globalConfig.ContextConfig.CompressionRatio; r > 0 && r < 1 {
-			// Convert compression ratio to threshold (threshold = 1 - ratio)
-			compressionThreshold = 1.0 - r
-		}
-		if globalConfig.ContextConfig.PreserveRecentTurns > 0 {
-			preserveRecentTurns = globalConfig.ContextConfig.PreserveRecentTurns
-		}
-		enableAutoCompression = globalConfig.ContextConfig.EnableCompression
-	}
-
-	return &StreamingConversation{
-		client:   client,
-		messages: messages,
-		onEvent:  onEvent,
-		compressionConfig: CompressionConfig{
-			EnableAutoCompression: enableAutoCompression,
-			MaxTokens:             maxTokens,
-			CompressionThreshold:  compressionThreshold,
-			PreserveRecentTurns:   preserveRecentTurns,
-		},
-		enableAutoCompression: enableAutoCompression,
-		compressionThreshold:  compressionThreshold,
-		maxConversationTurns:  100, // Increase for longer conversations
-		apiErrorHandler:       NewAPIErrorHandler(onEvent),
-	}
-}
-
-// SendMessage sends a user message and handles the streaming response
-func (sc *StreamingConversation) SendMessage(ctx context.Context, content string) error {
-	// Add user message
-	if content != "" {
-		sc.messages = append(sc.messages, Message{
-			Role:    "user",
-			Content: content,
-		})
-	}
-
-	// Process with tool calling support
-	return sc.Execute(ctx)
-}
-
-// Execute runs the conversation with the current messages
-func (sc *StreamingConversation) Execute(ctx context.Context) error {
-	return sc.processWithToolCalling(ctx)
-}
-
-// processWithToolCalling handles the recursive tool calling process
-func (sc *StreamingConversation) processWithToolCalling(ctx context.Context) error {
-	var currentResponse strings.Builder
-	var assistantMessageAdded bool
-	var toolCalls []tools.ToolCall
-
-	// Start streaming completion with retry mechanism
-	maxRetries := 3
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err := sc.client.StreamCompletion(ctx, sc.messages, func(streamEvent event.StreamEvent) {
-			// Forward event to callback
-			if sc.onEvent != nil {
-				sc.onEvent(streamEvent)
-			}
-
-			switch streamEvent.Type {
-			case event.EventTypeStreamContent:
-				// Handle streaming content for real-time display
-				currentResponse.WriteString(streamEvent.Content)
-
-			case event.EventTypeContent:
-				// Handle complete content for message storage
-				// This overwrites any accumulated streaming content
-				currentResponse.Reset()
-				currentResponse.WriteString(streamEvent.Content)
-
-				// Extract tool calls from the event
-				if len(streamEvent.ToolCalls) > 0 {
-					toolCalls = make([]tools.ToolCall, len(streamEvent.ToolCalls))
-					for i, tc := range streamEvent.ToolCalls {
-						toolCalls[i] = *tc
-					}
-				}
-			}
-		})
-
-		if err == nil {
-			// Success, exit retry loop
-			lastErr = nil
-			break
-		}
-
-		lastErr = err
-
-		// Use API error handler to analyze and handle the error
-		_, shouldRetry := sc.apiErrorHandler.HandleAPIError(ctx, err, 0, attempt)
-		if !shouldRetry || attempt >= maxRetries {
-			break
-		}
-	}
-
-	if lastErr != nil {
-		return lastErr
-	}
-
-	// Add assistant message with tool calls if present
-	if !assistantMessageAdded {
-		assistantMsg := Message{
-			Role:      "assistant",
-			Content:   currentResponse.String(),
-			ToolCalls: toolCalls,
-		}
-		sc.messages = append(sc.messages, assistantMsg)
-	}
-
-	return nil
-}
-
-// GetMessages returns the conversation history
-func (sc *StreamingConversation) GetMessages() []Message {
-	return sc.messages
-}
-
-// SetMessages sets the conversation history
-func (sc *StreamingConversation) SetMessages(messages []Message) {
-	sc.messages = messages
-}
-
-// AddMessages appends messages to the conversation history
-func (sc *StreamingConversation) AddMessages(messages []Message) {
-	sc.messages = append(sc.messages, messages...)
 }
 
 // UpdateTools updates the tools available to the LLM client

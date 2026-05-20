@@ -18,9 +18,17 @@ func cfg(enabled bool) *config.SandboxConfig {
 // ── PathChecker tests ─────────────────────────────────────────────────────────
 
 func TestPathChecker_DisabledAllowsAll(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("default blocked paths use Unix-style paths; skipping on Windows")
+	}
 	pc := NewPathChecker(cfg(false))
-	if err := pc.Check("/etc/passwd", OpRead); err != nil {
-		t.Fatalf("disabled checker should allow all: %v", err)
+	// With sandbox disabled, non-sensitive paths should be allowed
+	if err := pc.Check("/tmp/test.txt", OpRead); err != nil {
+		t.Fatalf("disabled checker should allow non-sensitive paths: %v", err)
+	}
+	// Default blacklist is ALWAYS enforced, even when sandbox is disabled
+	if err := pc.Check("/etc/passwd", OpRead); err == nil {
+		t.Fatal("default blacklist should block /etc/passwd even when sandbox is disabled")
 	}
 }
 
@@ -398,6 +406,27 @@ func TestBwrapArgs_NoNetworkNoShareNet(t *testing.T) {
 
 // ── macOS SandboxExecSandbox (profile contents) ───────────────────────────────
 
+// extractProfileFromWrappedArgs walks the wrapped argv produced by WrapCommand
+// (env -i KEY=val ... sandbox-exec -p <profile> cmd ...) and returns the SBPL
+// profile string. PR #183 changed WrapCommand to prepend /usr/bin/env -i ...
+// for environment sanitization, so the old "args[0] == -p" assumption is gone.
+func extractProfileFromWrappedArgs(t *testing.T, wrappedBin string, args []string) string {
+	t.Helper()
+	if wrappedBin != "/usr/bin/env" {
+		t.Fatalf("expected wrapper /usr/bin/env, got %q", wrappedBin)
+	}
+	for i, a := range args {
+		if a == "sandbox-exec" {
+			if i+2 >= len(args) || args[i+1] != "-p" {
+				t.Fatalf("expected 'sandbox-exec -p <profile>' substring, got tail: %v", args[i:])
+			}
+			return args[i+2]
+		}
+	}
+	t.Fatalf("'sandbox-exec' not found in wrapped args: %v", args)
+	return ""
+}
+
 func TestSandboxExec_ProfileDenyDefault(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("sandbox-exec test only relevant on macOS")
@@ -410,13 +439,7 @@ func TestSandboxExec_ProfileDenyDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if wrappedBin != "sandbox-exec" {
-		t.Errorf("expected sandbox-exec, got %q", wrappedBin)
-	}
-	if len(args) < 2 || args[0] != "-p" {
-		t.Fatalf("expected -p <profile> as first args, got: %v", args)
-	}
-	profile := args[1]
+	profile := extractProfileFromWrappedArgs(t, wrappedBin, args)
 	if !strings.Contains(profile, "(deny default)") {
 		t.Errorf("profile missing '(deny default)', got:\n%s", profile)
 	}
@@ -429,8 +452,8 @@ func TestSandboxExec_ProfileNetworkAllow(t *testing.T) {
 	c := cfg(true)
 	c.NetworkAccess = true
 	s := New(c, "/workspace")
-	_, args, _ := s.WrapCommand("/workspace", "sh", []string{"-c", "ls"})
-	profile := args[1]
+	wrappedBin, args, _ := s.WrapCommand("/workspace", "sh", []string{"-c", "ls"})
+	profile := extractProfileFromWrappedArgs(t, wrappedBin, args)
 	if !strings.Contains(profile, "(allow network*)") {
 		t.Errorf("expected '(allow network*)' in profile, got:\n%s", profile)
 	}
@@ -443,8 +466,8 @@ func TestSandboxExec_ProfileNetworkDeny(t *testing.T) {
 	c := cfg(true)
 	c.NetworkAccess = false
 	s := New(c, "/workspace")
-	_, args, _ := s.WrapCommand("/workspace", "sh", []string{"-c", "ls"})
-	profile := args[1]
+	wrappedBin, args, _ := s.WrapCommand("/workspace", "sh", []string{"-c", "ls"})
+	profile := extractProfileFromWrappedArgs(t, wrappedBin, args)
 	if !strings.Contains(profile, "(deny network*)") {
 		t.Errorf("expected '(deny network*)' in profile, got:\n%s", profile)
 	}

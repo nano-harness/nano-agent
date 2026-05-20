@@ -11,9 +11,9 @@ import (
 	btuitest "github.com/nano-harness/nano-agent/pkg/ui/bubbletea/testing"
 )
 
-func TestFilePicker_HashTriggersActive(t *testing.T) {
+func TestFilePicker_AtTriggersActive(t *testing.T) {
 	m := newFilePickerModel(t)
-	typeText(m, "#mod")
+	typeText(m, "@mod")
 
 	active, query, _, results := m.FilePickerState()
 	if !active || query != "mod" || len(results) == 0 {
@@ -21,19 +21,19 @@ func TestFilePicker_HashTriggersActive(t *testing.T) {
 	}
 }
 
-func TestFilePicker_DetectContext_NoHash(t *testing.T) {
+func TestFilePicker_DetectContext_NoAt(t *testing.T) {
 	m := newFilePickerModel(t)
 	typeText(m, "mod")
 
 	active, _, _, _ := m.FilePickerState()
 	if active {
-		t.Fatal("file picker should be inactive without a hash trigger")
+		t.Fatal("file picker should be inactive without an at trigger")
 	}
 }
 
 func TestFilePicker_NavigationArrows(t *testing.T) {
 	m := newFilePickerModel(t)
-	typeText(m, "#")
+	typeText(m, "@")
 	_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	_, _, cursor, _ := m.FilePickerState()
@@ -49,7 +49,7 @@ func TestFilePicker_NavigationArrows(t *testing.T) {
 
 func TestFilePicker_EnterInsertsPath(t *testing.T) {
 	m := newFilePickerModel(t)
-	typeText(m, "#go.mod")
+	typeText(m, "@go.mod")
 	_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if got := m.InputValue(); got != "@go.mod " {
@@ -59,25 +59,25 @@ func TestFilePicker_EnterInsertsPath(t *testing.T) {
 
 func TestFilePicker_EscCloses(t *testing.T) {
 	m := newFilePickerModel(t)
-	typeText(m, "#go")
+	typeText(m, "@go")
 	_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 
 	active, _, _, _ := m.FilePickerState()
 	if active {
 		t.Fatal("file picker should close on esc")
 	}
-	if got := m.InputValue(); got != "#go" {
+	if got := m.InputValue(); got != "@go" {
 		t.Fatalf("InputValue() = %q, want preserved input", got)
 	}
 }
 
-func TestFilePicker_MultipleHashes(t *testing.T) {
+func TestFilePicker_MultipleAts(t *testing.T) {
 	m := newFilePickerModel(t)
-	typeText(m, "#go.mod ")
-	typeText(m, "#README")
+	typeText(m, "@go.mod ")
+	typeText(m, "@README")
 	_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
-	if got := m.InputValue(); got != "#go.mod @README.md " {
+	if got := m.InputValue(); got != "@go.mod @README.md " {
 		t.Fatalf("InputValue() = %q, want both file mentions", got)
 	}
 }
@@ -86,7 +86,7 @@ func TestFilePicker_TeatestShowsPicker(t *testing.T) {
 	m := newFilePickerModel(t)
 	tm := btuitest.NewTeatestModel(t, m)
 	t.Cleanup(func() { _ = tm.Quit() })
-	tm.Type("#mod")
+	tm.Type("@mod")
 	btuitest.WaitForText(t, tm, "go\\.mod", time.Second)
 }
 

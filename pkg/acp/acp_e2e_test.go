@@ -125,18 +125,9 @@ func (c *E2ETestClient) SessionNew(cwd string) (*SessionNewResult, error) {
 	params := SessionNewParams{
 		CWD: cwd,
 		Capabilities: SessionCapabilities{
-			FS: &FSCapabilities{
-				Read:   true,
-				Write:  true,
-				List:   true,
-				Delete: true,
-			},
-			Terminal: &TerminalCapabilities{
-				Run:    true,
-				Input:  true,
-				Output: true,
-				Kill:   true,
-			},
+			Resume: emptyObj,
+			Close:  emptyObj,
+			List:   emptyObj,
 		},
 	}
 
@@ -165,7 +156,7 @@ func (c *E2ETestClient) FSRead(sessionID, path string) (string, error) {
 		"path":      path,
 	}
 
-	resp, err := c.sendRequest("fs/read", params)
+	resp, err := c.sendRequest("fs/read_text_file", params)
 	if err != nil {
 		return "", err
 	}
@@ -186,7 +177,7 @@ func (c *E2ETestClient) FSWrite(sessionID, path, content string) error {
 		"content":   content,
 	}
 
-	resp, err := c.sendRequest("fs/write", params)
+	resp, err := c.sendRequest("fs/write_text_file", params)
 	if err != nil {
 		return err
 	}
@@ -198,31 +189,10 @@ func (c *E2ETestClient) FSWrite(sessionID, path, content string) error {
 	return nil
 }
 
-// FSList lists directory contents
+// FSList lists directory contents (deprecated - not in latest ACP spec)
 func (c *E2ETestClient) FSList(sessionID, path string) ([]FSEntry, error) {
-	params := map[string]interface{}{
-		"sessionId": sessionID,
-		"path":      path,
-	}
-
-	resp, err := c.sendRequest("fs/list", params)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.Error != nil {
-		return nil, fmt.Errorf("RPC error: %s", resp.Error.Message)
-	}
-
-	result := resp.Result.(map[string]interface{})
-	entriesData, _ := json.Marshal(result["entries"])
-
-	var entries []FSEntry
-	if err := json.Unmarshal(entriesData, &entries); err != nil {
-		return nil, err
-	}
-
-	return entries, nil
+	// fs/list is not in the latest ACP spec, so we return empty for now
+	return []FSEntry{}, nil
 }
 
 // TerminalRun runs a terminal command
@@ -234,7 +204,7 @@ func (c *E2ETestClient) TerminalRun(sessionID, command, cwd string, env map[stri
 		"env":       env,
 	}
 
-	resp, err := c.sendRequest("terminal/run", params)
+	resp, err := c.sendRequest("terminal/create", params)
 	if err != nil {
 		return "", err
 	}
@@ -244,7 +214,7 @@ func (c *E2ETestClient) TerminalRun(sessionID, command, cwd string, env map[stri
 	}
 
 	result := resp.Result.(map[string]interface{})
-	return result["processId"].(string), nil
+	return result["terminalId"].(string), nil
 }
 
 // SessionClose closes a session
@@ -345,10 +315,6 @@ func TestACPE2EFilesystemOperations(t *testing.T) {
 			t.Error("Expected non-empty session ID")
 		}
 
-		if result.Capabilities.FS == nil || !result.Capabilities.FS.Read {
-			t.Error("Expected filesystem read capability")
-		}
-
 		t.Logf("Created session: %s", result.SessionID)
 	})
 
@@ -393,28 +359,14 @@ func TestACPE2EFilesystemOperations(t *testing.T) {
 
 	// Test 4: List directory
 	t.Run("ListDirectory", func(t *testing.T) {
+		// Note: fs/list is not in the latest ACP spec, so FSList returns empty
 		entries, err := client.FSList(sessionID, ".")
 		if err != nil {
 			t.Fatalf("FSList failed: %v", err)
 		}
 
-		// Should contain test.txt
-		found := false
-		for _, entry := range entries {
-			if entry.Name == "test.txt" {
-				found = true
-				if entry.IsDir {
-					t.Error("test.txt should not be a directory")
-				}
-				break
-			}
-		}
-
-		if !found {
-			t.Error("Expected to find test.txt in directory listing")
-		}
-
-		t.Logf("Found %d entries in directory", len(entries))
+		// Since fs/list is not in latest spec, we expect empty results
+		t.Logf("Found %d entries in directory (fs/list not in latest spec)", len(entries))
 	})
 
 	// Test 5: Write nested file
@@ -605,15 +557,6 @@ func TestACPE2EProtocolFlow(t *testing.T) {
 		}
 		sessionID := sessionResult.SessionID
 		t.Logf("✓ Session created: %s", sessionID)
-
-		// Verify capabilities
-		if sessionResult.Capabilities.FS == nil {
-			t.Error("Missing filesystem capabilities")
-		}
-		if sessionResult.Capabilities.Terminal == nil {
-			t.Error("Missing terminal capabilities")
-		}
-		t.Logf("✓ Capabilities verified")
 
 		// 2. Write some files using filesystem bridge
 		files := map[string]string{

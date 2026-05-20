@@ -306,7 +306,10 @@ func (c *MCPClient) createTransport(ctx context.Context, config MCPServerConfig)
 	case TransportType("sse"):
 		return nil, nil, fmt.Errorf("SSE transport is no longer supported; please use 'streamable' (HTTP) or 'stdio'")
 
-	case TransportStreamable:
+	case TransportStreamable, TransportType("http"):
+		if TransportType(config.Transport) == TransportType("http") {
+			logger.Warnf(`transport "http" is deprecated and will be removed in v0.4; alias to "streamable". Update config to silence this warning.`)
+		}
 		if config.URL == "" {
 			return nil, nil, fmt.Errorf("URL is required for streamable transport")
 		}
@@ -354,7 +357,7 @@ func (c *MCPClient) createTransport(ctx context.Context, config MCPServerConfig)
 		transport1, _ := mcp.NewInMemoryTransports()
 		return transport1, nil, nil
 
-	case TransportType("http"), TransportType("websocket"):
+	case TransportType("websocket"):
 		return nil, nil, fmt.Errorf(
 			"transport %q is no longer supported; use 'streamable' (HTTP) or 'stdio' instead. "+
 				"Migrate your config: change `transport: %s` to `transport: streamable` and keep the `url` field.",

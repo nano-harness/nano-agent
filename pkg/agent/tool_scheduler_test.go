@@ -11,6 +11,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
@@ -684,4 +685,126 @@ func (s *spyShellTool) Name() string { return "run_shell_command" }
 func (s *spyShellTool) Execute(ctx context.Context, params map[string]interface{}) (*interfaces.ToolResult, error) {
 	s.hadDecision = middleware.HasSecurityDecision(ctx)
 	return s.ShellTool.Execute(ctx, params)
+}
+
+// captureHook 实现 middleware.ProgrammaticHook，记录最近一次 Execute 调用的 params。
+type captureHook struct {
+	event      hookservice.Event
+	name       string
+	mu         sync.Mutex
+	lastParams map[string]interface{}
+	lastTool   string
+}
+
+func (h *captureHook) Name() string             { return h.name }
+func (h *captureHook) Event() hookservice.Event { return h.event }
+func (h *captureHook) Execute(_ context.Context, _ hookservice.Event, toolName string, params map[string]interface{}) (*hookservice.Decision, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastTool = toolName
+	h.lastParams = make(map[string]interface{}, len(params))
+	for k, v := range params {
+		h.lastParams[k] = v
+	}
+	return &hookservice.Decision{Action: hookservice.ActionAllow}, nil
+}
+
+func (h *captureHook) snapshot() (string, map[string]interface{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]interface{}, len(h.lastParams))
+	for k, v := range h.lastParams {
+		out[k] = v
+	}
+	return h.lastTool, out
+}
+
+func TestPreToolUseHook_IncludesSessionID(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+	hookEngine := middleware.NewHookEngine(nil)
+	cap := &captureHook{event: hookservice.EventPreToolUse, name: "capture-pre"}
+	hookEngine.RegisterProgrammaticHook(cap)
+
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     func(_ event.StreamEvent) {},
+		RecoveryStrategy: NewToolRecoveryStrategy(nil),
+	})
+	ts.SetHookEngine(hookEngine)
+
+	const wantSessionID = "session-pre-123"
+	ctx := context.WithValue(
+		context.Background(),
+		interfaces.TurnContextKey{},
+		interfaces.TurnContext{SessionID: wantSessionID},
+	)
+
+	if _, err := ts.ExecuteParallel(ctx, []ToolToExecute{{
+		ID:         "pre-hook-session",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "ls"},
+	}}); err != nil {
+		t.Fatalf("ExecuteParallel: %v", err)
+	}
+
+	_, params := cap.snapshot()
+	got, _ := params["session_id"].(string)
+	if got != wantSessionID {
+		t.Fatalf("PreToolUse params[session_id] = %q, want %q", got, wantSessionID)
+	}
+}
+
+func TestPostToolUseHook_IncludesSessionID(t *testing.T) {
+	ensureConfigLoaded(t)
+
+	tempDir := t.TempDir()
+	tb := newShellToolbox(t, tempDir)
+	hookEngine := middleware.NewHookEngine(nil)
+	capPost := &captureHook{event: hookservice.EventPostToolUse, name: "capture-post"}
+	capFail := &captureHook{event: hookservice.EventPostToolUseFailure, name: "capture-post-fail"}
+	hookEngine.RegisterProgrammaticHook(capPost)
+	hookEngine.RegisterProgrammaticHook(capFail)
+
+	ts := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          tb,
+		EventHandler:     func(_ event.StreamEvent) {},
+		RecoveryStrategy: NewToolRecoveryStrategy(nil),
+	})
+	ts.SetHookEngine(hookEngine)
+
+	const wantSessionID = "session-post-456"
+	ctx := context.WithValue(
+		context.Background(),
+		interfaces.TurnContextKey{},
+		interfaces.TurnContext{SessionID: wantSessionID},
+	)
+
+	// 成功路径 → PostToolUse
+	if _, err := ts.ExecuteParallel(ctx, []ToolToExecute{{
+		ID:         "post-hook-success",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "ls"},
+	}}); err != nil {
+		t.Fatalf("ExecuteParallel(success): %v", err)
+	}
+	if _, params := capPost.snapshot(); params["session_id"] != wantSessionID {
+		t.Fatalf("PostToolUse session_id = %v, want %q", params["session_id"], wantSessionID)
+	}
+
+	// 失败路径 → PostToolUseFailure
+	// Use an invalid command that will fail
+	if _, err := ts.ExecuteParallel(ctx, []ToolToExecute{{
+		ID:         "post-hook-failure",
+		Name:       "run_shell_command",
+		Parameters: map[string]interface{}{"command": "exit 1"},
+	}}); err != nil {
+		// ExecuteParallel doesn't return error, failure is in result
+		_ = err
+	}
+	if _, params := capFail.snapshot(); params["session_id"] != wantSessionID {
+		t.Fatalf("PostToolUseFailure session_id = %v, want %q", params["session_id"], wantSessionID)
+	}
 }

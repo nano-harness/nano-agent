@@ -321,9 +321,25 @@ func (tb *Toolbox) Unregister(name string) error {
 	return tb.registry.Unregister(name)
 }
 
-// Get retrieves a tool by name
+// Get retrieves a tool by name, with MCP tool name resolution.
+// If the exact name is not found and MCP is enabled, attempts to resolve
+// the original tool name (without the mcp_<server>_ prefix).
 func (tb *Toolbox) Get(name string) (interfaces.Tool, bool) {
-	return tb.registry.Get(name)
+	// First try exact match
+	tool, exists := tb.registry.Get(name)
+	if exists {
+		return tool, true
+	}
+
+	// If not found and MCP is enabled, try MCP tool name resolution
+	if tb.mcpClient != nil {
+		tool, exists = tb.resolveMCPToolByOriginalName(name)
+		if exists {
+			return tool, true
+		}
+	}
+
+	return nil, false
 }
 
 // List returns all available tools
@@ -348,6 +364,15 @@ func (tb *Toolbox) Schemas() map[string]*interfaces.ToolSchema {
 
 // Execute runs a tool with given parameters through ToolRuntime.
 func (tb *Toolbox) Execute(ctx context.Context, name string, params map[string]interface{}) (*interfaces.ToolResult, error) {
+	// 1. LLM may directly use MCP tool's original name (without mcp_<server>_ prefix).
+	//    registry only stores the rewritten registered name, so we need to resolve it first.
+	if _, ok := tb.registry.Get(name); !ok && tb.mcpClient != nil {
+		if resolved, ok := tb.resolveMCPToolByOriginalName(name); ok {
+			logger.Debugf("Resolved MCP tool '%s' to registered name '%s'", name, resolved.Name())
+			name = resolved.Name()
+		}
+	}
+
 	logger.Infof("Running tool: %s", name)
 
 	// Keep Execute safe for compatibility with legacy tests and callers that
@@ -823,6 +848,75 @@ func (tb *Toolbox) GetMCPStatus() map[string]interface{} {
 	}
 
 	return status
+}
+
+// resolveMCPToolByOriginalName resolves an MCP tool by its original name
+// (without the mcp_<server>_ prefix). Returns the tool if exactly one match
+// is found across all MCP servers. Returns nil, false if no match or multiple
+// matches are found (to avoid ambiguity).
+func (tb *Toolbox) resolveMCPToolByOriginalName(originalName string) (interfaces.Tool, bool) {
+	if tb.mcpClient == nil {
+		return nil, false
+	}
+
+	allTools := tb.mcpClient.GetAllTools()
+	var matches []interfaces.Tool
+
+	for serverName, tools := range allTools {
+		for _, toolInfo := range tools {
+			if toolInfo.Name == originalName {
+				// Construct the registered name
+				registeredName := fmt.Sprintf("mcp_%s_%s", serverName, toolInfo.Name)
+				tool, exists := tb.registry.Get(registeredName)
+				if exists {
+					matches = append(matches, tool)
+				}
+			}
+		}
+	}
+
+	// Only return if exactly one match found (avoid ambiguity)
+	if len(matches) == 1 {
+		logger.Debugf("Resolved MCP tool '%s' to registered name '%s'", originalName, matches[0].Name())
+		return matches[0], true
+	} else if len(matches) > 1 {
+		logger.Warnf("Multiple MCP tools found with original name '%s', cannot resolve ambiguously", originalName)
+	}
+
+	return nil, false
+}
+
+// GetMCPToolByOriginalName returns information about an MCP tool by its original name.
+// This is useful for the ProgressiveDisclosure system and tool_scheduler to check if
+// a tool exists in the MCP registry even if it hasn't been expanded yet.
+func (tb *Toolbox) GetMCPToolByOriginalName(originalName string) (serverName string, toolInfo *interfaces.Tool, exists bool) {
+	if tb.mcpClient == nil {
+		return "", nil, false
+	}
+
+	allTools := tb.mcpClient.GetAllTools()
+	var foundServerName string
+	var foundTool interfaces.Tool
+	matchCount := 0
+
+	for srvName, tools := range allTools {
+		for _, tInfo := range tools {
+			if tInfo.Name == originalName {
+				registeredName := fmt.Sprintf("mcp_%s_%s", srvName, tInfo.Name)
+				tool, regExists := tb.registry.Get(registeredName)
+				if regExists {
+					foundServerName = srvName
+					foundTool = tool
+					matchCount++
+				}
+			}
+		}
+	}
+
+	if matchCount == 1 {
+		return foundServerName, &foundTool, true
+	}
+	return "", nil, false
 }
 
 // ListMCPConnections returns information about MCP connections

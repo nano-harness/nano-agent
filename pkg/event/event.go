@@ -17,7 +17,6 @@ const (
 	EventTypeTokenStats     EventType = "token_stats"
 	EventTypeWaitingForUser EventType = "waiting_for_user" // Execution paused, waiting for user intervention
 	EventTypeTodoListUpdate EventType = "todo_list_update" // Dynamic todo list updates
-	EventTypeTodoUpdate     EventType = "todo_update"      // Individual todo updates
 	EventTypeFinalSummary   EventType = "final_summary"    // Final summary response after synthesis completion
 	// EventTypeTaskStart Task execution started
 	EventTypeTaskStart        EventType = "task_start"        // Task execution started
@@ -59,14 +58,8 @@ const (
 	EventTypeRalphIteration EventType = "ralph_iteration"
 	EventTypeRalphStopped   EventType = "ralph_stopped"
 
-	// Expert system events
-	EventTypeExpertStarted  EventType = "expert_started"  // Expert execution started
-	EventTypeExpertProgress EventType = "expert_progress" // Expert execution progress
-	EventTypeExpertFinished EventType = "expert_finished" // Expert execution finished
-
 	// Mailbox system events
-	EventTypeMailboxSent     EventType = "mailbox_sent"     // Message sent to agent mailbox
-	EventTypeMailboxReceived EventType = "mailbox_received" // Message received from mailbox
+	EventTypeMailboxSent EventType = "mailbox_sent" // Message sent to agent mailbox
 
 	// Sandbox audit and observability events
 	EventTypeSandboxDecisionCreated       EventType = "sandbox.decision.created"

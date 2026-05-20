@@ -14,6 +14,13 @@ func applyTextareaTheme(ta *textarea.Model) {
 	styles.Focused.Base = lipgloss.NewStyle().
 		PaddingLeft(1).
 		PaddingRight(1)
-	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(lipgloss.Color(colorInfoTitle))
+	// The default textarea Prompt is "┃ " (a thick vertical bar) and the
+	// default focused Prompt foreground inherits the accent color, which
+	// in milktea mode renders as a stray blue/black dot in the upper-left
+	// corner before any text is typed. We disable the prompt entirely and
+	// reset its style so the input area starts visually empty.
+	styles.Focused.Prompt = lipgloss.NewStyle()
+	styles.Blurred.Prompt = lipgloss.NewStyle()
+	ta.Prompt = ""
 	ta.SetStyles(styles)
 }

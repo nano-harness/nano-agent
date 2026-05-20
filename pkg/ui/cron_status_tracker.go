@@ -17,9 +17,10 @@ type CronTaskState struct {
 }
 
 type CronStatusTracker struct {
-	mu       sync.RWMutex
-	running  map[string]CronTaskState
-	onChange func()
+	mu               sync.RWMutex
+	running          map[string]CronTaskState
+	onChange         func()
+	scheduledCountFn func() int
 }
 
 func NewCronStatusTracker() *CronStatusTracker {
@@ -96,11 +97,15 @@ func (t *CronStatusTracker) Snapshot() []CronTaskState {
 }
 
 func (t *CronStatusTracker) FormatIndicator() string {
-	count := t.Count()
-	if count == 0 {
+	running := t.Count()
+	scheduled := t.ScheduledCount()
+	if scheduled == 0 && running == 0 {
 		return ""
 	}
-	return fmt.Sprintf("⏰ %d running", count)
+	if running == 0 {
+		return fmt.Sprintf("⏰ %d scheduled", scheduled)
+	}
+	return fmt.Sprintf("⏰ %d scheduled, %d running", scheduled, running)
 }
 
 // FormatDetails returns a multi-line listing of currently running cron
@@ -139,6 +144,40 @@ func (t *CronStatusTracker) SetOnChange(fn func()) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.onChange = fn
+}
+
+func (t *CronStatusTracker) SetScheduledCountFn(fn func() int) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.scheduledCountFn = fn
+}
+
+func (t *CronStatusTracker) ScheduledCount() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.RLock()
+	fn := t.scheduledCountFn
+	t.mu.RUnlock()
+	if fn == nil {
+		return 0
+	}
+	return fn()
+}
+
+func (t *CronStatusTracker) TriggerChange() {
+	if t == nil {
+		return
+	}
+	t.mu.RLock()
+	fn := t.onChange
+	t.mu.RUnlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 func metadataString(metadata map[string]interface{}, key string) string {

@@ -30,6 +30,13 @@ func TestParseNaturalSchedule(t *testing.T) {
 		{"invalid input xyz", "", true},
 		{"every 60 minutes", "", true},
 		{"every 24 hours", "", true},
+		// Overly frequent expressions (should be rejected)
+		{"* * * * * *", "", true},               // every second
+		{"*/5 * * * * *", "", true},             // every 5 seconds
+		{"0,30 * * * * *", "", true},            // twice per minute
+		{"0-30 * * * * *", "", true},            // 31 times per minute (range)
+		{"15 * * * * *", "15 * * * * *", false}, // once per minute at second 15 (allowed)
+		{"30 * * * * *", "30 * * * * *", false}, // once per minute at second 30 (allowed)
 	}
 
 	for _, tc := range tests {
@@ -47,5 +54,34 @@ func TestParseNaturalSchedule(t *testing.T) {
 		if got != tc.expected {
 			t.Errorf("ParseNaturalSchedule(%q) = %q, want %q", tc.input, got, tc.expected)
 		}
+	}
+}
+
+func TestValidateMinimumInterval(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"every second", "* * * * * *", true},
+		{"every 5 seconds", "*/5 * * * * *", true},
+		{"multiple seconds", "0,15,30,45 * * * * *", true},
+		{"second range", "0-30 * * * * *", true},
+		{"once per minute at second 0", "0 * * * * *", false},
+		{"once per minute at second 15", "15 * * * * *", false},
+		{"once per minute at second 30", "30 * * * * *", false},
+		{"every minute", "0 * * * * *", false},
+		{"every 5 minutes", "0 */5 * * * *", false},
+		{"every hour", "0 0 * * * *", false},
+		{"daily at midnight", "0 0 0 * * *", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMinimumInterval(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateMinimumInterval(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
 	}
 }

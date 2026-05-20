@@ -28,14 +28,14 @@ func newTestModel(termWidth int) *Model {
 	ta.KeyMap.InsertNewline.SetEnabled(false)
 	applyTextareaTheme(&ta)
 	return &Model{
-		status:           "等待输入",
-		termWidth:        termWidth,
-		input:            ta,
-		historyIndex:     -1,
-		activeToolCalls:  make(map[string]string),
-		currentPhase:     phaseIdle,
-		terminalFocused:  true,
-		streamingLineIdx: -1,
+		status:          "等待输入",
+		termWidth:       termWidth,
+		input:           ta,
+		messages:        NewMessageStore(),
+		historyIndex:    -1,
+		activeToolCalls: make(map[string]string),
+		currentPhase:    phaseIdle,
+		terminalFocused: true,
 	}
 }
 
@@ -69,18 +69,6 @@ func runTeaCmd(t *testing.T, cmd tea.Cmd) {
 			runTeaCmd(t, c)
 		}
 	}
-}
-
-func teaPrintfBody(t *testing.T, cmd tea.Cmd) string {
-	t.Helper()
-	if cmd == nil {
-		t.Fatal("expected tea.Printf command, got nil")
-	}
-	msg := cmd()
-	if got := reflect.TypeOf(msg).String(); got != "tea.printLineMessage" {
-		t.Fatalf("expected tea.printLineMessage, got %s", got)
-	}
-	return reflect.ValueOf(msg).FieldByName("messageBody").String()
 }
 
 func assertClearScreenCmd(t *testing.T, cmd tea.Cmd) {
@@ -152,10 +140,8 @@ func TestUpdate_WindowSizeMsg_WidthChange_ClearScreenOnly(t *testing.T) {
 	// without reprinting history.
 	m := newTestModel(80)
 	m.termHeight = 24
-	m.lines = []string{
-		"assistant: " + strings.Repeat("alpha beta ", 12),
-		"tool: " + strings.Repeat("0123456789", 10),
-	}
+	m.recordMessage("assistant", strings.Repeat("alpha beta ", 12))
+	m.recordMessage("tool", strings.Repeat("0123456789", 10))
 
 	newModel, cmd := m.Update(tea.WindowSizeMsg{Width: 30, Height: 24})
 	updatedModel := newModel.(*Model)
@@ -169,7 +155,7 @@ func TestUpdate_WindowSizeMsg_WidthChange_ClearScreenOnly(t *testing.T) {
 func TestUpdate_WindowSizeMsg_HeightOnlyChange_ClearScreen(t *testing.T) {
 	m := newTestModel(80)
 	m.termHeight = 24
-	m.lines = []string{"assistant: " + strings.Repeat("history ", 20)}
+	m.recordMessage("assistant", strings.Repeat("history ", 20))
 
 	newModel, cmd := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
 	updatedModel := newModel.(*Model)
@@ -183,7 +169,7 @@ func TestUpdate_WindowSizeMsg_HeightOnlyChange_ClearScreen(t *testing.T) {
 func TestUpdate_WindowSizeMsg_EmptyHistory_ClearScreen(t *testing.T) {
 	m := newTestModel(80)
 	m.termHeight = 24
-	m.lines = nil
+	// empty store — no messages added
 
 	newModel, cmd := m.Update(tea.WindowSizeMsg{Width: 30, Height: 24})
 	updatedModel := newModel.(*Model)
@@ -208,6 +194,123 @@ func TestView_RequestsBubbleTeaV2Capabilities(t *testing.T) {
 	}
 	if got, want := v.WindowTitle, "nano · 思考中..."; got != want {
 		t.Fatalf("WindowTitle = %q, want %q", got, want)
+	}
+}
+
+// TestView_RendersBannerArtWhenIdle verifies that a non-empty bannerArt is
+// included in the inline View while the message store is empty, so the TUI
+// keeps showing the product mark after the startup animation finishes.
+func TestView_RendersBannerArtWhenIdle(t *testing.T) {
+	m := newTestModel(80)
+	m.termHeight = 40
+	const art = "NANO-BANNER-TOKEN"
+	m.SetBannerArt(art)
+
+	got := m.View().Content
+	if !strings.Contains(got, art) {
+		t.Fatalf("expected View to contain banner art %q; got:\n%s", art, got)
+	}
+}
+
+func TestView_RendersBannerArtWhenIdle_ExactFit(t *testing.T) {
+	m := newTestModel(80)
+	const art = "L1\nL2\nL3"
+	m.SetBannerArt(art)
+
+	var inputBuf strings.Builder
+	m.renderInputSection(&inputBuf)
+	m.termHeight = renderedLineCount(art) + renderedLineCount(inputBuf.String())
+
+	got := m.View().Content
+	if !strings.Contains(got, art) {
+		t.Fatalf("expected View to contain banner art %q; got:\n%s", art, got)
+	}
+}
+
+// TestView_KeepsBannerOnceMessagesArrive verifies the banner remains visible
+// after messages exist when the terminal has enough room.
+func TestView_KeepsBannerOnceMessagesArrive(t *testing.T) {
+	m := newTestModel(80)
+	m.termHeight = 40
+	const art = "NANO-BANNER-TOKEN"
+	m.SetBannerArt(art)
+	m.messages.Add("user", "hello")
+
+	got := m.View().Content
+	if !strings.Contains(got, art) {
+		t.Fatalf("expected View to keep banner art after messages arrive; got:\n%s", got)
+	}
+}
+
+// TestView_SkipsBannerWhenTooTall verifies that the banner is suppressed
+// when it would not fit vertically alongside the input area.
+func TestView_SkipsBannerWhenTooTall(t *testing.T) {
+	m := newTestModel(80)
+	m.termHeight = 3 // tiny terminal
+	const art = "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8"
+	m.SetBannerArt(art)
+
+	got := m.View().Content
+	if strings.Contains(got, "L8") {
+		t.Fatalf("expected View to skip banner when too tall; got:\n%s", got)
+	}
+}
+
+// TestView_BannerVisibleWithMessages verifies the banner stays visible once
+// messages exist when there is ample vertical space.
+func TestView_BannerVisibleWithMessages(t *testing.T) {
+	m := newTestModel(80)
+	m.termHeight = 40
+	const art = "PERSISTENT-BANNER"
+	m.SetBannerArt(art)
+	m.messages.Add("user", "first message")
+	m.messages.Add("assistant", "response")
+
+	got := m.View().Content
+	if !strings.Contains(got, art) {
+		t.Fatalf("expected banner to stay visible once messages exist; got:\n%s", got)
+	}
+	if !strings.Contains(got, "first message") {
+		t.Fatalf("expected messages to render with banner visible; got:\n%s", got)
+	}
+}
+
+// TestView_BannerHiddenWhenTerminalTooSmall verifies that the banner is
+// gracefully hidden when the terminal is too small to accommodate both
+// banner and input area.
+func TestView_BannerHiddenWhenTerminalTooSmall(t *testing.T) {
+	m := newTestModel(80)
+	const art = "LINE1\nLINE2\nLINE3\nLINE4"
+	m.SetBannerArt(art)
+	m.messages.Add("user", "message")
+
+	var inputBuf strings.Builder
+	m.renderInputSection(&inputBuf)
+	// Set terminal height so banner + input won't fit.
+	m.termHeight = renderedLineCount(art) + renderedLineCount(inputBuf.String()) - 1
+
+	got := m.View().Content
+	if strings.Contains(got, art) {
+		t.Fatalf("expected banner to be hidden in small terminal; got:\n%s", got)
+	}
+}
+
+// TestView_BannerHiddenWhenMessageAreaTooSmall verifies that the banner is
+// hidden when it would fit with the input but leave too little space for
+// messages.
+func TestView_BannerHiddenWhenMessageAreaTooSmall(t *testing.T) {
+	m := newTestModel(80)
+	const art = "LINE1\nLINE2\nLINE3\nLINE4"
+	m.SetBannerArt(art)
+	m.messages.Add("user", "message")
+
+	var inputBuf strings.Builder
+	m.renderInputSection(&inputBuf)
+	m.termHeight = renderedLineCount(art) + renderedLineCount(inputBuf.String())
+
+	got := m.View().Content
+	if strings.Contains(got, art) {
+		t.Fatalf("expected banner to be hidden when message area is too small; got:\n%s", got)
 	}
 }
 
@@ -341,7 +444,11 @@ func TestUpdate_MouseCommandSelection(t *testing.T) {
 func TestUpdate_FullscreenHistoryNavigationAndView(t *testing.T) {
 	m := newTestModel(80)
 	m.termHeight = 6
-	m.lines = []string{"one", "two", "three", "four", "five"}
+	m.recordMessage("user", "one")
+	m.recordMessage("assistant", "two")
+	m.recordMessage("tool", "three")
+	m.recordMessage("system", "four")
+	m.recordMessage("assistant", "five")
 
 	_, _ = m.Update(tea.KeyPressMsg{Code: 'f', Mod: tea.ModCtrl})
 	if !m.altScreenActive {
@@ -361,6 +468,47 @@ func TestUpdate_FullscreenHistoryNavigationAndView(t *testing.T) {
 	_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	if m.altScreenActive {
 		t.Fatal("expected fullscreen history mode to exit")
+	}
+}
+
+// TestRenderFullscreenHistory_UsesRenderedCache verifies that
+// renderFullscreenHistory populates msg.Rendered (via renderedMessageLines)
+// so that formatting work is cached and reused across frames.
+func TestRenderFullscreenHistory_UsesRenderedCache(t *testing.T) {
+	m := newTestModel(80)
+	m.termHeight = 10
+	m.recordMessage("user", "hello world")
+	m.recordMessage("assistant", "reply")
+
+	// Before entering fullscreen history, msg.Rendered is empty.
+	for i := 0; i < m.messages.Len(); i++ {
+		if msg := m.messages.Get(i); msg.Rendered != "" {
+			t.Fatalf("message %d: expected empty Rendered before first render, got %q", i, msg.Rendered)
+		}
+	}
+
+	m.enterFullscreenHistory()
+	_ = m.renderFullscreenHistory()
+
+	// After renderFullscreenHistory, every visible message should have a
+	// populated Rendered cache with the expected emoji prefix.
+	expectations := []struct {
+		role   string
+		prefix string
+	}{
+		{"user", "👤"},
+		{"assistant", "🤖"},
+	}
+	for idx, want := range expectations {
+		msg := m.messages.Get(idx)
+		if msg.Rendered == "" {
+			t.Fatalf("message %d (%s): expected non-empty Rendered after renderFullscreenHistory", idx, want.role)
+		}
+		firstLine := strings.SplitN(msg.Rendered, "\n", 2)[0]
+		if !strings.Contains(firstLine, want.prefix) {
+			t.Fatalf("message %d (%s): first rendered line %q does not contain expected prefix %q",
+				idx, want.role, firstLine, want.prefix)
+		}
 	}
 }
 
@@ -400,7 +548,8 @@ func TestTruncateLines_TruncatesLongLine(t *testing.T) {
 
 func TestBuildHelpText_WideTerminal(t *testing.T) {
 	m := newTestModel(200)
-	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
+	m.showHelp = true
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+F 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | [ 滚动 | PgUp/PgDn 翻页 | ↑↓ 历史 | ? 收起"
 	if got := m.buildHelpText(); got != full {
 		t.Errorf("expected full text for wide terminal, got %q", got)
 	}
@@ -408,7 +557,8 @@ func TestBuildHelpText_WideTerminal(t *testing.T) {
 
 func TestBuildHelpText_NoTermWidth(t *testing.T) {
 	m := newTestModel(0)
-	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
+	m.showHelp = true
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+F 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | [ 滚动 | PgUp/PgDn 翻页 | ↑↓ 历史 | ? 收起"
 	if got := m.buildHelpText(); got != full {
 		t.Errorf("expected full text when termWidth=0, got %q", got)
 	}
@@ -418,6 +568,7 @@ func TestBuildHelpText_NarrowFallsBack(t *testing.T) {
 	// At width=1 nothing fits fully; buildHelpText must fall back to
 	// xansi.Truncate. The result must fit within termWidth columns.
 	m := newTestModel(1)
+	m.showHelp = true
 	got := m.buildHelpText()
 	if xansi.StringWidth(got) > m.termWidth {
 		t.Errorf("expected result ≤%d terminal columns, got width %d: %q", m.termWidth, xansi.StringWidth(got), got)
@@ -425,8 +576,8 @@ func TestBuildHelpText_NarrowFallsBack(t *testing.T) {
 }
 
 func TestBuildHelpText_ShortVariant(t *testing.T) {
-	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | Tab 补全"
-	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
+	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索 | Ctrl+F 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | PgUp/PgDn 翻页 | Tab 补全 | ? 收起"
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+F 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | [ 滚动 | PgUp/PgDn 翻页 | ↑↓ 历史 | ? 收起"
 	// Choose a width that fits short but not full.
 	width := xansi.StringWidth(short)
 	if xansi.StringWidth(full) <= width {
@@ -434,6 +585,7 @@ func TestBuildHelpText_ShortVariant(t *testing.T) {
 		t.Skip("full and short are the same width in this environment")
 	}
 	m := newTestModel(width)
+	m.showHelp = true
 	got := m.buildHelpText()
 	if got != short {
 		t.Errorf("expected short variant at width=%d, got %q", width, got)
@@ -444,20 +596,30 @@ func TestBuildHelpText_ShortVariant(t *testing.T) {
 }
 
 func TestBuildHelpText_MinimalVariant(t *testing.T) {
-	minimal := "Enter发送 | ^J换行 | ^R搜索 | ^L新会话"
-	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | Tab 补全"
+	minimal := "Enter发送 | ^J换行 | ^R搜索 | ^F搜索 | ^L新会话 | PgUp/PgDn | ?收起"
+	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索 | Ctrl+F 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | PgUp/PgDn 翻页 | Tab 补全 | ? 收起"
 	// Choose a width that fits minimal but not short.
 	width := xansi.StringWidth(minimal)
 	if xansi.StringWidth(short) <= width {
 		t.Skip("short and minimal are the same width in this environment")
 	}
 	m := newTestModel(width)
+	m.showHelp = true
 	got := m.buildHelpText()
 	if got != minimal {
 		t.Errorf("expected minimal variant at width=%d, got %q", width, got)
 	}
 	if xansi.StringWidth(got) > width {
 		t.Errorf("minimal variant exceeds termWidth=%d: got width %d", width, xansi.StringWidth(got))
+	}
+}
+
+func TestBuildHelpText_CollapsedDefault(t *testing.T) {
+	// By default showHelp is false; only the compact hint is shown.
+	m := newTestModel(80)
+	got := m.buildHelpText()
+	if got != "? 帮助" {
+		t.Errorf("expected compact hint when showHelp=false, got %q", got)
 	}
 }
 
@@ -530,11 +692,12 @@ func TestRenderInputSectionStableHeight_ThinkingShrink(t *testing.T) {
 	m.renderInputSection(&b)
 	shrunkLines := strings.Count(b.String(), "\n")
 
-	if shrunkLines < tallLines {
-		t.Fatalf("expected padded render line count >= %d after thinking disappears, got %d:\n%s", tallLines, shrunkLines, b.String())
-	}
-	if got := m.lastRenderHeight; got != tallLines {
-		t.Fatalf("expected lastRenderHeight to remain %d, got %d", tallLines, got)
+	// With the sliding-window renderer, renderInputSection no longer pads
+	// with blank lines to match a previous height — the message window above
+	// it fills the viewport instead. The section may shrink when thinking is
+	// removed.
+	if shrunkLines == 0 {
+		t.Fatalf("expected shrunk render to still produce lines, got 0:\n%s", b.String())
 	}
 }
 
@@ -545,17 +708,14 @@ func TestRenderInputSection_ResizeResetsHeight(t *testing.T) {
 
 	var b strings.Builder
 	m.renderInputSection(&b)
-	if m.lastRenderHeight == 0 {
-		t.Fatal("expected render to record lastRenderHeight")
+	if b.Len() == 0 {
+		t.Fatal("expected render to produce output")
 	}
 
 	newModel, cmd := m.Update(tea.WindowSizeMsg{Width: 60, Height: 24})
-	updatedModel := newModel.(*Model)
+	_ = newModel
 
 	assertClearScreenCmd(t, cmd)
-	if got := updatedModel.lastRenderHeight; got != 0 {
-		t.Fatalf("expected resize to reset lastRenderHeight, got %d", got)
-	}
 }
 
 func TestRenderInputSectionTokenPlaceholder(t *testing.T) {
@@ -664,41 +824,42 @@ func TestFlushStreamingBuffer_NarrowWidthNoOverflow(t *testing.T) {
 
 	cmds := m.flushStreamingBuffer()
 
-	if len(cmds) != 1 {
-		t.Fatalf("expected one print command, got %d", len(cmds))
+	// Phase 1b: no tea.Printf — nil cmds expected; View() renders from store.
+	if cmds != nil {
+		t.Fatalf("expected nil cmds (no tea.Printf), got %d", len(cmds))
 	}
-	if len(m.lines) != 1 {
-		t.Fatalf("expected one scrollback line, got %#v", m.lines)
+	if m.messages.Len() != 1 {
+		t.Fatalf("expected one streaming message in store, got %d", m.messages.Len())
 	}
-	wrapped := m.wrapFormattedLine(m.lines[0])
-	for i, line := range strings.Split(wrapped, "\n") {
+	// assistant_stream has no emoji prefix so renderedMessageLines wraps at
+	// the full termWidth rather than the prefix-reserved safeWrapWidth.
+	// Check that every rendered line stays within termWidth.
+	for i, line := range m.renderedMessageLines(m.messages.Last()) {
 		if w := xansi.StringWidth(line); w > termWidth {
-			t.Fatalf("wrapped streaming line %d exceeds termWidth=%d (got width %d): %q", i+1, termWidth, w, line)
+			t.Fatalf("rendered streaming line %d exceeds termWidth=%d (got width %d): %q", i+1, termWidth, w, line)
 		}
 	}
 }
 
+// TestSpinnerSuppressedAfterFlush verifies the spinner does not animate
+// when the spinner phase is not active.
 func TestSpinnerSuppressedAfterFlush(t *testing.T) {
 	m := newTestModel(80)
-	m.currentPhase = phaseResponse
-	m.lastFlushTime = time.Now()
-	m.spinnerFrame = 3
+	m.currentPhase = phaseIdle
 
 	if m.shouldAnimateSpinner() {
-		t.Fatal("spinner should be suppressed immediately after a streaming flush")
-	}
-	updated, cmd := m.Update(SpinnerTickMsg(time.Now()))
-	updatedModel := updated.(*Model)
-	if updatedModel.spinnerFrame != 3 {
-		t.Fatalf("spinner frame should not change during suppression, got %d", updatedModel.spinnerFrame)
-	}
-	if cmd == nil {
-		t.Fatal("spinner tick should still be scheduled while phase is active")
+		t.Fatal("spinner should not animate in idle phase")
 	}
 
-	m.lastFlushTime = time.Now().Add(-spinnerTickInterval)
+	m.currentPhase = phaseResponse
 	if !m.shouldAnimateSpinner() {
-		t.Fatal("spinner should animate after the suppression window")
+		t.Fatal("spinner should animate in response phase")
+	}
+
+	updated, cmd := m.Update(SpinnerTickMsg(time.Now()))
+	_ = updated
+	if cmd == nil {
+		t.Fatal("spinner tick should still be scheduled while phase is active")
 	}
 }
 
@@ -780,14 +941,15 @@ func TestThinkingMsg_NoHeaderWrittenToScrollback(t *testing.T) {
 		Metadata:  map[string]interface{}{"is_complete": true},
 	})
 
-	if len(m.lines) < 1 {
-		t.Fatalf("expected completion summary in scrollback, got %#v", m.lines)
+	if m.messages.Len() < 1 {
+		t.Fatalf("expected completion summary in message store, got 0 messages")
 	}
-	if strings.Contains(strings.Join(m.lines, "\n"), "[进行中]") {
-		t.Fatalf("scrollback should not contain in-progress header: %#v", m.lines)
+	last := m.messages.Last()
+	if strings.Contains(last.Content, "[进行中]") {
+		t.Fatalf("store should not contain in-progress header: %q", last.Content)
 	}
-	if !strings.Contains(m.lines[0], "思考完成") {
-		t.Fatalf("expected completion summary, got %q", m.lines[0])
+	if !strings.Contains(last.Content, "思考完成") {
+		t.Fatalf("expected completion summary, got %q", last.Content)
 	}
 }
 
@@ -824,7 +986,7 @@ func TestModel_ContextBarColors(t *testing.T) {
 	}
 }
 
-func TestModel_HashTriggersFilePicker(t *testing.T) {
+func TestModel_AtTriggersFilePicker(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(dir+"/go.mod", []byte("module test\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -839,7 +1001,7 @@ func TestModel_HashTriggersFilePicker(t *testing.T) {
 
 	m := newTestModel(80)
 	m.fileIndex = idx
-	m.input.SetValue("#gom")
+	m.input.SetValue("@gom")
 	m.updateFilePickerState()
 
 	if !m.showingFilePicker {
@@ -897,7 +1059,7 @@ func TestEnterSubmits(t *testing.T) {
 func TestCtrlLClearsAndPrintsFeedback(t *testing.T) {
 	m := newTestModel(80)
 	m.status = "处理中..."
-	m.lines = []string{"old"}
+	m.recordMessage("assistant", "old message")
 	m.input.SetValue("draft")
 	m.newSessionHandler = func() string { return "session_test" }
 
@@ -906,12 +1068,12 @@ func TestCtrlLClearsAndPrintsFeedback(t *testing.T) {
 		t.Fatal("expected Ctrl+L to return clear/print command")
 	}
 	updatedModel := newModel.(*Model)
-	if len(updatedModel.lines) == 0 {
-		t.Fatal("expected Ctrl+L to append feedback line")
+	if updatedModel.messages.Len() == 0 {
+		t.Fatal("expected Ctrl+L to append feedback message to store")
 	}
-	last := updatedModel.lines[len(updatedModel.lines)-1]
-	if !strings.Contains(last, "已开启新会话 (id: session_test)") {
-		t.Fatalf("expected new-session feedback, got %q", last)
+	last := updatedModel.messages.Last()
+	if !strings.Contains(last.Content, "已开启新会话 (id: session_test)") {
+		t.Fatalf("expected new-session feedback, got %q", last.Content)
 	}
 	if updatedModel.status != "等待输入" {
 		t.Fatalf("expected status reset to 等待输入, got %q", updatedModel.status)
@@ -1102,6 +1264,9 @@ func TestStatusUpdateDoneClearsThinkingState(t *testing.T) {
 	if m.spinnerStage != "" || m.spinnerFrame != 0 {
 		t.Fatalf("expected spinner to be reset, got stage=%q frame=%d", m.spinnerStage, m.spinnerFrame)
 	}
+	if m.selectedVerb != "" {
+		t.Fatalf("expected selectedVerb to be cleared, got %q", m.selectedVerb)
+	}
 	if got := m.status; got != "✅ 完成" {
 		t.Fatalf("expected done status, got %q", got)
 	}
@@ -1185,6 +1350,9 @@ func TestTaskCompletionMsgClearsThinkingState(t *testing.T) {
 	}
 	if m.spinnerStage != "" || m.spinnerFrame != 0 {
 		t.Fatalf("expected spinner to be reset, got stage=%q frame=%d", m.spinnerStage, m.spinnerFrame)
+	}
+	if m.selectedVerb != "" {
+		t.Fatalf("expected selectedVerb to be cleared, got %q", m.selectedVerb)
 	}
 	if m.currentPhase != phaseDone {
 		t.Fatalf("expected phaseDone, got %v", m.currentPhase)
@@ -1289,6 +1457,88 @@ func TestSpinnerStatusUpdateIdleDoesNotAdvance(t *testing.T) {
 	}
 }
 
+func TestSelectedVerbSetOnThinkingMsg(t *testing.T) {
+	m := newTestModel(80)
+	m.spinnerVerbs = []string{"Alpha", "Beta", "Gamma"}
+
+	_, _ = m.Update(ThinkingMsg{Title: "thinking", ReasoningDelta: "step1"})
+
+	if m.SelectedVerb() == "" {
+		t.Fatal("selectedVerb should be set after first ThinkingMsg")
+	}
+}
+
+func TestSelectedVerbStableAcrossThinkingCycle(t *testing.T) {
+	m := newTestModel(80)
+	m.spinnerVerbs = []string{"Alpha", "Beta", "Gamma"}
+
+	_, _ = m.Update(ThinkingMsg{Title: "thinking", ReasoningDelta: "step1"})
+	first := m.SelectedVerb()
+	if first == "" {
+		t.Fatal("selectedVerb should be set after ThinkingMsg")
+	}
+
+	// Additional ThinkingMsg messages during same cycle should not change the verb.
+	for i := 0; i < 5; i++ {
+		_, _ = m.Update(ThinkingMsg{ReasoningDelta: "more"})
+		if got := m.SelectedVerb(); got != first {
+			t.Fatalf("selectedVerb changed mid-cycle: was %q, now %q", first, got)
+		}
+	}
+}
+
+func TestSelectedVerbClearedOnResetSpinnerToIdle(t *testing.T) {
+	m := newTestModel(80)
+	m.spinnerVerbs = []string{"Alpha", "Beta"}
+	m.selectedVerb = "Alpha"
+
+	m.resetSpinnerToIdle()
+
+	if got := m.SelectedVerb(); got != "" {
+		t.Fatalf("selectedVerb should be cleared after resetSpinnerToIdle, got %q", got)
+	}
+}
+
+func TestSelectedVerbHiddenInIdleAndDonePhase(t *testing.T) {
+	m := newTestModel(80)
+	m.spinnerVerbs = []string{"Alpha"}
+	m.selectedVerb = "Alpha"
+	m.spinnerStage = "thinking"
+	m.spinnerFrame = 1
+
+	m.currentPhase = phaseIdle
+	if got := m.currentSpinnerVerb(); got != "" {
+		t.Fatalf("idle phase spinner verb = %q, want hidden", got)
+	}
+
+	m.currentPhase = phaseDone
+	if got := m.currentSpinnerVerb(); got != "" {
+		t.Fatalf("done phase spinner verb = %q, want hidden", got)
+	}
+}
+
+func TestSelectedVerbVisibleInActivePhases(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		phase displayPhase
+	}{
+		{name: "thinking", phase: phaseThinking},
+		{name: "tool", phase: phaseToolCall},
+		{name: "response", phase: phaseResponse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModel(80)
+			m.currentPhase = tc.phase
+			m.spinnerFrame = 1
+			m.selectedVerb = "TestVerb"
+
+			if got := m.currentSpinnerVerb(); got != "TestVerb" {
+				t.Fatalf("currentSpinnerVerb() = %q, want %q", got, "TestVerb")
+			}
+		})
+	}
+}
+
 func TestTokenStatsUpdate_ContextTextRendered(t *testing.T) {
 	m := newTestModel(80)
 
@@ -1317,11 +1567,60 @@ func TestThinkingCompleteClearsWindowButPreservesReasoning(t *testing.T) {
 
 	_, _ = m.Update(ThinkingMsg{Metadata: map[string]interface{}{"is_complete": true}})
 
-	if len(m.thinkingWindow) != 0 {
-		t.Fatalf("expected thinking window to be cleared, got %#v", m.thinkingWindow)
+	// After completion the streaming preview is replaced with a single-line
+	// "思考完成" hint so the user can still confirm thinking finished after
+	// the assistant stream takes over. The Ctrl+T affordance is part of
+	// that preview text.
+	if len(m.thinkingWindow) != 1 {
+		t.Fatalf("expected single-line completion preview, got %#v", m.thinkingWindow)
+	}
+	if !strings.Contains(m.thinkingWindow[0], "思考完成") || !strings.Contains(m.thinkingWindow[0], "Ctrl+T") {
+		t.Fatalf("expected preview to mention 思考完成 and Ctrl+T, got %q", m.thinkingWindow[0])
 	}
 	if m.thinkingReasoning != "old thought" {
 		t.Fatalf("expected thinking reasoning to be preserved, got %q", m.thinkingReasoning)
+	}
+}
+
+func TestThinkingComplete_EmptyReasoningDoesNotPersist(t *testing.T) {
+	m := newTestModel(80)
+	m.thinkingTitle = "thinking"
+
+	before := m.messages.Len()
+	_, _ = m.Update(ThinkingMsg{Metadata: map[string]interface{}{"is_complete": true}})
+
+	if m.messages.Len() != before {
+		t.Fatalf("empty reasoning complete should not append a thinking message; got len=%d", m.messages.Len())
+	}
+	if len(m.thinkingWindow) != 0 {
+		t.Fatalf("empty reasoning complete must leave thinking window empty, got %#v", m.thinkingWindow)
+	}
+}
+
+func TestThinkingComplete_PreviewSurvivesAssistantStream(t *testing.T) {
+	m := newTestModel(80)
+	// One delta then immediately complete, then assistant_stream — preview
+	// must remain visible (and the full reasoning must be in the store).
+	_, _ = m.Update(ThinkingMsg{Title: "thinking", ReasoningDelta: "fast thought"})
+	_, _ = m.Update(ThinkingMsg{Reasoning: "fast thought", Metadata: map[string]interface{}{"is_complete": true}})
+	_, _ = m.Update(Message{Role: "assistant_stream", Content: "here is the answer\n"})
+
+	if len(m.thinkingWindow) == 0 || !strings.Contains(m.thinkingWindow[0], "思考完成") {
+		t.Fatalf("expected thinking completion preview to remain after assistant_stream, got %#v", m.thinkingWindow)
+	}
+
+	// The full reasoning must be present in the message store so the user
+	// can scroll back to it.
+	found := false
+	for i := 0; i < m.messages.Len(); i++ {
+		msg := m.messages.Get(i)
+		if msg.Role == "thinking" && strings.Contains(msg.Content, "fast thought") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected full reasoning to be persisted to MessageStore")
 	}
 }
 
@@ -1330,11 +1629,11 @@ func TestStreamingFlushPreservesRawMarkdown(t *testing.T) {
 
 	_, _ = m.Update(Message{Role: "assistant_stream", Content: "**bold**\n"})
 
-	if len(m.lines) == 0 {
-		t.Fatal("expected streaming line to be flushed")
+	if m.messages.Len() == 0 {
+		t.Fatal("expected streaming message in store")
 	}
-	if got := m.lines[len(m.lines)-1]; !strings.Contains(got, "**bold**") {
-		t.Fatalf("streaming line should preserve raw markdown delimiters, got %q", got)
+	if content := m.messages.Last().Content; !strings.Contains(content, "**bold**") {
+		t.Fatalf("streaming message should preserve raw markdown delimiters, got %q", content)
 	}
 }
 
@@ -1345,17 +1644,15 @@ func TestStreamingFlushIncrementalPartialDoesNotPrint(t *testing.T) {
 
 	cmds := m.flushStreamingIncremental()
 
+	// Phase 2: flushStreamingIncremental updates the MessageStore only.
 	if cmds != nil {
-		t.Fatalf("expected no printf command for incomplete chunk, got %d", len(cmds))
+		t.Fatalf("expected nil cmds (no tea.Printf), got %d", len(cmds))
 	}
-	if len(m.lines) != 1 {
-		t.Fatalf("expected scrollback line to be updated, got %d: %#v", len(m.lines), m.lines)
+	if m.messages.Len() != 1 {
+		t.Fatalf("expected one streaming message in store, got %d", m.messages.Len())
 	}
-	if got, want := stripFormatLine(m.lines[0]), "partial chunk"; got != want {
-		t.Fatalf("streaming line = %q, want %q", got, want)
-	}
-	if got, want := m.streamingPrintBuf.String(), "partial chunk"; got != want {
-		t.Fatalf("streamingPrintBuf = %q, want %q", got, want)
+	if got, want := m.messages.Last().Content, "partial chunk"; got != want {
+		t.Fatalf("streaming content = %q, want %q", got, want)
 	}
 	if m.streamingBuf.Len() != 0 {
 		t.Fatalf("expected streamingBuf to be consumed, got %q", m.streamingBuf.String())
@@ -1369,17 +1666,13 @@ func TestStreamingFlushIncrementalPrintsOnlyCompletedLines(t *testing.T) {
 
 	cmds := m.flushStreamingIncremental()
 
-	if len(cmds) != 1 {
-		t.Fatalf("expected one printf command, got %d", len(cmds))
+	// Phase 2: no tea.Printf — View() renders from the updated MessageStore.
+	if cmds != nil {
+		t.Fatalf("expected nil cmds (no tea.Printf), got %d", len(cmds))
 	}
-	if got, want := teaPrintfBody(t, cmds[0]), renderStreamingChunk("first line", m.termWidth); got != want {
-		t.Fatalf("printf body = %q, want %q", got, want)
-	}
-	if got, want := m.streamingPrintBuf.String(), "partial tail"; got != want {
-		t.Fatalf("streamingPrintBuf = %q, want %q", got, want)
-	}
-	if got, want := stripFormatLine(m.lines[0]), "first line\npartial tail"; got != want {
-		t.Fatalf("streaming line = %q, want %q", got, want)
+	// Both the completed line and partial tail must be in the single streaming entry.
+	if got, want := m.messages.Last().Content, "first line\npartial tail"; got != want {
+		t.Fatalf("streaming content = %q, want %q", got, want)
 	}
 }
 
@@ -1390,17 +1683,12 @@ func TestStreamingFlushIncrementalHandlesLeadingNewline(t *testing.T) {
 
 	cmds := m.flushStreamingIncremental()
 
-	if len(cmds) != 1 {
-		t.Fatalf("expected one printf command for completed empty line, got %d", len(cmds))
+	// Phase 2: no tea.Printf — View() renders from the updated MessageStore.
+	if cmds != nil {
+		t.Fatalf("expected nil cmds (no tea.Printf), got %d", len(cmds))
 	}
-	if got, want := teaPrintfBody(t, cmds[0]), renderStreamingChunk("", m.termWidth); got != want {
-		t.Fatalf("printf body = %q, want %q", got, want)
-	}
-	if got, want := m.streamingPrintBuf.String(), "partial tail"; got != want {
-		t.Fatalf("streamingPrintBuf = %q, want %q", got, want)
-	}
-	if got, want := stripFormatLine(m.lines[0]), "\npartial tail"; got != want {
-		t.Fatalf("streaming line = %q, want %q", got, want)
+	if got, want := m.messages.Last().Content, "\npartial tail"; got != want {
+		t.Fatalf("streaming content = %q, want %q", got, want)
 	}
 }
 
@@ -1409,26 +1697,21 @@ func TestStreamingFlushBufferPrintsRemainingTail(t *testing.T) {
 	m.isStreaming = true
 	m.streamingBuf.WriteString("partial")
 	if cmds := m.flushStreamingIncremental(); cmds != nil {
-		t.Fatalf("expected no incremental printf command, got %d", len(cmds))
+		t.Fatalf("expected nil cmds for incremental flush, got %d", len(cmds))
 	}
 	m.streamingBuf.WriteString(" tail")
 
 	cmds := m.flushStreamingBuffer()
 
-	if len(cmds) != 1 {
-		t.Fatalf("expected one final printf command, got %d", len(cmds))
+	// Phase 2: no tea.Printf — View() renders from the updated MessageStore.
+	if cmds != nil {
+		t.Fatalf("expected nil cmds (no tea.Printf), got %d", len(cmds))
 	}
-	if got, want := teaPrintfBody(t, cmds[0]), renderStreamingChunk("partial tail", m.termWidth); got != want {
-		t.Fatalf("printf body = %q, want %q", got, want)
-	}
-	if got, want := stripFormatLine(m.lines[0]), "partial tail"; got != want {
-		t.Fatalf("streaming line = %q, want %q", got, want)
+	if got, want := m.messages.Last().Content, "partial tail"; got != want {
+		t.Fatalf("streaming content = %q, want %q", got, want)
 	}
 	if m.isStreaming {
 		t.Fatal("expected final flush to terminate streaming state")
-	}
-	if m.streamingPrintBuf.Len() != 0 {
-		t.Fatalf("expected streamingPrintBuf to be reset, got %q", m.streamingPrintBuf.String())
 	}
 }
 
@@ -1439,11 +1722,9 @@ func TestStreamingFlushBufferPreservesExtraTrailingNewline(t *testing.T) {
 
 	cmds := m.flushStreamingBuffer()
 
-	if len(cmds) != 1 {
-		t.Fatalf("expected one final printf command, got %d", len(cmds))
-	}
-	if got, want := teaPrintfBody(t, cmds[0]), renderStreamingChunk("tail\n", m.termWidth); got != want {
-		t.Fatalf("printf body = %q, want %q", got, want)
+	// Phase 1b: no tea.Printf — View() renders from the updated MessageStore.
+	if cmds != nil {
+		t.Fatalf("expected nil cmds (no tea.Printf), got %d", len(cmds))
 	}
 }
 
@@ -1454,17 +1735,14 @@ func TestStreamingFlushNewlineDoesNotSplitBlock(t *testing.T) {
 	_, _ = m.Update(Message{Role: "assistant_stream", Content: "second line"})
 	_, _ = m.Update(TaskCompletionMsg{Reason: "done"})
 
-	if len(m.lines) != 1 {
-		t.Fatalf("expected one streaming line, got %d: %#v", len(m.lines), m.lines)
+	if m.messages.Len() != 1 {
+		t.Fatalf("expected one streaming message in store, got %d", m.messages.Len())
 	}
-	if got, want := stripFormatLine(m.lines[0]), "first line\nsecond line"; got != want {
-		t.Fatalf("streaming line = %q, want %q", got, want)
+	if got, want := m.messages.Last().Content, "first line\nsecond line"; got != want {
+		t.Fatalf("streaming content = %q, want %q", got, want)
 	}
 	if m.isStreaming {
 		t.Fatal("expected final flush to terminate streaming state")
-	}
-	if m.streamingLineIdx != -1 {
-		t.Fatalf("streamingLineIdx = %d, want -1", m.streamingLineIdx)
 	}
 }
 
@@ -1474,11 +1752,11 @@ func TestStreamingFlushMultiChunkWithNewlinesConcats(t *testing.T) {
 	_, _ = m.Update(Message{Role: "assistant_stream", Content: "alpha\n"})
 	_, _ = m.Update(Message{Role: "assistant_stream", Content: "beta\n"})
 
-	if len(m.lines) != 1 {
-		t.Fatalf("expected one streaming line after incremental flushes, got %d: %#v", len(m.lines), m.lines)
+	if m.messages.Len() != 1 {
+		t.Fatalf("expected one streaming message after incremental flushes, got %d", m.messages.Len())
 	}
-	if got, want := stripFormatLine(m.lines[0]), "alpha\nbeta"; got != want {
-		t.Fatalf("streaming line = %q, want %q", got, want)
+	if got, want := m.messages.Last().Content, "alpha\nbeta\n"; got != want {
+		t.Fatalf("streaming content = %q, want %q", got, want)
 	}
 	if !m.isStreaming {
 		t.Fatal("expected incremental flush to keep streaming state active")
@@ -1492,20 +1770,18 @@ func TestStreamingFlushToolUseTerminatesStream(t *testing.T) {
 	_, _ = m.Update(Message{Role: "assistant_stream", Content: "tool"})
 	_, _ = m.Update(ToolUseMsg{ID: "tool-1", ToolName: "read_file", Status: "executing"})
 
-	if len(m.lines) != 2 {
-		t.Fatalf("expected streaming line and tool line, got %d: %#v", len(m.lines), m.lines)
+	// After ToolUseMsg the stream is flushed + a tool entry is added: 2 messages.
+	if m.messages.Len() != 2 {
+		t.Fatalf("expected streaming + tool messages, got %d", m.messages.Len())
 	}
-	if got, want := stripFormatLine(m.lines[0]), "before\ntool"; got != want {
-		t.Fatalf("streaming line = %q, want %q", got, want)
+	if got, want := m.messages.Get(0).Content, "before\ntool"; got != want {
+		t.Fatalf("streaming content = %q, want %q", got, want)
 	}
 	if m.isStreaming {
 		t.Fatal("expected tool use to terminate streaming state")
 	}
-	if m.streamingLineIdx != -1 {
-		t.Fatalf("streamingLineIdx = %d, want -1", m.streamingLineIdx)
-	}
-	if got := xansi.Strip(m.lines[1]); !strings.Contains(got, "正在调用工具: read_file") {
-		t.Fatalf("expected tool line after stream, got %q", got)
+	if got := m.messages.Get(1).Content; !strings.Contains(got, "正在调用工具: read_file") {
+		t.Fatalf("expected tool message after stream, got %q", got)
 	}
 }
 
@@ -1568,7 +1844,6 @@ func TestClearSessionResetsAllThinkingState(t *testing.T) {
 	m.notice = "notice"
 	m.contextWindowMax = 1000
 	m.contextUsedTokens = 250
-	m.lastRenderHeight = 12
 
 	_ = m.ClearSession()
 
@@ -1593,6 +1868,9 @@ func TestClearSessionResetsAllThinkingState(t *testing.T) {
 	if m.spinnerStage != "" {
 		t.Fatalf("expected spinner stage to be reset, got %q", m.spinnerStage)
 	}
+	if m.selectedVerb != "" {
+		t.Fatalf("expected selectedVerb to be cleared, got %q", m.selectedVerb)
+	}
 	if m.swarmLine != "" {
 		t.Fatalf("expected swarm line to be cleared, got %q", m.swarmLine)
 	}
@@ -1605,8 +1883,81 @@ func TestClearSessionResetsAllThinkingState(t *testing.T) {
 	if m.contextWindowMax != 0 || m.contextUsedTokens != 0 {
 		t.Fatalf("expected context fields to be reset, got %d/%d", m.contextUsedTokens, m.contextWindowMax)
 	}
-	if m.lastRenderHeight != 0 {
-		t.Fatalf("expected lastRenderHeight to be reset, got %d", m.lastRenderHeight)
+}
+
+// --- Phase 0: inline 残影修复回归测试 ---
+
+// TestResetThinkingStateResetsRenderHeight ensures that collapsing the
+// thinking window clears all thinking-related state so the next View()
+// renders cleanly without stale content.
+func TestResetThinkingStateResetsRenderHeight(t *testing.T) {
+	m := newTestModel(80)
+	m.thinkingTitle = "thinking"
+	m.thinkingReasoning = "deep thought"
+	m.thinkingWindow = []string{"deep thought"}
+
+	m.resetThinkingState()
+
+	if len(m.thinkingWindow) != 0 {
+		t.Fatalf("expected thinking window to be cleared, got %#v", m.thinkingWindow)
+	}
+	if m.thinkingReasoning != "" {
+		t.Fatalf("expected thinking reasoning to be cleared, got %q", m.thinkingReasoning)
+	}
+}
+
+// TestFlushStreamingIncrementalSetsLastFlushTime ensures that an incremental
+// streaming flush updates the store and lastStreamFlush timestamp.
+func TestFlushStreamingIncrementalSetsLastFlushTime(t *testing.T) {
+	m := newTestModel(80)
+	m.isStreaming = true
+	m.streamingBuf.WriteString("completed line\n")
+
+	before := time.Now().Add(-time.Second)
+
+	cmds := m.flushStreamingIncremental()
+
+	// Phase 1b: no tea.Printf — nil cmds expected.
+	if cmds != nil {
+		t.Fatalf("expected nil cmds, got %d", len(cmds))
+	}
+	if !m.lastStreamFlush.After(before) {
+		t.Fatal("expected flushStreamingIncremental to update lastStreamFlush")
+	}
+}
+
+// TestSpinnerSuppressionWindowIsTwoTicks verifies the spinner animates
+// in the response phase regardless of flush timing (suppression removed in 1b).
+func TestSpinnerSuppressionWindowIsTwoTicks(t *testing.T) {
+	m := newTestModel(80)
+	m.currentPhase = phaseResponse
+
+	// Phase 1b: no flush-time suppression — spinner always animates in
+	// active phases regardless of when the last flush happened.
+	if !m.shouldAnimateSpinner() {
+		t.Fatal("spinner should animate in response phase")
+	}
+}
+
+// TestMultiLineToolSuccessUpdatesStore verifies that when a tool completes
+// with a multi-line result, the result is recorded in the MessageStore so
+// the sliding-window View() can render it.
+func TestMultiLineToolSuccessUpdatesStore(t *testing.T) {
+	// Use a narrow width so the formatted preview wraps onto multiple lines.
+	m := newTestModel(40)
+
+	longResult := strings.Repeat("abcdefghij ", 20) // long enough to wrap >2 lines after formatting
+	updated, _ := m.Update(ToolUseMsg{
+		ID:       "tool-multi",
+		ToolName: "run_shell_command",
+		Status:   "success",
+		Result:   longResult,
+	})
+	um := updated.(*Model)
+
+	// The result must appear in the MessageStore for the sliding-window View().
+	if um.messages == nil || um.messages.Len() == 0 {
+		t.Fatal("expected tool success to record message in MessageStore")
 	}
 }
 

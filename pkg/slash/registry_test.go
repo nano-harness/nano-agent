@@ -23,7 +23,7 @@ func TestNewRegistry_BuiltinCommands(t *testing.T) {
 		"agents", "agents:list", "agents:show",
 		"models", "model list", "model use", "model status", "model fallback", "model doctor", "context status",
 		"doctor", "events", "audit",
-		"routines list", "routines add", "routines remove", "routines status", "routines pause", "routines resume",
+		"routines list", "routines add", "routines remove", "routines status", "routines pause", "routines resume", "routines run",
 		"opsx:propose", "opsx:explore", "opsx:new", "opsx:continue", "opsx:ff",
 		"opsx:apply", "opsx:verify", "opsx:sync", "opsx:status",
 		"opsx:archive", "opsx:bulk-archive",
@@ -223,5 +223,114 @@ Ship $ARGUMENTS
 	}
 	if got.PreludeTimeoutSeconds != 7 || got.PreludeOnError != "abort" || got.PreludeOutput != "full" {
 		t.Fatalf("unexpected prelude options: %#v", got)
+	}
+}
+
+func TestNewRegistry_AgentProfileRegistered(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".nano", "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "reviewer.yaml"), []byte(`description: Review code
+initial_prompt: Review the requested changes.
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := slash.NewRegistry(cwd)
+	cmd, ok := r.Find("reviewer")
+	if !ok {
+		t.Fatal("agent profile not registered as slash command")
+	}
+	if cmd.Category != slash.CategoryAgent {
+		t.Errorf("Category = %q, want %q", cmd.Category, slash.CategoryAgent)
+	}
+	if cmd.Source != "agent-profile" {
+		t.Errorf("Source = %q, want agent-profile", cmd.Source)
+	}
+	if cmd.Description == "" {
+		t.Errorf("Description should be non-empty")
+	}
+}
+
+func TestNewRegistry_AgentProfileBuiltinConflict(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".nano", "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// "yolo" is a built-in permission command.
+	if err := os.WriteFile(filepath.Join(dir, "yolo.yaml"), []byte(`description: hostile takeover`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := slash.NewRegistry(cwd)
+	cmd, ok := r.Find("yolo")
+	if !ok {
+		t.Fatal("built-in /yolo missing")
+	}
+	if cmd.Source == "agent-profile" {
+		t.Fatalf("agent profile overrode built-in yolo: %#v", cmd)
+	}
+	if cmd.Category != slash.CategoryPermission {
+		t.Errorf("Category = %q, want permission", cmd.Category)
+	}
+}
+
+func TestNewRegistry_AgentProfileCustomCommandConflict(t *testing.T) {
+	cwd := t.TempDir()
+	cmdDir := filepath.Join(cwd, ".nano", "commands")
+	if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmdDir, "deploy.md"), []byte(`---
+description: Deploy
+---
+Do deploy
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(cwd, ".nano", "agents")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "deploy.yaml"), []byte(`description: agent deploy`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := slash.NewRegistry(cwd)
+	cmd, ok := r.Find("deploy")
+	if !ok {
+		t.Fatal("custom /deploy missing")
+	}
+	if cmd.Source == "agent-profile" {
+		t.Fatalf("agent profile overrode custom command: %#v", cmd)
+	}
+	if cmd.Category != slash.CategoryCustom {
+		t.Errorf("Category = %q, want custom", cmd.Category)
+	}
+}
+
+func TestNewRegistry_AgentProfileInvalidName(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".nano", "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Names with ':' or '.' must be rejected; agentprofile uses filename as
+	// the default Name when frontmatter is absent.
+	if err := os.WriteFile(filepath.Join(dir, "bad name.yaml"), []byte(`name: "bad:name"
+description: x
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := slash.NewRegistry(cwd)
+	if _, ok := r.Find("bad:name"); ok {
+		t.Fatal("agent profile with invalid name should not be registered")
+	}
+	if _, ok := r.Find("bad name"); ok {
+		t.Fatal("agent profile with space in name should not be registered")
 	}
 }

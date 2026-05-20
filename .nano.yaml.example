@@ -16,12 +16,15 @@ verbose: false
 # model: "deepseek/deepseek-chat"
 # fallbacks:
 #   - "openai/gpt-4.1"
+#   - "anthropic/claude-sonnet-4.6"
 #   - "moonshot/kimi-k2"
 # providers:
 #   deepseek:
 #     api_key_env: NANO_DEEPSEEK_API_KEY
 #   openai:
 #     api_key_env: OPENAI_API_KEY
+#   anthropic:
+#     api_key_env: ANTHROPIC_API_KEY
 #   moonshot:
 #     api_key_env: MOONSHOT_API_KEY
 #     base_url: "https://api.moonshot.cn/v1"
@@ -98,17 +101,18 @@ hooks:
 
 
 # Sub-agents Configuration (Expert System)
-# Define specialized sub-agents that can be invoked with @agent-name syntax
+# Define specialized sub-agents that can be invoked with /agent-name slash command
 #
 # IMPORTANT: Expert Trigger Syntax
-#   - Use @kebab-case-name to invoke an expert (e.g., "@coder help me debug")
+#   - Use /kebab-case-name to invoke an expert (e.g., "/coder help me debug")
 #   - Names are automatically converted to kebab-case (coder -> coder, myAgent -> my-agent)
-#   - LLM cannot directly call experts; only users can trigger them with @ syntax
+#   - LLM cannot directly call experts; only users can trigger them with / syntax
+#   - The `@` prefix is reserved for file references (e.g. `@README.md`)
 #
 # Built-in Experts (always available):
-#   @investigator - Read-only codebase exploration and analysis
-#   @help         - Answers questions about nano-agent CLI from documentation
-#   @generalist   - General-purpose agent with full tool access
+#   /investigator - Read-only codebase exploration and analysis
+#   /help         - Answers questions about nano-agent CLI from documentation
+#   /generalist   - General-purpose agent with full tool access
 #
 # Custom experts can be defined in:
 #   - Project:  .nano/agents/*.md (highest priority)
@@ -342,6 +346,17 @@ sandbox:
 #   "acceptEdits" - Automatically approve filesystem write/edit tools; shell commands still ask
 #   "yolo"        - Skip ALL permission checks (use with caution!)
 # permission_mode: "default"
+
+# Spinner Verbs Configuration
+# Customize the dynamic verb displayed alongside the spinner animation.
+# spinner_verbs:
+#   enabled: true              # Show spinner verbs (default: true)
+#   mode: "append"             # "append" adds to defaults, "replace" uses only custom verbs
+#   verbs:                     # Custom verb list (examples below)
+#     - "Brewing"
+#     - "Pondering"
+#     - "Crafting"
+#     - "Weaving"
 
 # Pre-defined session allowlist rules (applied at startup)
 # Each entry follows the "ToolName" or "ToolName(specifier)" format with glob support.

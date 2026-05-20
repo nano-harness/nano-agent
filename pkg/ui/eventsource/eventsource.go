@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/llm"
 )
 
 type ConnectionState int
@@ -38,6 +39,7 @@ type Outbound struct {
 	Text     string
 	Approval *ApprovalDecision
 	Control  string
+	Images   []llm.MultimodalImage // Optional multimodal images for submit
 }
 
 type ApprovalDecision struct {

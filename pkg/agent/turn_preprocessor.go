@@ -37,7 +37,6 @@ func (t *Turn) preprocessInput(ctx context.Context, cfg *config.Config) {
 				MaxArtifactSize: cfg.OpenSpec.MaxArtifactSize,
 			}
 		}),
-		preprocessor.AgentMentionStep(),
 		t.skillPreprocessorStep(ctx, cfg),
 		preprocessor.RoutinesStep(),
 	)

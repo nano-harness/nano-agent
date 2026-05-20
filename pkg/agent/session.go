@@ -34,8 +34,10 @@ type Session struct {
 	StateChangedAt      time.Time    `json:"state_changed_at"`
 	LastPersistedSeq    int64        `json:"last_persisted_seq"`
 	LastCompactionSeq   int64        `json:"last_compaction_seq"`
+	Goal                *GoalState   `json:"goal,omitempty"`
 	transcript          *TranscriptWriter
 	ralphContext        *RalphContext
+	goalContext         *GoalContext
 	mutex               sync.RWMutex
 }
 
@@ -74,6 +76,16 @@ func (s *Session) initRuntimeState() {
 		return
 	}
 	s.ralphContext = NewRalphContext(nil)
+	s.goalContext = NewGoalContextFromState(nil, s.Goal)
+	s.goalContext.SetOnChange(func(state GoalState) {
+		s.mutex.Lock()
+		defer s.mutex.Unlock()
+		if state.Condition == "" && !state.Active && state.AchievedAt == nil {
+			s.Goal = nil
+			return
+		}
+		s.Goal = &state
+	})
 	if tw, err := NewTranscriptWriter(s.ID); err == nil {
 		s.transcript = tw
 	} else {
@@ -103,6 +115,16 @@ func (s *Session) RalphContext() *RalphContext {
 		s.ralphContext = NewRalphContext(nil)
 	}
 	return s.ralphContext
+}
+
+func (s *Session) GoalContext() *GoalContext {
+	if s == nil {
+		return NewGoalContext(nil)
+	}
+	if s.goalContext == nil {
+		s.initRuntimeState()
+	}
+	return s.goalContext
 }
 
 // generateSessionID generates a unique session ID.
@@ -363,6 +385,7 @@ type SessionManager struct {
 	loadInProgress    map[string]chan struct{}
 	lifecycleHooks    []LifecycleHook
 	metrics           *SessionMetrics
+	deletedSessions   map[string]time.Time // tracks recently deleted sessions to prevent resurrection
 }
 
 // SessionManagerOption is a functional option for SessionManager.
@@ -405,6 +428,7 @@ func NewSessionManager(opts ...SessionManagerOption) *SessionManager {
 		backgroundCancels: make(map[string][]context.CancelFunc),
 		loadInProgress:    make(map[string]chan struct{}),
 		metrics:           NewSessionMetrics(),
+		deletedSessions:   make(map[string]time.Time),
 	}
 
 	for _, opt := range opts {
@@ -524,6 +548,11 @@ func (sm *SessionManager) SaveSession(sessionID string) error {
 	}
 
 	sm.mutex.RLock()
+	// Check if session was recently deleted
+	if _, wasDeleted := sm.deletedSessions[sessionID]; wasDeleted {
+		sm.mutex.RUnlock()
+		return fmt.Errorf("session %s was deleted, refusing to resurrect", sessionID)
+	}
 	session, exists := sm.sessions[sessionID]
 	sm.mutex.RUnlock()
 
@@ -607,6 +636,8 @@ func (sm *SessionManager) DeleteSession(sessionID string) (bool, error) {
 		logger.Infof("Deleted session from memory: %s", sessionID)
 		deleted = true
 	}
+	// Mark session as deleted to prevent resurrection by concurrent saves
+	sm.deletedSessions[sessionID] = time.Now()
 	storage := sm.storage
 	sm.mutex.Unlock()
 
@@ -622,9 +653,12 @@ func (sm *SessionManager) DeleteSession(sessionID string) (bool, error) {
 
 	sm.emitLifecycle(context.Background(), sessionID, SessionLifecycleBeforeCleanup, map[string]interface{}{"reason": "user_delete"})
 	if storage != nil {
+		logger.Infof("Attempting to delete session %s from storage", sessionID)
 		if err := storage.DeleteSession(sessionID); err != nil {
+			logger.Errorf("Failed to delete session %s from storage: %v", sessionID, err)
 			return deleted, err
 		}
+		logger.Infof("Successfully deleted session %s from storage", sessionID)
 		// If storage.DeleteSession succeeds (even if not found), we consider it handled.
 		// We can't easily know if it was actually in storage without checking first,
 		// but checking is expensive.
@@ -709,8 +743,13 @@ func (sm *SessionManager) SaveSessionIfActive(ctx context.Context, sessionID str
 	}
 
 	sm.mutex.RLock()
-	defer sm.mutex.RUnlock()
+	// Check if session was recently deleted
+	if _, wasDeleted := sm.deletedSessions[sessionID]; wasDeleted {
+		sm.mutex.RUnlock()
+		return fmt.Errorf("session %s was deleted, refusing to resurrect", sessionID)
+	}
 	session, exists := sm.sessions[sessionID]
+	sm.mutex.RUnlock()
 	if !exists {
 		return fmt.Errorf("session %s no longer active", sessionID)
 	}
@@ -762,6 +801,15 @@ func (sm *SessionManager) cleanupExpiredSessions() {
 	for _, item := range expired {
 		delete(sm.sessions, item.id)
 	}
+
+	// Clean up old deleted session markers (keep for 5 minutes to handle race conditions)
+	deletionTTL := 5 * time.Minute
+	for sessionID, deletedAt := range sm.deletedSessions {
+		if now.Sub(deletedAt) > deletionTTL {
+			delete(sm.deletedSessions, sessionID)
+		}
+	}
+
 	storage := sm.storage
 	sm.mutex.Unlock()
 

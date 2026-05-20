@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -108,6 +109,83 @@ read_file_max_lines: 500
 
 	if cfg.ReadFileMaxLines != 500 {
 		t.Errorf("Expected ReadFileMaxLines 500, got %d", cfg.ReadFileMaxLines)
+	}
+}
+
+func TestLoadConfig_EnvInterpolation(t *testing.T) {
+	tempDir := t.TempDir()
+	originalDir, _ := os.Getwd()
+	defer func() { _ = os.Chdir(originalDir) }()
+	_ = os.Chdir(tempDir)
+	t.Setenv("SYMPHONY_MCP_URL", "http://127.0.0.1:3456/mcp")
+	t.Setenv("SYMPHONY_TOKEN", "secret-token")
+
+	content := `mcp:
+  servers:
+    - name: symphony
+      transport: streamable
+      url: "${env:SYMPHONY_MCP_URL}"
+      headers:
+        X-Symphony-Token: "${env:SYMPHONY_TOKEN}"
+`
+	if err := os.WriteFile(".nano.yaml", []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if got := cfg.MCP.Servers[0].URL; got != "http://127.0.0.1:3456/mcp" {
+		t.Fatalf("URL = %q", got)
+	}
+	if got := cfg.MCP.Servers[0].Headers["X-Symphony-Token"]; got != "secret-token" {
+		t.Fatalf("header token = %q", got)
+	}
+}
+
+func TestLoadConfig_EnvInterpolationMissingVar(t *testing.T) {
+	tempDir := t.TempDir()
+	originalDir, _ := os.Getwd()
+	defer func() { _ = os.Chdir(originalDir) }()
+	_ = os.Chdir(tempDir)
+
+	if err := os.WriteFile(".nano.yaml", []byte(`api_key: "${env:NANO_MISSING_TEST_SECRET}"`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadConfig("")
+	if err == nil || !strings.Contains(err.Error(), "NANO_MISSING_TEST_SECRET") {
+		t.Fatalf("expected missing env error, got %v", err)
+	}
+}
+
+func TestLoadConfig_SymphonyProfileInjection(t *testing.T) {
+	tempDir := t.TempDir()
+	originalDir, _ := os.Getwd()
+	defer func() { _ = os.Chdir(originalDir) }()
+	_ = os.Chdir(tempDir)
+	t.Setenv("SYMPHONY_MCP_URL", "http://127.0.0.1:3456/mcp")
+	t.Setenv("SYMPHONY_TOKEN", "secret-token")
+
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if !cfg.EnableMCP || len(cfg.MCP.Servers) == 0 {
+		t.Fatalf("expected MCP server injection: %#v", cfg.MCP)
+	}
+	if cfg.MCP.Servers[0].Name != "symphony" || cfg.MCP.Servers[0].Transport != "streamable" {
+		t.Fatalf("unexpected server: %#v", cfg.MCP.Servers[0])
+	}
+	found := false
+	for _, name := range cfg.Skills.AutoActivate {
+		if name == "nano-symphony" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected nano-symphony auto activation: %#v", cfg.Skills.AutoActivate)
 	}
 }
 

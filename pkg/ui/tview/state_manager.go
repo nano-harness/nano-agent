@@ -6,7 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/ui/spinnerverbs"
 )
 
 // AgentState represents the high-level agent execution state
@@ -61,17 +63,24 @@ type StateManager struct {
 	callbackMu      sync.Mutex
 	quit            chan struct{}
 	stopOnce        sync.Once
+	spinnerVerbs    []string // Effective list of spinner verbs
+	selectedVerb    string   // verb selected at start of active cycle
 }
 
-// NewStateManager creates a new state manager
-func NewStateManager() *StateManager {
+// NewStateManager creates a new state manager with optional spinner verbs configuration
+func NewStateManager(cfg *config.Config) *StateManager {
+	var spinnerVerbsCfg *config.SpinnerVerbsConfig
+	if cfg != nil {
+		spinnerVerbsCfg = cfg.SpinnerVerbs
+	}
 	sm := &StateManager{
 		currentState: UIState{
 			AgentState: AgentStateIdle,
 			LastUpdate: time.Now(),
 		},
-		maxLogSize: 100,
-		quit:       make(chan struct{}),
+		maxLogSize:   100,
+		quit:         make(chan struct{}),
+		spinnerVerbs: spinnerverbs.EffectiveVerbs(spinnerVerbsCfg),
 	}
 	sm.startAnimation()
 	return sm
@@ -111,6 +120,16 @@ func (sm *StateManager) TransitionTo(newState AgentState, activity string, conte
 	sm.currentState.AgentState = newState
 	sm.currentState.CurrentActivity = activity
 	sm.currentState.LastUpdate = time.Now()
+
+	// Select or clear the spinner verb based on state
+	switch newState {
+	case AgentStateProcessing, AgentStateThinking, AgentStateToolExecution:
+		if sm.selectedVerb == "" {
+			sm.selectedVerb = spinnerverbs.RandomVerb(sm.spinnerVerbs)
+		}
+	default:
+		sm.selectedVerb = ""
+	}
 
 	// Extract context information
 	if toolName, ok := context["tool_name"].(string); ok {
@@ -234,18 +253,33 @@ func (sm *StateManager) FormatStatusText() string {
 	animationChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	animChar := animationChars[sm.animationFrame%len(animationChars)]
 
+	// Get spinner verb for current cycle
+	spinnerVerb := sm.selectedVerb
+
 	// Format based on agent state
 	switch sm.currentState.AgentState {
 	case AgentStateIdle:
 		status.WriteString("[green]🟢 空闲[white]")
 	case AgentStateProcessing:
-		fmt.Fprintf(&status, "[yellow]%s 处理输入中...[white]", animChar)
+		if spinnerVerb != "" {
+			fmt.Fprintf(&status, "[yellow]%s %s 处理输入中...[white]", animChar, spinnerVerb)
+		} else {
+			fmt.Fprintf(&status, "[yellow]%s 处理输入中...[white]", animChar)
+		}
 	case AgentStateThinking:
-		fmt.Fprintf(&status, "[yellow]%s 思考中...[white]", animChar)
+		if spinnerVerb != "" {
+			fmt.Fprintf(&status, "[yellow]%s %s 思考中...[white]", animChar, spinnerVerb)
+		} else {
+			fmt.Fprintf(&status, "[yellow]%s 思考中...[white]", animChar)
+		}
 	case AgentStateToolExecution:
-		fmt.Fprintf(&status, "[orange]%s 执行工具中...[white]", animChar)
+		if spinnerVerb != "" {
+			fmt.Fprintf(&status, "[orange]%s %s 执行工具中...[white]", animChar, spinnerVerb)
+		} else {
+			fmt.Fprintf(&status, "[orange]%s 执行工具中...[white]", animChar)
+		}
 	case AgentStateWaitingApproval:
-		status.WriteString("[magenta]🤔 等待用户批准[white] | [yellow]使用↑/↓选择，回车确认，ESC取消[white]")
+		status.WriteString("[magenta]🤔 等待用户批准[white] | [yellow]使用↑/↓选择，回车确认,ESC取消[white]")
 	case AgentStateError:
 		status.WriteString("[red]❌ 错误[white]")
 	case AgentStateCompleted:

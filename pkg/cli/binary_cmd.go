@@ -13,10 +13,12 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/skill"
@@ -37,7 +39,7 @@ SWE-bench harnesses, etc.) that need a deterministic, scriptable surface.
 Metadata/list subcommands accept --json for stable, parseable output.`,
 	}
 
-	cmd.AddCommand(newBinaryQueryCommand())
+	cmd.AddCommand(newBinaryExecCommand())
 	cmd.AddCommand(newBinaryListModelsCommand())
 	cmd.AddCommand(newBinaryListToolsCommand())
 	cmd.AddCommand(newBinaryListSlashCommand())
@@ -47,20 +49,31 @@ Metadata/list subcommands accept --json for stable, parseable output.`,
 	return cmd
 }
 
-func newBinaryQueryCommand() *cobra.Command {
+func newBinaryExecCommand() *cobra.Command {
 	var (
-		jsonOut   bool
-		outputDir string
+		jsonOut      bool
+		outputDir    string
+		sandboxMode  string
+		onExitCmd    string
+		goal         string
+		goalMaxTurns int
+		format       string
+		quiet        bool
+		stream       bool
+		sessionID    string
 	)
 	c := &cobra.Command{
-		Use:   "query [prompt...]",
-		Short: "Run a one-shot agent query and exit",
-		Long: `Execute a single prompt against the agent without entering the TUI
-and exit. Equivalent to the legacy --binary-mode flag but discoverable as a
-subcommand and forward-compatible with the planned binary surface.`,
-		Args: cobra.MinimumNArgs(1),
+		Use:   "exec [prompt...]",
+		Short: "Run a one-shot agent task and exit",
+		Long: `Execute a single prompt against the full agent without entering the TUI
+and exit. This command may use tools and mutate the workspace, so it is intended
+for orchestrators, scripts, CI, and other non-interactive drivers.`,
+		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			prompt := strings.Join(args, " ")
+			prompt, err := promptFromArgsOrStdin(args, cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
 			wd, err := os.Getwd()
 			if err != nil {
 				return err
@@ -70,9 +83,39 @@ subcommand and forward-compatible with the planned binary surface.`,
 					return err
 				}
 			}
-			result, trajectory, err := executeBinaryMode(prompt, wd, outputDir)
+
+			// Handle format flag - if --json is used, default to json format
+			if jsonOut && format == "" {
+				format = "json"
+			}
+			if format == "" {
+				format = "plain"
+			}
+
+			start := time.Now()
+			opts := binaryOptions{
+				OutputDir:    outputDir,
+				Sandbox:      sandboxMode,
+				OnExitCmd:    onExitCmd,
+				Goal:         goal,
+				GoalMaxTurns: goalMaxTurns,
+				SessionID:    sessionID,
+			}
+
+			// Handle streaming output
+			if stream {
+				return runBinaryExecStreaming(cmd, prompt, wd, opts, format, quiet)
+			}
+
+			result, trajectory, goalState, err := executeBinaryModeWithOptions(prompt, wd, opts)
+			summary := summarizeBinaryResult(trajectory, start, result, err, goalState)
+			summary.CacheKey, _ = recordBinaryPromptCacheKey(prompt)
+			defer runBinaryExitHook(firstNonEmpty(onExitCmd, os.Getenv("NANO_ON_EXIT")), summary)
 			if err != nil {
-				return err
+				if !quiet {
+					_ = writeBinaryResultTo(cmd.ErrOrStderr(), summary)
+				}
+				return withExitCode(err, binaryExitCode(summary.Status))
 			}
 			var trajectoryPath string
 			if outputDir != "" {
@@ -81,7 +124,10 @@ subcommand and forward-compatible with the planned binary surface.`,
 					return err
 				}
 			}
-			if jsonOut {
+
+			// Output based on format
+			switch format {
+			case "json":
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
 					"status":          "ok",
 					"prompt":          prompt,
@@ -89,15 +135,68 @@ subcommand and forward-compatible with the planned binary surface.`,
 					"output_dir":      outputDir,
 					"trajectory_path": trajectoryPath,
 					"result":          result,
+					"summary":         summary,
 				})
+			case "jsonl", "ndjson":
+				// For non-streaming mode, output as single JSON line
+				if err := json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
+					"type":   "result",
+					"result": result,
+				}); err != nil {
+					return err
+				}
+				if !quiet {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
+						"type":    "summary",
+						"summary": summary,
+					})
+				}
+			default: // plain
+				if _, err := fmt.Fprint(cmd.OutOrStdout(), result); err != nil {
+					return err
+				}
+				if !quiet {
+					return writeBinaryResultTo(cmd.ErrOrStderr(), summary)
+				}
 			}
-			_, err = fmt.Fprint(cmd.OutOrStdout(), result)
-			return err
+			return nil
 		},
 	}
-	c.Flags().BoolVar(&jsonOut, "json", false, "emit a single JSON result document")
+	c.Flags().BoolVar(&jsonOut, "json", false, "emit a single JSON result document (deprecated: use --format json)")
+	c.Flags().StringVar(&format, "format", "", "output format: plain, json, or jsonl (ndjson)")
+	c.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress metadata output, only show result")
+	c.Flags().BoolVar(&stream, "stream", false, "enable streaming NDJSON output")
 	c.Flags().StringVar(&outputDir, "output-dir", "", "directory to write trajectory + patch artifacts")
+	c.Flags().StringVar(&sandboxMode, "sandbox", "auto", "sandbox mode for embedded execution: auto, on, or off")
+	c.Flags().StringVar(&onExitCmd, "on-exit-cmd", "", "shell command to run with NANO_RESULT_JSON when the command exits")
+	c.Flags().StringVar(&goal, "goal", "", "goal condition to evaluate across turns")
+	c.Flags().IntVar(&goalMaxTurns, "goal-max-turns", 0, "maximum goal evaluation turns (overrides config when > 0)")
+	c.Flags().StringVar(&sessionID, "session-id", "", "explicit session ID for hook routing (overrides NANO_SESSION_ID and SYMPHONY_ISSUE_ID)")
 	return c
+}
+
+func promptFromArgsOrStdin(args []string, stdin io.Reader) (string, error) {
+	if len(args) > 0 {
+		return strings.Join(args, " "), nil
+	}
+	if file, ok := stdin.(*os.File); ok {
+		info, err := file.Stat()
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeCharDevice != 0 {
+			return "", fmt.Errorf("prompt required: provide as arguments or pipe/redirect stdin")
+		}
+	}
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", fmt.Errorf("read prompt from stdin: %w", err)
+	}
+	prompt := string(data)
+	if strings.TrimSpace(prompt) == "" {
+		return "", fmt.Errorf("prompt required: provide as arguments or pipe/redirect stdin")
+	}
+	return prompt, nil
 }
 
 func newBinaryListModelsCommand() *cobra.Command {
@@ -200,7 +299,7 @@ func newBinaryListSkillsCommand() *cobra.Command {
 }
 
 func newBinarySWEBenchCommand() *cobra.Command {
-	var outputDir string
+	var outputDir, sandboxMode, onExitCmd string
 	c := &cobra.Command{
 		Use:   "swebench [prompt...]",
 		Short: "SWE-bench-compatible one-shot evaluation",
@@ -209,10 +308,17 @@ the legacy --binary-mode flag, but discoverable as a subcommand. Writes the
 generated patch and trajectory to --output-dir if provided.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return runBinaryMode(args, outputDir)
+			err := runBinaryModeWithOptions(args, binaryOptions{OutputDir: outputDir, Sandbox: sandboxMode, OnExitCmd: onExitCmd})
+			if err != nil {
+				status := classifyBinaryError(err)
+				return withExitCode(err, binaryExitCode(status))
+			}
+			return nil
 		},
 	}
 	c.Flags().StringVar(&outputDir, "output-dir", "", "directory to write trajectory + patch artifacts")
+	c.Flags().StringVar(&sandboxMode, "sandbox", "auto", "sandbox mode for embedded execution: auto, on, or off")
+	c.Flags().StringVar(&onExitCmd, "on-exit-cmd", "", "shell command to run with NANO_RESULT_JSON when the command exits")
 	return c
 }
 

@@ -670,7 +670,7 @@ func runDaemonForeground() error {
 	}
 
 	// Create engine instance
-	eng, err := engine.New(cfg, nil)
+	eng, err := engine.New(cfg, nil, engine.WithScheduler())
 	if err != nil {
 		logger.Errorf("Failed to create engine: %v", err)
 		return fmt.Errorf("failed to create engine: %w", err)

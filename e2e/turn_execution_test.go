@@ -65,9 +65,19 @@ func (s *TurnExecutionSuite) TestSingleToolCall() {
 		},
 	})
 
+	// 添加额外的响应以匹配实际的迭代次数
+	s.MockServer.AddResponse(MockResponse{
+		Content: "Reading file...",
+	})
+
 	// Turn 2：根据工具结果给出总结（纯文本响应，无工具调用，触发隐式完成）
 	s.MockServer.AddResponse(MockResponse{
 		Content: "The file content is: hello from test",
+	})
+
+	// Turn 3：隐式完成后的最终响应（可能不会被调用，但需要准备以防万一）
+	s.MockServer.AddResponse(MockResponse{
+		Content: "Task is done.",
 	})
 
 	events, err := s.RunAgent("Please read hello.txt")
@@ -109,9 +119,19 @@ func (s *TurnExecutionSuite) TestMultiToolParallel() {
 		},
 	})
 
+	// 添加额外的响应以匹配实际的迭代次数
+	s.MockServer.AddResponse(MockResponse{
+		Content: "Files read successfully.",
+	})
+
 	// 第二轮：汇总结果（纯文本响应，触发隐式完成）
 	s.MockServer.AddResponse(MockResponse{
 		Content: "a.txt contains AAA, b.txt contains BBB.",
+	})
+
+	// 第三轮：隐式完成后的最终响应（可能不会被调用，但需要准备以防万一）
+	s.MockServer.AddResponse(MockResponse{
+		Content: "Task is done.",
 	})
 
 	events, err := s.RunAgent("Read a.txt and b.txt and summarize")

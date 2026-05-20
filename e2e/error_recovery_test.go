@@ -126,6 +126,11 @@ func (s *ErrorRecoverySuite) TestToolRecovery_RetrySuccess() {
 		},
 	})
 
+	// 添加额外的响应以匹配实际的迭代次数
+	s.MockServer.AddResponse(MockResponse{
+		Content: "Tool execution completed.",
+	})
+
 	// 第二轮：在工具最终成功后调用 task_done
 	s.MockServer.AddResponse(MockResponse{
 		Content: "Flaky tool eventually succeeded.",
@@ -136,6 +141,11 @@ func (s *ErrorRecoverySuite) TestToolRecovery_RetrySuccess() {
 				Arguments: `{"status":"success"}`,
 			},
 		},
+	})
+
+	// 第三轮：task_done 执行后的最终响应
+	s.MockServer.AddResponse(MockResponse{
+		Content: "Task completed.",
 	})
 
 	_, err = s.RunAgent("Please use flaky_tool and then finish.")

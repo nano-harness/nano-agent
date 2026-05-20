@@ -5,9 +5,11 @@
 package slash
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/nano-harness/nano-agent/pkg/agentprofile"
 	"github.com/nano-harness/nano-agent/pkg/skill"
 )
 
@@ -107,6 +109,13 @@ var builtinCommands = []Command{
 		Description: "切换思考模式（开启/关闭/查看状态）",
 		Usage:       "/think [on|off|status]",
 		Category:    CategoryPermission,
+		Source:      "built-in",
+	},
+	{
+		Name:        "goal",
+		Description: "设置完成目标，agent 持续工作直到条件满足",
+		Usage:       "/goal [condition|clear|status]",
+		Category:    CategoryObserve,
 		Source:      "built-in",
 	},
 	{
@@ -327,6 +336,13 @@ var builtinCommands = []Command{
 		Category:    CategoryRoutines,
 		Source:      "built-in",
 	},
+	{
+		Name:        "routines run",
+		Description: "手动触发指定定时任务",
+		Usage:       "/routines run <id>",
+		Category:    CategoryRoutines,
+		Source:      "built-in",
+	},
 
 	// ── openspec ─────────────────────────────────────────────────────────────
 	{
@@ -461,7 +477,29 @@ func NewRegistry(cwd string) *Registry {
 		})
 	}
 
-	// Re-sort to place any added custom commands correctly.
+	// Register agent profiles from .nano/agents/ as slash commands. Built-in
+	// and custom commands take precedence; conflicting profiles are skipped.
+	existing := r.commandNameSet()
+	agentMgr := agentprofile.NewManager(cwd)
+	for _, p := range agentMgr.List() {
+		name := strings.TrimSpace(p.Name)
+		if !isValidAgentSlashName(name) {
+			continue
+		}
+		if existing[name] {
+			continue
+		}
+		r.commands = append(r.commands, Command{
+			Name:        name,
+			Description: firstNonEmpty(p.Description, "Run agent profile "+name),
+			Usage:       "/" + name + " [prompt]",
+			Category:    CategoryAgent,
+			Source:      "agent-profile",
+		})
+		existing[name] = true
+	}
+
+	// Re-sort to place any added commands correctly.
 	sort.Slice(r.commands, func(i, j int) bool {
 		ci, cj := r.commands[i], r.commands[j]
 		oi := categoryIndex(ci.Category)
@@ -544,6 +582,17 @@ func (r *Registry) Names() []string {
 	return names
 }
 
+// Find returns the registered Command with the given name (without the
+// leading slash) and reports whether it was found.
+func (r *Registry) Find(name string) (Command, bool) {
+	for _, cmd := range r.commands {
+		if cmd.Name == name {
+			return cmd, true
+		}
+	}
+	return Command{}, false
+}
+
 // categoryIndex returns the display-order index for a category.
 func categoryIndex(c Category) int {
 	for i, cat := range categoryOrder {
@@ -552,4 +601,39 @@ func categoryIndex(c Category) int {
 		}
 	}
 	return len(categoryOrder)
+}
+
+// agentSlashNameRE constrains agent profile slash command names to safe
+// characters so they cannot collide with paths, namespaces, or sub-command
+// separators.
+var agentSlashNameRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// isValidAgentSlashName reports whether name is suitable to be registered as
+// a slash command. Empty names, names containing spaces, '.', ':' or path
+// separators are rejected.
+func isValidAgentSlashName(name string) bool {
+	if name == "" {
+		return false
+	}
+	return agentSlashNameRE.MatchString(name)
+}
+
+// commandNameSet returns the set of currently registered command names.
+func (r *Registry) commandNameSet() map[string]bool {
+	out := make(map[string]bool, len(r.commands))
+	for _, c := range r.commands {
+		out[c.Name] = true
+	}
+	return out
+}
+
+// firstNonEmpty returns the first non-empty value from values, or "" if all
+// values are empty/whitespace-only.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

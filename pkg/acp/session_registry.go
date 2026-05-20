@@ -27,7 +27,7 @@ func NewSessionRegistry() *SessionRegistry {
 }
 
 // Create creates a new ACP session and returns it
-func (r *SessionRegistry) Create(nanoSessionID, cwd string, env map[string]string, caps SessionCapabilities, fsMode FSMode) (*ACPSession, error) {
+func (r *SessionRegistry) Create(nanoSessionID, cwd string, env map[string]string, caps SessionCapabilities, clientCaps ClientCapabilities, fsMode FSMode) (*ACPSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -42,6 +42,7 @@ func (r *SessionRegistry) Create(nanoSessionID, cwd string, env map[string]strin
 		CWD:           cwd,
 		Env:           env,
 		ClientCaps:    caps,
+		ClientInfo:    clientCaps,
 		FSMode:        fsMode,
 		CreatedAt:     time.Now(),
 		LastActiveAt:  time.Now(),
@@ -104,6 +105,13 @@ func (r *SessionRegistry) SetCancel(acpSessionID string, cancel context.CancelFu
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cancels[acpSessionID] = cancel
+}
+
+// GetCancel retrieves the cancel function for a session
+func (r *SessionRegistry) GetCancel(acpSessionID string) context.CancelFunc {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cancels[acpSessionID]
 }
 
 // generateSessionID generates a unique session ID

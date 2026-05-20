@@ -79,9 +79,15 @@ func (e *turnExecutor) Execute(ctx context.Context) error {
 
 	e.prepare(ctx, config.Get())
 	var turnErr error
+	goalContinue := false
 	for {
 		if t.shouldTerminate() {
 			logger.Infof("Turn termination condition met")
+			break
+		}
+		// K1.1: Check early stop based on completion criteria (consecutive errors, etc.)
+		if stop, reason := t.ShouldStop(); stop {
+			logger.Infof("Early stop triggered: %s", reason)
 			break
 		}
 		done, err := e.runIteration(ctx)
@@ -97,10 +103,20 @@ func (e *turnExecutor) Execute(ctx context.Context) error {
 		logger.Warnf("Failed to save conversation memory: %v", err)
 	}
 
+	if t.goalContext != nil && t.goalContext.IsActive() {
+		goalErr := e.evaluateGoal(ctx)
+		if goalErr == ErrContinueRequested {
+			turnErr = ErrContinueRequested
+			goalContinue = true
+		} else if goalErr != nil {
+			logger.Warnf("Goal evaluation error: %v", goalErr)
+		}
+	}
+
 	// M1F: Stop / StopFailure hooks fire at turn termination. Hooks may signal
 	// that the agent should keep going by returning ActionBlock; in that case
 	// the executor returns ErrContinueRequested so a higher layer can decide.
-	if t.hookEngine != nil {
+	if t.hookEngine != nil && !goalContinue {
 		stopEvent := middleware.HookStop
 		status := "success"
 		if turnErr != nil {
@@ -150,6 +166,86 @@ func (e *turnExecutor) Execute(ctx context.Context) error {
 	return turnErr
 }
 
+func (e *turnExecutor) evaluateGoal(ctx context.Context) error {
+	t := e.turn
+	condition := t.goalContext.Condition()
+	if t.goalEvaluator == nil {
+		t.goalEvaluator = NewGoalEvaluator(t.LLMClient)
+	}
+	result, err := t.goalEvaluator.Evaluate(ctx, condition, t.Messages)
+	if err != nil {
+		return err
+	}
+	t.goalContext.MarkEvaluated(result.TokensUsed, result.Reason)
+	if result.Met {
+		t.goalContext.MarkAchieved(result.Reason)
+		if t.eventHandler != nil {
+			t.eventHandler(event.NewStreamEvent(event.EventTypeWarning, "agent_turn").
+				WithContent("✅ /goal achieved: " + result.Reason))
+		}
+		return nil
+	}
+	if t.goalContext.TurnsEvaluated() >= t.goalContext.MaxTurns() {
+		reason := fmt.Sprintf("/goal max turns reached: %s", result.Reason)
+		t.goalContext.MarkStopped(reason)
+		if t.eventHandler != nil {
+			t.eventHandler(event.NewStreamEvent(event.EventTypeWarning, "agent_turn").WithContent(reason))
+		}
+		return nil
+	}
+	t.continuationReason = result.Reason
+	return ErrContinueRequested
+}
+
+// K1.3: evaluateSatisfaction evaluates user satisfaction and marks it if threshold is met
+func (e *turnExecutor) evaluateSatisfaction(ctx context.Context) error {
+	t := e.turn
+	// Skip satisfaction evaluation if already marked or if task is already completed
+	if t.CompletionCriteria != nil && (t.CompletionCriteria.UserSatisfied || t.CompletionCriteria.TaskCompleted) {
+		return nil
+	}
+
+	// Only evaluate satisfaction after at least 2 iterations to have meaningful conversation history
+	if t.CompletionCriteria == nil || t.CompletionCriteria.CurrentIteration < 2 {
+		return nil
+	}
+
+	// Initialize evaluator if needed
+	if t.goalEvaluator == nil {
+		t.goalEvaluator = NewGoalEvaluator(t.LLMClient)
+	}
+
+	// Evaluate satisfaction
+	result, err := t.goalEvaluator.EvaluateSatisfaction(ctx, t.UserInput, t.Messages)
+	if err != nil {
+		logger.Warnf("Satisfaction evaluation failed: %v", err)
+		return nil // Don't fail the turn on evaluation errors
+	}
+
+	// Update satisfaction score only if evaluator parsed successfully
+	if t.CompletionCriteria != nil {
+		if result.EvaluatorParseFailed {
+			logger.Warnf("satisfaction evaluator parse failed; keeping previous score (raw: %s)", result.Reason)
+		} else {
+			t.CompletionCriteria.LLMSatisfactionScore = result.Score
+		}
+	}
+
+	// Mark user satisfied if score is >= satisfactionThreshold
+	satisfactionThreshold := 0.7 // Default threshold
+	if t.agentConfig != nil && t.agentConfig.Turn != nil && t.agentConfig.Turn.SatisfactionThreshold > 0 {
+		satisfactionThreshold = t.agentConfig.Turn.SatisfactionThreshold
+	}
+	if result.Score >= satisfactionThreshold {
+		t.MarkUserSatisfied(result.Reason)
+		logger.Infof("User satisfaction threshold met: score=%.2f, reason=%s", result.Score, result.Reason)
+	} else {
+		logger.Debugf("User satisfaction score: %.2f (threshold=%.2f), reason=%s", result.Score, satisfactionThreshold, result.Reason)
+	}
+
+	return nil
+}
+
 func (e *turnExecutor) prepare(ctx context.Context, cfg *config.Config) {
 	e.turn.preprocessInput(ctx, cfg)
 	e.emitter.plannerPlanSnapshot([]map[string]interface{}{
@@ -183,6 +279,20 @@ func (e *turnExecutor) runIteration(ctx context.Context) (bool, error) {
 		"tool_calls_count": len(toolCalls),
 	})
 
+	// K1.2: Heuristic - detect completion signals in LLM response text
+	if len(toolCalls) == 0 {
+		responseLower := strings.ToLower(response)
+		if strings.Contains(responseLower, "task complete") ||
+			strings.Contains(responseLower, "task is complete") ||
+			strings.Contains(responseLower, "task finished") ||
+			strings.Contains(responseLower, "task is finished") ||
+			strings.Contains(responseLower, "task done") ||
+			strings.Contains(responseLower, "successfully completed") {
+			logger.Infof("Detected completion signal in LLM response")
+			t.UpdateCompletionStatus(true, "")
+		}
+	}
+
 	done, err := e.completeIfNoTools(ctx, response, len(toolCalls))
 	if done || err != nil {
 		return done, err
@@ -202,10 +312,21 @@ func (e *turnExecutor) runIteration(ctx context.Context) (bool, error) {
 		logger.Errorf("Failed to add tool results to context: %v", err)
 		t.CompletionCriteria.ErrorCount++
 		t.CompletionCriteria.ConsecutiveErrors++
+		t.CompletionCriteria.CurrentIteration++
+		logger.Debugf("Turn error recorded: %s (consecutive: %d, total: %d)",
+			err.Error(), t.CompletionCriteria.ConsecutiveErrors, t.CompletionCriteria.ErrorCount)
 	} else {
 		t.updateConsecutiveErrorsFromToolResults(toolResults)
+		// Increment iteration counter (error counting already handled by updateConsecutiveErrorsFromToolResults)
+		t.CompletionCriteria.CurrentIteration++
 	}
 	t.recordTokenGain()
+
+	// K1.3: Evaluate user satisfaction periodically
+	if err := e.evaluateSatisfaction(ctx); err != nil {
+		logger.Warnf("Satisfaction evaluation error: %v", err)
+	}
+
 	e.keepRunningForUnreadMailbox(ctx)
 	if t.isComplete() {
 		logger.Infof("Turn completion criteria met")

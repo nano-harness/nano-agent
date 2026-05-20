@@ -345,6 +345,11 @@ func (ds *Server) Start() error {
 		}
 	}
 
+	// K4.1: Clean up orphan containers on startup (best-effort, activeNames is empty at start)
+	if removed, err := sandbox.CleanupOrphanContainers(context.Background(), make(map[string]bool)); err == nil && len(removed) > 0 {
+		logger.Infof("Cleaned up %d orphan nano-* containers on startup: %v", len(removed), removed)
+	}
+
 	// Setup HTTP router
 	router := ds.setupRoutes()
 
@@ -450,6 +455,13 @@ func (ds *Server) Start() error {
 		shutdownCancel()
 	}
 
+	// K4.2: Clean up orphan containers on shutdown (best-effort)
+	activeContainerNames := make(map[string]bool)
+	// TODO: In future, populate activeContainerNames from ds.activeTasks or sandbox registry
+	if removed, err := sandbox.CleanupOrphanContainers(ctx, activeContainerNames); err == nil && len(removed) > 0 {
+		logger.Infof("Cleaned up %d orphan nano-* containers on shutdown: %v", len(removed), removed)
+	}
+
 	// Shutdown team-lead registry if initialized
 	if ds.teamLeadRegistry != nil {
 		if err := ds.teamLeadRegistry.ShutdownWithTimeout(drainTimeout); err != nil {
@@ -530,6 +542,12 @@ func (ds *Server) setupRoutes() *mux.Router {
 	authenticatedAPI.HandleFunc("/sessions/{id}/resume", ds.sessionResumeHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/sessions/{id}/execute", ds.sessionExecuteHandler).Methods("POST")
 	authenticatedAPI.HandleFunc("/sessions/{id}/cancel", ds.cancelSessionPostHandler).Methods("POST")
+
+	// K2.1: Tool call observability endpoints for IDE/Web UI integration
+	authenticatedAPI.HandleFunc("/sessions/{id}/tool-calls", ds.getSessionToolCallsHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/sessions/{id}/tool-calls/{callID}", ds.getToolCallStatusHandler).Methods("GET")
+	authenticatedAPI.HandleFunc("/sessions/{id}/tool-calls/{callID}/cancel", ds.cancelToolCallHandler).Methods("POST")
+	authenticatedAPI.HandleFunc("/sessions/{id}/tool-calls/completed", ds.getCompletedToolCallsHandler).Methods("GET")
 
 	// Team-lead session endpoints (if registry is initialized)
 	if ds.teamLeadRegistry != nil {
@@ -3627,6 +3645,110 @@ func generateRandomID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// K2.1: Tool call observability HTTP handlers
+
+// getSessionToolCallsHandler returns all active tool calls for a session
+func (ds *Server) getSessionToolCallsHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	sessionID := vars["id"]
+
+	if ds.agent == nil || ds.agent.GetToolScheduler() == nil {
+		http.Error(w, "Agent or tool scheduler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	toolCalls := ds.agent.GetToolScheduler().GetAllToolCalls()
+
+	// Filter by session if needed (tool calls are global currently)
+	// In future, add session filtering logic here if tool scheduler tracks sessions
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id": sessionID,
+		"tool_calls": toolCalls,
+		"count":      len(toolCalls),
+	})
+}
+
+// getToolCallStatusHandler returns status of a specific tool call
+func (ds *Server) getToolCallStatusHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	sessionID := vars["id"]
+	callID := vars["callID"]
+
+	if ds.agent == nil || ds.agent.GetToolScheduler() == nil {
+		http.Error(w, "Agent or tool scheduler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	toolCall, exists := ds.agent.GetToolScheduler().GetToolCallStatus(callID)
+	if !exists {
+		http.Error(w, fmt.Sprintf("Tool call %s not found", callID), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id": sessionID,
+		"tool_call":  toolCall,
+	})
+}
+
+// cancelToolCallHandler cancels a specific tool call
+func (ds *Server) cancelToolCallHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	sessionID := vars["id"]
+	callID := vars["callID"]
+
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		req.Reason = "cancelled by user via API"
+	}
+
+	if ds.agent == nil || ds.agent.GetToolScheduler() == nil {
+		http.Error(w, "Agent or tool scheduler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	if err := ds.agent.GetToolScheduler().CancelToolCall(callID, req.Reason); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id": sessionID,
+		"call_id":    callID,
+		"status":     "cancelled",
+		"reason":     req.Reason,
+	})
+}
+
+// getCompletedToolCallsHandler returns completed tool calls for a session
+func (ds *Server) getCompletedToolCallsHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	sessionID := vars["id"]
+
+	if ds.agent == nil || ds.agent.GetToolScheduler() == nil {
+		http.Error(w, "Agent or tool scheduler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	completedCalls := ds.agent.GetToolScheduler().GetCompletedToolCalls()
+
+	// Filter by session if needed
+	// In future, add session filtering logic here
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":      sessionID,
+		"completed_calls": completedCalls,
+		"count":           len(completedCalls),
+	})
 }
 
 func generateTaskID() string {

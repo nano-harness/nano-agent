@@ -10,11 +10,16 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
+	"github.com/nano-harness/nano-agent/pkg/attachment"
+	"github.com/nano-harness/nano-agent/pkg/clipboard"
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/filesearch"
+	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/slash"
 	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
+	"github.com/nano-harness/nano-agent/pkg/ui/spinnerverbs"
 	xansi "github.com/charmbracelet/x/ansi"
 	"github.com/muesli/reflow/wordwrap"
 )
@@ -23,30 +28,30 @@ import (
 // Inspired by GitHub Copilot CLI's semantic color role design.
 // Uses 256-color ANSI codes chosen for readability on dark terminal backgrounds.
 const (
-	colorAssistant      = "115" // Soft sage green  – AI responses
-	colorUser           = "75"  // Soft blue         – user messages
-	colorTool           = "249" // Light gray        – tool/secondary info
-	colorError          = "203" // Soft coral red    – errors (readable, not blinding)
-	colorSystem         = "179" // Warm gold         – system messages
-	colorStatus         = "73"  // Soft teal         – status/token info
-	colorSuccess        = "114" // Soft green        – success feedback
-	colorWarning        = "215" // Soft orange       – warnings/confirmation titles
-	colorMuted          = "245" // Medium gray       – separators, help text, borders
-	colorDetail         = "252" // Light gray        – detail/description text
-	colorBright         = "255" // Near-white        – important message text
-	colorInfoTitle      = "75"  // Soft blue         – info panel titles
-	colorDimBg          = "238" // Dark gray         – subtle backgrounds (slightly lighter than 236)
-	colorConfirmBg      = "236" // Dark gray         – confirmation dialog title bg
-	colorSecondary      = "248" // Lighter gray      – secondary/tool info text, inactive button fg
-	colorDefaultFg      = "250" // Light gray        – default permission mode badge foreground
-	colorYoloBg         = "208" // Deep orange       – YOLO mode badge background
-	colorOpenSpec       = "135" // Soft purple       – OpenSpec category label
-	colorOnAccent       = "0"   // Black             – foreground on colored badge backgrounds
-	colorAcceptEditsBg  = "220" // Amber yellow      – AcceptEdits permission badge background
-	colorButtonFg       = "15"  // Bright white      – confirmation dialog button foreground
-	colorYesButtonBg    = "28"  // Forest green      – "confirm" button background
-	colorNoButtonBg     = "124" // Dark red          – "cancel" button background
-	colorAlwaysButtonBg = "33"  // Ocean blue        – "always allow" button background
+	colorAssistant      = paletteAssistant // sage green  – AI responses
+	colorUser           = paletteUser      // soft blue   – user messages
+	colorTool           = paletteTool      // light gray  – tool/secondary info
+	colorError          = paletteError     // coral red   – errors
+	colorSystem         = paletteSystem    // warm gold   – system messages
+	colorStatus         = "73"             // Soft teal         – status/token info
+	colorSuccess        = "114"            // Soft green        – success feedback
+	colorWarning        = "215"            // Soft orange       – warnings/confirmation titles
+	colorMuted          = "245"            // Medium gray       – separators, help text, borders
+	colorDetail         = "252"            // Light gray        – detail/description text
+	colorBright         = "255"            // Near-white        – important message text
+	colorInfoTitle      = "75"             // Soft blue         – info panel titles
+	colorDimBg          = "238"            // Dark gray         – subtle backgrounds (slightly lighter than 236)
+	colorConfirmBg      = "236"            // Dark gray         – confirmation dialog title bg
+	colorSecondary      = "248"            // Lighter gray      – secondary/tool info text, inactive button fg
+	colorDefaultFg      = "250"            // Light gray        – default permission mode badge foreground
+	colorYoloBg         = "208"            // Deep orange       – YOLO mode badge background
+	colorOpenSpec       = "135"            // Soft purple       – OpenSpec category label
+	colorOnAccent       = "0"              // Black             – foreground on colored badge backgrounds
+	colorAcceptEditsBg  = "220"            // Amber yellow      – AcceptEdits permission badge background
+	colorButtonFg       = "15"             // Bright white      – confirmation dialog button foreground
+	colorYesButtonBg    = "28"             // Forest green      – "confirm" button background
+	colorNoButtonBg     = "124"            // Dark red          – "cancel" button background
+	colorAlwaysButtonBg = "33"             // Ocean blue        – "always allow" button background
 )
 
 // commandsPaletteVisibleRows is the number of command rows rendered at once in
@@ -77,7 +82,7 @@ const (
 	historyWheelScrollLines     = 3
 )
 
-const spinnerTickInterval = 150 * time.Millisecond
+const spinnerTickInterval = 100 * time.Millisecond
 
 var spinnerFrames = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"} //nolint:gochecknoglobals
 
@@ -103,7 +108,9 @@ type Model struct { //nolint:revive
 	outbound func(eventsource.Outbound) error
 
 	// Properties
-	lines            []string
+	// messages is the shared declarative message store powering both the
+	// sliding-window View() renderer and the fullscreen history view.
+	messages         *MessageStore
 	status           string
 	cronIndicator    string
 	termWidth        int
@@ -113,14 +120,19 @@ type Model struct { //nolint:revive
 	keyboardEnhanced bool
 	terminalFocused  bool
 
+	// bannerArt holds the rendered static product banner (multi-line, no
+	// trailing newline). When non-empty and the conversation has no messages
+	// yet, View() renders it above the input area so the TUI always shows a
+	// product mark while idle. Populated by the UI adapter after the startup
+	// banner animation completes; left empty when --no-banner is set or on
+	// non-interactive terminals.
+	bannerArt string
+
 	// History buffer management
 	sessionStartTime time.Time // Session start timestamp
-	lastFlushTime    time.Time // Most recent streaming flush, used to avoid inline redraw races.
 
 	// Components
 	input textarea.Model
-
-	lastRenderHeight int
 
 	// Confirmation dialog state
 	showingConfirmation        bool
@@ -168,12 +180,9 @@ type Model struct { //nolint:revive
 	availableToolNames []string
 
 	// Streaming text aggregation
-	streamingBuf         strings.Builder
-	streamingPrintBuf    strings.Builder
-	streamingLineContent strings.Builder
-	isStreaming          bool
-	lastStreamFlush      time.Time
-	streamingLineIdx     int
+	streamingBuf    strings.Builder
+	isStreaming     bool
+	lastStreamFlush time.Time
 
 	// Thinking block (collapsible reasoning preview)
 	thinkingTitle     string
@@ -189,11 +198,22 @@ type Model struct { //nolint:revive
 	historyDraft  string // draft saved when user starts browsing history
 	historySearch *HistorySearch
 
+	// showHelp controls whether the full help line is visible. Toggled by
+	// pressing `?`; starts collapsed so the input area gets maximum space.
+	showHelp bool
+
 	// Content display phase management
 	currentPhase        displayPhase
 	altScreenActive     bool
 	historyScrollOffset int
 	historySelected     int
+
+	// messageScrollOffsetLines tracks how many rendered lines the inline
+	// message-window is scrolled up from the bottom. 0 anchors to the
+	// latest content; positive values reveal older rows. Modified by
+	// PgUp/PgDn and mouse-wheel handlers and reset whenever the user
+	// submits a new prompt.
+	messageScrollOffsetLines int
 
 	// Tool call tracking for deduplication
 	activeToolCalls  map[string]string // ID -> last displayed status
@@ -208,6 +228,8 @@ type Model struct { //nolint:revive
 	// Spinner and context status
 	spinnerFrame      int
 	spinnerStage      string
+	spinnerVerbs      []string // Effective spinner verbs from config
+	selectedVerb      string   // verb selected at start of thinking cycle
 	contextWindowMax  int
 	contextUsedTokens int
 
@@ -218,11 +240,24 @@ type Model struct { //nolint:revive
 	filePickerCursor  int
 	fileIndex         *filesearch.Index
 
+	// termCap describes which characters the host terminal can render.
+	// Populated in New() and re-evaluated on resize; used by safe-char
+	// rendering helpers to avoid garbled output on constrained terminals.
+	termCap TermCapability
+
 	// localDispatcher handles slash commands that can be answered locally
 	// without contacting the backend agent (e.g. /agents, /checkpoint,
 	// /models). It is constructed lazily on first use so unit tests that
 	// do not exercise slash commands stay decoupled from the slash package.
-	localDispatcher      *slash.LocalDispatcher
+	localDispatcher *slash.LocalDispatcher
+
+	// attachmentMgr manages files saved to .nano/attachments/
+	attachmentMgr *attachment.Manager
+	// pendingImages tracks images queued for the next user message
+	pendingImages []llm.MultimodalImage
+	// imageIndicator shows a UI indicator when images are attached
+	imageIndicator string
+
 	modelLister          func() string
 	skillLister          func() string
 	modelStatusGetter    func() string
@@ -239,6 +274,7 @@ type Model struct { //nolint:revive
 	routinesRemover      func(string) string
 	routinesPauser       func(string) string
 	routinesResumer      func(string) string
+	routinesRunner       func(string) string
 }
 
 type hitBox struct {
@@ -274,19 +310,18 @@ func New(submitCh chan<- string, cancelCh chan<- struct{}, apiBaseURL, cwd strin
 	}
 
 	return &Model{
-		SubmitCh:         submitCh,
-		CancelCh:         cancelCh,
-		lines:            make([]string, 0),
-		status:           "等待输入",
-		apiBaseURL:       apiBaseURL,
-		cwd:              cwd,
-		input:            ta,
-		terminalFocused:  true,
-		streamingLineIdx: -1,
+		SubmitCh:        submitCh,
+		CancelCh:        cancelCh,
+		messages:        NewMessageStore(),
+		status:          "等待输入",
+		apiBaseURL:      apiBaseURL,
+		cwd:             cwd,
+		input:           ta,
+		terminalFocused: true,
+		termCap:         DetectTermCapability(),
 
 		// History buffer initialization
 		sessionStartTime: time.Now(),
-		lastRenderHeight: 0,
 
 		thinkingCollapsed: true,
 
@@ -297,6 +332,7 @@ func New(submitCh chan<- string, cancelCh chan<- struct{}, apiBaseURL, cwd strin
 		currentPhase:    phaseIdle,
 		activeToolCalls: make(map[string]string),
 		fileIndex:       fileIndex,
+		spinnerVerbs:    spinnerverbs.EffectiveVerbs(nil), // Initialize with default verbs
 	}
 }
 
@@ -315,6 +351,11 @@ func (m *Model) SendOutbound(o eventsource.Outbound) error {
 	return m.outbound(o)
 }
 
+// SetSpinnerVerbsConfig updates the spinner verbs configuration.
+func (m *Model) SetSpinnerVerbsConfig(cfg *config.SpinnerVerbsConfig) {
+	m.spinnerVerbs = spinnerverbs.EffectiveVerbs(cfg)
+}
+
 // ThinkingWindow returns a snapshot of the current 3-line rolling thinking buffer.
 // The returned slice is a copy.
 func (m *Model) ThinkingWindow() []string {
@@ -331,6 +372,11 @@ func (m *Model) SpinnerStage() string {
 // SpinnerFrameIndex returns the internal spinner frame counter.
 func (m *Model) SpinnerFrameIndex() int {
 	return m.spinnerFrame
+}
+
+// SelectedVerb returns the verb selected for the current thinking cycle.
+func (m *Model) SelectedVerb() string {
+	return m.selectedVerb
 }
 
 // ContextBarState returns the context bar token state and clamped percentage.
@@ -368,17 +414,14 @@ func (m *Model) InputValue() string {
 // ClearSession resets all UI state and (if handler set) starts a new agent session.
 // Returns the new session ID if one was created.
 func (m *Model) ClearSession() string {
-	// Reset all session state
-	m.lines = make([]string, 0)
+	// Reset all session state. m.messages is always initialised by NewModel
+	// (and by test helpers), so no nil guard is needed here.
+	m.messages = NewMessageStore()
 	m.sessionStartTime = time.Now()
-	m.lastRenderHeight = 0
 	m.resetThinkingState()
 	m.streamingBuf.Reset()
-	m.streamingPrintBuf.Reset()
-	m.streamingLineContent.Reset()
 	m.isStreaming = false
 	m.lastStreamFlush = time.Time{}
-	m.streamingLineIdx = -1
 	m.altScreenActive = false
 	m.historyScrollOffset = 0
 	m.showingConfirmation = false
@@ -539,6 +582,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 
 		// Normal input handling when not showing confirmation
 		switch msg.String() {
+		case "pgup":
+			// Scroll the inline message window up by ~half a viewport
+			// so the user can review earlier conversation history.
+			vp := m.inlineMessageViewportLines()
+			step := vp / 2
+			if step < 1 {
+				step = 1
+			}
+			m.messageScrollOffsetLines += step
+			m.clampMessageScrollOffset(vp)
+			return m, nil
+		case "pgdown":
+			vp := m.inlineMessageViewportLines()
+			step := vp / 2
+			if step < 1 {
+				step = 1
+			}
+			m.messageScrollOffsetLines -= step
+			m.clampMessageScrollOffset(vp)
+			return m, nil
 		case "ctrl+c":
 			if m.outbound != nil {
 				// Adapter/EventSource mode: cancel if a turn is in progress, quit if idle.
@@ -549,7 +612,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 					m.isActivePhase() || m.isStreaming {
 					return m, m.outboundCmd(eventsource.Outbound{Kind: "cancel"})
 				}
+				if dump := m.dumpHistory(); dump != "" {
+					return m, tea.Sequence(tea.Printf("%s", dump), tea.Quit)
+				}
 				return m, tea.Quit
+			}
+			if dump := m.dumpHistory(); dump != "" {
+				return m, tea.Sequence(tea.Printf("%s", dump), tea.Quit)
 			}
 			return m, tea.Quit
 		case "ctrl+z":
@@ -596,7 +665,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 				next := cyclePermissionMode(m.permissionMode)
 				m.permissionManager.SetMode(next)
 				m.permissionMode = string(next)
-				return m, tea.Printf("🔁 权限模式 → %s %s", m.permissionModeIcon(string(next)), next)
+				notice := fmt.Sprintf("🔁 权限模式 → %s %s", m.permissionModeIcon(string(next)), next)
+				m.recordMessage("system", notice)
+				return m, nil
 			}
 			return m, nil
 		case "tab":
@@ -608,8 +679,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 					m.input.CursorEnd()
 				}
 				if len(suggestions) > 1 {
-					hint := formatLine("system", "补全候选："+strings.Join(suggestions, "  "))
-					return m, tea.Printf("%s", m.wrapFormattedLine(hint))
+					hintContent := "补全候选：" + strings.Join(suggestions, "  ")
+					m.recordMessage("system", hintContent)
+					return m, nil
 				}
 			}
 			return m, nil
@@ -640,21 +712,72 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 						m.historyIndex = -1
 						return m, cmd
 					}
-					if handled, cmd := m.handleLocalSlashCommand(input); handled {
+					dispatched := m.getLocalDispatcher().Dispatch(input)
+					if dispatched.Handled {
+						_, cmd := m.recordLocalSlashResult(dispatched)
 						m.input.Reset()
 						m.historyIndex = -1
 						return m, cmd
 					}
+					if dispatched.ShouldSubmit {
+						// Show the original "/cmd ..." in the transcript but
+						// submit the dispatcher-rewritten text to the agent.
+						m.recordMessage("user", input)
+						submit := dispatched.SubmitInput
+						cmds = append(cmds, m.outboundCmd(eventsource.Outbound{Kind: "submit", Text: submit}))
+						if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != input {
+							m.inputHistory = append(m.inputHistory, input)
+							if len(m.inputHistory) > 100 {
+								m.inputHistory = m.inputHistory[1:]
+							}
+						}
+						m.historyIndex = -1
+						m.historyDraft = ""
+						m.currentPhase = phaseProcessing
+						m.status = m.formatStatusForPhase(phaseProcessing, "")
+						m.input.Reset()
+						m.showingFilePicker = false
+						m.messageScrollOffsetLines = 0
+						return m, tea.Batch(cmds...)
+					}
 				}
 
-				newLine := formatLine("user", input)
-				m.lines = append(m.lines, newLine)
+				m.recordMessage("user", input)
+
+				// Parse @file references for images and add to pending images
+				if m.attachmentMgr != nil {
+					fileRefs := attachment.ParseFileReference(input)
+					for _, ref := range fileRefs {
+						if attachment.IsImageFile(ref) {
+							img, err := m.attachmentMgr.ToMultimodalImage(ref)
+							if err == nil {
+								m.pendingImages = append(m.pendingImages, img)
+							} else {
+								logger.Warnf("Failed to load image from @file reference %s: %v", ref, err)
+							}
+						}
+					}
+				}
+
 				// Expand `@file[:start-end]` references before forwarding so
 				// the agent sees the actual content. The original token is
 				// preserved as a header in the expansion so the user-visible
 				// transcript still shows what was referenced.
 				expanded := ExpandFileReferences(input, m.cwd)
-				cmds = append(cmds, m.outboundCmd(eventsource.Outbound{Kind: "submit", Text: expanded}))
+
+				// If we have pending images, submit via multimodal outbound
+				if len(m.pendingImages) > 0 {
+					cmds = append(cmds, m.outboundCmd(eventsource.Outbound{
+						Kind:   "submit",
+						Text:   expanded,
+						Images: m.pendingImages,
+					}))
+					// Clear pending images after submission
+					m.pendingImages = nil
+					m.imageIndicator = ""
+				} else {
+					cmds = append(cmds, m.outboundCmd(eventsource.Outbound{Kind: "submit", Text: expanded}))
+				}
 
 				// Record in history (avoid consecutive duplicates), cap at 100 entries
 				if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != input {
@@ -666,12 +789,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 				m.historyIndex = -1
 				m.historyDraft = ""
 
-				wrapped := m.wrapFormattedLine(newLine)
-				cmds = append(cmds, tea.Printf("%s", wrapped))
 				m.currentPhase = phaseProcessing
 				m.status = m.formatStatusForPhase(phaseProcessing, "")
 				m.input.Reset()
 				m.showingFilePicker = false
+				// Anchor the message window to the bottom whenever a
+				// new prompt is submitted so the user sees the latest
+				// turn without having to scroll back manually.
+				m.messageScrollOffsetLines = 0
 			}
 		case "ctrl+p":
 			m.openCommandsPalette()
@@ -699,6 +824,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		case "ctrl+j", "shift+enter":
 			m.insertInputNewline()
 			return m, nil
+		case "?", "shift+/":
+			if strings.TrimSpace(m.input.Value()) == "" {
+				m.showHelp = !m.showHelp
+				return m, nil
+			}
 		}
 
 	case tea.KeyboardEnhancementsMsg:
@@ -706,6 +836,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		return m, nil
 
 	case tea.PasteMsg:
+		// Before processing as text, check if the clipboard contains an image
+		if m.attachmentMgr != nil {
+			contentType := clipboard.DetectContentType()
+			if contentType == clipboard.ContentImage {
+				return m, m.handleImagePaste()
+			}
+			if contentType == clipboard.ContentFilePath {
+				return m, m.handleFilePaste()
+			}
+		}
+
+		// Normal text paste handling
 		if m.isLargePaste(msg.Content) {
 			m.showPasteConfirmation(msg.Content)
 			return m, nil
@@ -767,6 +909,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			}
 			return m, nil
 		}
+		// Inline message-window scroll.
+		vp := m.inlineMessageViewportLines()
+		switch mouse.Button {
+		case tea.MouseWheelUp:
+			m.messageScrollOffsetLines += historyWheelScrollLines
+		case tea.MouseWheelDown:
+			m.messageScrollOffsetLines -= historyWheelScrollLines
+		}
+		m.clampMessageScrollOffset(vp)
+		return m, nil
 
 	case tea.FocusMsg:
 		m.terminalFocused = true
@@ -793,10 +945,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			m.input.SetWidth(inputContentWidth + m.input.Styles().Focused.Base.GetHorizontalFrameSize())
 		}
 		m.adjustInputHeight()
-		m.lastRenderHeight = 0
 
-		// Inline rendering can leave stale rows when terminal width changes
-		// cause the input section height to shrink; clear once after resize.
+		// Invalidate cached rendering so the message window re-wraps
+		// lines at the new terminal width.
+		m.messages.InvalidateCache()
+		m.clampMessageScrollOffset(m.inlineMessageViewportLines())
+
+		// Clear once after resize to prevent stale rows from prior renders.
 		return m, tea.ClearScreen
 
 	case SpinnerTickMsg:
@@ -847,20 +1002,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		}
 
 		m.advanceSpinner("thinking")
+		if m.selectedVerb == "" {
+			m.selectedVerb = spinnerverbs.RandomVerb(m.spinnerVerbs)
+		}
 		if isComplete {
 			runes := []rune(m.thinkingReasoning)
-			summary := formatLine("thinking",
-				fmt.Sprintf("思考完成 [%d 字符]", len(runes)))
-			m.lines = append(m.lines, summary)
+			summaryContent := fmt.Sprintf("思考完成 [%d 字符]", len(runes))
+			// Only persist a thinking message when there is actual reasoning
+			// content. Empty complete events should not pollute the
+			// scrollback with a "思考完成 [0 字符]" placeholder.
 			if strings.TrimSpace(m.thinkingReasoning) != "" {
-				wrappedReasoning := wordwrap.String(m.thinkingReasoning, m.thinkingWrapWidth())
-				for _, line := range strings.Split(wrappedReasoning, "\n") {
-					m.lines = append(m.lines, formatLine("thinking", line))
-				}
+				storeContent := summaryContent + "\n" + m.thinkingReasoning
+				m.recordMessage("thinking", storeContent)
+				// Keep a single-line preview visible in the status area so the
+				// user can confirm the thinking finished even after the
+				// assistant stream begins. The preview is non-destructive: the
+				// full reasoning lives in the MessageStore and can be revealed
+				// with Ctrl+T.
+				m.thinkingWindow = []string{summaryContent + "，Ctrl+T 展开"}
+			} else {
+				m.thinkingWindow = nil
 			}
-			wrapped := m.wrapFormattedLine(summary)
-			cmds = append(cmds, tea.Printf("%s", wrapped))
-			m.thinkingWindow = nil
 			m.thinkingPending = ""
 		} else {
 			m.setAgentStatus(phaseThinking, "")
@@ -913,34 +1075,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 		case "executing":
 			if lastStatus == "" {
 				// First time seeing this tool: print "正在调用"
-				line := formatLine("tool", fmt.Sprintf("正在调用工具: %s", msg.ToolName))
-				m.lines = append(m.lines, line)
-				wrapped := m.wrapFormattedLine(line)
-				cmds = append(cmds, tea.Printf("%s", wrapped))
+				content := fmt.Sprintf("正在调用工具: %s", msg.ToolName)
+				m.recordMessage("tool", content)
 			}
 			// Otherwise skip to avoid duplicate "executing" messages
 		case "success":
 			if lastStatus != "success" {
 				// Print completion marker (concise version); normalize whitespace in preview
 				resultPreview := truncateResult(strings.ReplaceAll(msg.Result, "\n", " "), 200)
-				line := formatLine("tool", fmt.Sprintf("工具: %s 调用完成\n结果: %s", msg.ToolName, resultPreview))
-				m.lines = append(m.lines, line)
-				wrapped := m.wrapFormattedLine(line)
-				cmds = append(cmds, tea.Printf("%s", wrapped))
+				content := fmt.Sprintf("工具: %s 调用完成\n结果: %s", msg.ToolName, resultPreview)
+				m.recordMessage("tool", content)
 			}
 		case "error":
 			// Always print errors
-			line := formatLine("error", fmt.Sprintf("工具 %s 执行失败: %s", msg.ToolName, msg.Result))
-			m.lines = append(m.lines, line)
-			wrapped := m.wrapFormattedLine(line)
-			cmds = append(cmds, tea.Printf("%s", wrapped))
+			content := fmt.Sprintf("工具 %s 执行失败: %s", msg.ToolName, msg.Result)
+			m.recordMessage("error", content)
 		case "cancelled":
 			// Print cancellation notice unless already shown
 			if lastStatus != "cancelled" {
-				line := formatLine("tool", fmt.Sprintf("工具 %s 已取消", msg.ToolName))
-				m.lines = append(m.lines, line)
-				wrapped := m.wrapFormattedLine(line)
-				cmds = append(cmds, tea.Printf("%s", wrapped))
+				content := fmt.Sprintf("工具 %s 已取消", msg.ToolName)
+				m.recordMessage("tool", content)
 			}
 		}
 
@@ -981,10 +1135,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			if !m.isStreaming {
 				m.isStreaming = true
 				m.streamingBuf.Reset()
-				m.streamingPrintBuf.Reset()
-				m.streamingLineContent.Reset()
 				m.lastStreamFlush = time.Now()
-				m.streamingLineIdx = -1
 			}
 			m.streamingBuf.WriteString(msg.Content)
 			if strings.Contains(msg.Content, "\n") || m.shouldFlushPartial() {
@@ -999,10 +1150,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			cmds = append(cmds, m.flushStreamingBuffer()...)
 		}
 
-		newLine := formatLine(msg.Role, msg.Content)
-		m.lines = append(m.lines, newLine)
-		wrapped := m.wrapFormattedLine(newLine)
-		cmds = append(cmds, tea.Printf("%s", wrapped))
+		m.recordMessage(msg.Role, msg.Content)
 		if msg.Role == "assistant" || msg.Role == "assistant_stream" {
 			m.setAgentStatus(phaseResponse, "")
 		}
@@ -1057,23 +1205,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:revive
 			m.contextUsedTokens = msg.ContextUsedTokens
 		}
 		return m, nil
-	case ConnectionStatusMsg:
+	// The following cases are fed by BubbleTeaAdapter (nano chat / nano
+	// lead-chat paths).  The runBubbleTeaMode (--tea / --milktea) path does
+	// not currently emit these message types through forwardBubbleTeaStreamEvent;
+	// they are kept here so the BubbleTeaAdapter route continues to work.
+	case ConnectionStatusMsg: // BubbleTeaAdapter (nano chat) path only
 		m.connectionState = msg.State
 		m.connectionDetail = msg.Detail
 		return m, nil
-	case NoticeMsg:
-		line := formatLine("system", string(msg))
+	case NoticeMsg: // BubbleTeaAdapter (nano chat) path only
 		m.notice = string(msg)
-		m.lines = append(m.lines, line)
-		return m, tea.Printf("%s", m.wrapFormattedLine(line))
-	case MailboxMsg:
+		m.recordMessage("system", string(msg))
+		return m, nil
+	case MailboxMsg: // BubbleTeaAdapter (nano chat) path only
 		m.swarmLine = fmt.Sprintf("📬 %s → %s [%s] %s", msg.From, msg.To, msg.Kind, msg.Preview)
 		return m, nil
-	case IdleNotifyMsg:
+	case IdleNotifyMsg: // BubbleTeaAdapter (nano chat) path only
 		m.swarmLine = fmt.Sprintf("💤 %s: %s", msg.Agent, msg.Summary)
 		return m, nil
-	case SpawnTeammateMsg:
+	case SpawnTeammateMsg: // BubbleTeaAdapter (nano chat) path only
 		m.swarmLine = fmt.Sprintf("🧑‍💻 %s spawned for %s (%s)", msg.Agent, msg.Topic, msg.SessionID)
+		return m, nil
+
+	case ImagePasteSuccessMsg:
+		m.pendingImages = append(m.pendingImages, msg.Image)
+		m.updateImageIndicator()
+		return m, nil
+
+	case ImagePasteErrorMsg:
+		logger.Warnf("Image paste failed: %v", msg.Error)
+		m.recordMessage("system", fmt.Sprintf("⚠️  Image paste failed: %v", msg.Error))
 		return m, nil
 	}
 
@@ -1228,6 +1389,20 @@ func truncateHistoryPreview(s string) string {
 	return s
 }
 
+// inlineMessageViewportLines computes the height of the inline message
+// window in terminal rows using the same accounting as View(). The
+// PgUp/PgDn and mouse-wheel handlers use it to step ~half a viewport
+// and to clamp messageScrollOffsetLines.
+func (m *Model) inlineMessageViewportLines() int {
+	if m == nil || m.termHeight <= 0 {
+		return 0
+	}
+	var inputBuf strings.Builder
+	m.renderInputSection(&inputBuf)
+	inputLines := renderedLineCount(inputBuf.String())
+	return m.termHeight - inputLines
+}
+
 func (m *Model) adjustInputHeight() {
 	n := m.input.LineCount()
 	if n < minInputHeight {
@@ -1250,12 +1425,10 @@ func (m *Model) clearSessionCmd() tea.Cmd {
 	if newID != "" {
 		msg = fmt.Sprintf("已开启新会话 (id: %s)", newID)
 	}
-	line := formatLine("system", msg)
-	m.lines = append(m.lines, line)
+	m.recordMessage("system", msg)
 
 	cmds := []tea.Cmd{
 		tea.ClearScreen,
-		tea.Printf("%s", m.wrapFormattedLine(line)),
 	}
 	if m.outbound != nil {
 		cmds = append(cmds, m.outboundCmd(eventsource.Outbound{Kind: "control", Control: "/clear"}))
@@ -1391,8 +1564,9 @@ func (m *Model) shouldFlushPartial() bool {
 	return m.streamingBuf.Len() > 0 && time.Since(m.lastStreamFlush) >= streamFlushInterval
 }
 
-// flushStreamingIncremental emits the current streaming chunk while keeping the
-// logical response aggregated in one scrollback entry.
+// flushStreamingIncremental updates the streaming message in the store.
+// The message window in View() will pick up the updated content on the
+// next render — no tea.Printf is needed.
 func (m *Model) flushStreamingIncremental() []tea.Cmd {
 	if !m.isStreaming || m.streamingBuf.Len() == 0 {
 		return nil
@@ -1402,77 +1576,43 @@ func (m *Model) flushStreamingIncremental() []tea.Cmd {
 	m.lastStreamFlush = time.Now()
 
 	m.appendStreamingChunkToLine(chunk)
-	m.streamingPrintBuf.WriteString(chunk)
 	m.setAgentStatus(phaseResponse, "")
-
-	raw := m.streamingPrintBuf.String()
-	lastNL := strings.LastIndex(raw, "\n")
-	if lastNL < 0 {
-		return nil
-	}
-
-	completedLines := raw[:lastNL]
-	remainder := raw[lastNL+1:]
-	m.streamingPrintBuf.Reset()
-	m.streamingPrintBuf.WriteString(remainder)
-
-	wrapped := renderStreamingChunk(completedLines, m.termWidth)
-	return []tea.Cmd{tea.Printf("%s", wrapped)}
+	return nil
 }
 
 // flushStreamingBuffer emits any remaining streaming content and terminates the
 // streaming state.
 func (m *Model) flushStreamingBuffer() []tea.Cmd {
-	if !m.isStreaming || (m.streamingBuf.Len() == 0 && m.streamingPrintBuf.Len() == 0) {
+	if !m.isStreaming || m.streamingBuf.Len() == 0 {
 		m.isStreaming = false
-		m.streamingLineIdx = -1
-		m.streamingPrintBuf.Reset()
-		m.streamingLineContent.Reset()
 		return nil
 	}
 	chunk := m.streamingBuf.String()
 	m.streamingBuf.Reset()
 	m.isStreaming = false
 	m.lastStreamFlush = time.Now()
-	m.lastFlushTime = m.lastStreamFlush
 
 	if chunk != "" {
 		m.appendStreamingChunkToLine(chunk)
 	}
-	m.streamingPrintBuf.WriteString(chunk)
-	pending := m.streamingPrintBuf.String()
-	m.streamingPrintBuf.Reset()
-	m.streamingLineIdx = -1
-	m.streamingLineContent.Reset()
 	m.setAgentStatus(phaseResponse, "")
-	if pending == "" {
-		return nil
-	}
-	wrapped := renderStreamingChunk(strings.TrimSuffix(pending, "\n"), m.termWidth)
-	return []tea.Cmd{tea.Printf("%s", wrapped)}
+	return nil
 }
 
+// appendStreamingChunkToLine appends chunk to the active assistant_stream
+// entry in the MessageStore so that View() renders the latest partial
+// response on every tick. The MessageStore entry is the canonical
+// accumulator — no secondary buffer is kept. A new entry is created on the
+// first chunk of each streaming session; subsequent chunks append in place.
 func (m *Model) appendStreamingChunkToLine(chunk string) {
-	if m.streamingLineContent.Len() == 0 && m.streamingLineIdx >= 0 && m.streamingLineIdx < len(m.lines) {
-		m.streamingLineContent.WriteString(stripFormatLine(m.lines[m.streamingLineIdx]))
-	}
-	m.streamingLineContent.WriteString(chunk)
-	content := m.streamingLineContent.String()
-	if m.streamingLineIdx >= 0 && m.streamingLineIdx < len(m.lines) {
-		m.lines[m.streamingLineIdx] = formatLine("assistant_stream", content)
+	// Append to the existing streaming entry when one is active.
+	if last := m.messages.Last(); last != nil && last.Role == "assistant_stream" {
+		last.Content += chunk
+		last.InvalidateCache()
 		return
 	}
-	m.streamingLineIdx = len(m.lines)
-	m.lines = append(m.lines, formatLine("assistant_stream", content))
-}
-
-func renderStreamingChunk(chunk string, termWidth int) string {
-	rendered := renderAssistantStreamText(chunk)
-	return truncateLines(wordwrap.String(rendered, termWidth), termWidth)
-}
-
-func stripFormatLine(formatted string) string {
-	return xansi.Strip(formatted)
+	// First chunk: create a new streaming message in the store.
+	m.recordMessage("assistant_stream", chunk)
 }
 
 func (m *Model) appendThinkingDelta(delta string) {
@@ -1487,10 +1627,7 @@ func (m *Model) appendThinkingDelta(delta string) {
 	m.thinkingPending += normalized
 	rawPending := m.thinkingPending
 
-	width := m.termWidth - thinkingWindowPrefixReserve
-	if width < minThinkingWindowWidth {
-		width = minThinkingWindowWidth
-	}
+	width := m.thinkingWrapWidth()
 	wrapped := wordwrap.String(m.thinkingPending, width)
 	lines := strings.Split(wrapped, "\n")
 	displayLines := make([]string, len(lines))
@@ -1518,10 +1655,7 @@ func (m *Model) updateThinkingWindow(preview string) {
 	if normalized == "" {
 		return
 	}
-	width := m.termWidth - thinkingWindowPrefixReserve
-	if width < minThinkingWindowWidth {
-		width = minThinkingWindowWidth
-	}
+	width := m.thinkingWrapWidth()
 	lines := strings.Split(wordwrap.String(normalized, width), "\n")
 	displayLines := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -1560,6 +1694,7 @@ func (m *Model) resetThinkingState() {
 func (m *Model) resetSpinnerToIdle() {
 	m.spinnerStage = ""
 	m.spinnerFrame = 0
+	m.selectedVerb = ""
 }
 
 func (m *Model) advanceSpinner(stage string) {
@@ -1584,6 +1719,14 @@ func (m *Model) currentSpinnerFrame() string {
 	default:
 		return frame
 	}
+}
+
+// currentSpinnerVerb returns the current spinner verb for the active thinking cycle.
+func (m *Model) currentSpinnerVerb() string {
+	if m.currentPhase == phaseDone || m.currentPhase == phaseIdle {
+		return ""
+	}
+	return m.selectedVerb
 }
 
 func (m *Model) renderContextBar() string {
@@ -1627,7 +1770,7 @@ func (m *Model) detectFileMentionContext() (bool, string) {
 	i := len(text) - 1
 	for i >= 0 {
 		r := rune(text[i])
-		if r == '#' {
+		if r == '@' {
 			if i == 0 || text[i-1] == ' ' || text[i-1] == '\n' || text[i-1] == '\t' {
 				return true, text[i+1:]
 			}
@@ -1669,7 +1812,7 @@ func (m *Model) insertSelectedFile() {
 		return
 	}
 	text := m.input.Value()
-	idx := strings.LastIndex(text, "#")
+	idx := strings.LastIndex(text, "@")
 	if idx < 0 {
 		return
 	}
@@ -1726,10 +1869,59 @@ func (m *Model) View() tea.View { //nolint:revive
 		return m.configureView(v)
 	}
 
-	// Render the input section.
-	m.renderInputSection(&b)
+	// Render input section first so we can measure its physical height and
+	// compute the message-window budget that fills the space above it.
+	var inputBuf strings.Builder
+	m.renderInputSection(&inputBuf)
+	inputStr := inputBuf.String()
 
+	// Banner: keep the static product banner above the input when there is
+	// enough vertical room. On short terminals with messages, hide it so the
+	// conversation still has a usable message window.
+	bannerRendered := false
+	if m.bannerArt != "" && m.termHeight > 0 {
+		bannerLines := renderedLineCount(m.bannerArt)
+		inputLines := renderedLineCount(inputStr)
+		const minMessageLines = 3
+		hasRoom := bannerLines+inputLines <= m.termHeight
+		hasMessageRoom := m.messages.Len() == 0 || bannerLines+inputLines+minMessageLines <= m.termHeight
+		if hasRoom && hasMessageRoom {
+			b.WriteString(m.bannerArt)
+			b.WriteString("\n")
+			bannerRendered = true
+		}
+	}
+
+	// Message window: fill the remaining terminal rows between the banner
+	// (if rendered) and the input section with the most recent messages.
+	if m.termHeight > 0 && m.messages.Len() > 0 {
+		inputLines := renderedLineCount(inputStr)
+		bannerLines := 0
+		if bannerRendered {
+			bannerLines = renderedLineCount(m.bannerArt) + 1 // +1 for the trailing "\n"
+		}
+		windowLines := m.termHeight - inputLines - bannerLines
+		if windowLines > 0 {
+			if window := m.renderMessageWindow(windowLines); window != "" {
+				b.WriteString(window)
+				b.WriteString("\n")
+			}
+		}
+	}
+
+	b.WriteString(inputStr)
 	return m.configureView(tea.NewView(b.String()))
+}
+
+func renderedLineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	lines := strings.Count(s, "\n")
+	if strings.HasSuffix(s, "\n") {
+		return lines
+	}
+	return lines + 1
 }
 
 func (m *Model) configureView(v tea.View) tea.View {
@@ -1744,7 +1936,6 @@ func (m *Model) configureView(v tea.View) tea.View {
 // non-input lines capped at m.termWidth columns so that wide characters or
 // long help text never trigger terminal auto-wrapping.
 func (m *Model) renderInputSection(b *strings.Builder) {
-	startLen := b.Len()
 
 	// Line 1: separator — cap at termWidth so it never auto-wraps on very
 	// narrow terminals (termWidth < 5 would otherwise overflow the 5-rune
@@ -1770,9 +1961,14 @@ func (m *Model) renderInputSection(b *strings.Builder) {
 	}
 	statusLine := statusStyle.Render("[状态] " + status)
 	spinner := m.currentSpinnerFrame()
+	verb := m.currentSpinnerVerb()
 	var spinnerPart string
 	if spinner != "" {
-		spinnerPart = "  " + spinner
+		if verb != "" {
+			spinnerPart = "  " + spinner + " " + verb
+		} else {
+			spinnerPart = "  " + spinner
+		}
 	}
 	if contextBar := m.renderContextBar(); contextBar != "" {
 		spinnerPart += "  " + contextBar
@@ -1802,6 +1998,21 @@ func (m *Model) renderInputSection(b *strings.Builder) {
 		if m.connectionDetail != "" {
 			tokenText += " " + m.connectionDetail
 		}
+	}
+	if m.cwd != "" {
+		base := m.cwd
+		if idx := strings.LastIndex(base, "/"); idx >= 0 && idx < len(base)-1 {
+			parent := base[:idx]
+			if pidx := strings.LastIndex(parent, "/"); pidx >= 0 {
+				base = base[pidx+1:]
+			} else {
+				base = base[idx+1:]
+			}
+		}
+		tokenText += " | " + SafeChar("folder_prefix", m.termCap) + base
+	}
+	if m.apiBaseURL != "" {
+		tokenText += " | " + SafeChar("globe_prefix", m.termCap) + m.apiBaseURL
 	}
 	tokenLine := tokenStyle.Render("[令牌] " + tokenText)
 	if m.termWidth > 0 && lipgloss.Width(tokenLine) > m.termWidth {
@@ -1850,16 +2061,6 @@ func (m *Model) renderInputSection(b *strings.Builder) {
 	// Line 5: help text (width-adaptive to prevent terminal auto-wrapping)
 	helpStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 	b.WriteString(helpStyle.Render(m.buildHelpText()) + "\n")
-
-	rendered := b.String()[startLen:]
-	currentLines := strings.Count(rendered, "\n")
-	if currentLines < m.lastRenderHeight {
-		for i := 0; i < m.lastRenderHeight-currentLines; i++ {
-			b.WriteString("\n")
-		}
-	} else if currentLines > m.lastRenderHeight {
-		m.lastRenderHeight = currentLines
-	}
 }
 
 func (m *Model) renderExpandedThinking(b *strings.Builder) {
@@ -1898,18 +2099,31 @@ func (m *Model) renderFullscreenHistory() tea.View {
 	b.WriteString(title + "\n\n")
 
 	viewportHeight := m.historyViewportHeight()
-	if len(m.lines) == 0 {
+	nMsg := m.historyMsgLen()
+	if nMsg == 0 {
 		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Render("暂无历史记录") + "\n")
 		return tea.NewView(b.String())
 	}
-	maxOffset := maxInt(0, len(m.lines)-viewportHeight)
+	maxOffset := maxInt(0, nMsg-viewportHeight)
 	m.historyScrollOffset = clampInt(m.historyScrollOffset, 0, maxOffset)
 	end := m.historyScrollOffset + viewportHeight
-	if end > len(m.lines) {
-		end = len(m.lines)
+	if end > nMsg {
+		end = nMsg
 	}
 	for i := m.historyScrollOffset; i < end; i++ {
-		line := m.lines[i]
+		msg := m.messages.Get(i)
+		if msg == nil {
+			continue
+		}
+		// Use the shared renderedMessageLines cache so formatting work done
+		// by the inline window is reused here. Take only the first line so
+		// the history browser shows exactly one row per message regardless
+		// of how many wrapped lines the message occupies in the inline view.
+		renderedLines := m.renderedMessageLines(msg)
+		line := ""
+		if len(renderedLines) > 0 {
+			line = renderedLines[0]
+		}
 		if m.termWidth > 0 && xansi.StringWidth(line) > m.termWidth {
 			line = xansi.Truncate(line, m.termWidth, "")
 		}
@@ -1924,6 +2138,11 @@ func (m *Model) renderFullscreenHistory() tea.View {
 	return tea.NewView(b.String())
 }
 
+// historyMsgLen returns the number of displayable messages in the store.
+func (m *Model) historyMsgLen() int {
+	return m.messages.Len()
+}
+
 func (m *Model) historyViewportHeight() int {
 	if m.termHeight <= 3 {
 		return 10
@@ -1934,8 +2153,9 @@ func (m *Model) historyViewportHeight() int {
 func (m *Model) enterFullscreenHistory() {
 	m.altScreenActive = true
 	viewportHeight := m.historyViewportHeight()
-	m.historyScrollOffset = maxInt(0, len(m.lines)-viewportHeight)
-	m.historySelected = clampInt(len(m.lines)-1, 0, maxInt(0, len(m.lines)-1))
+	nMsg := m.historyMsgLen()
+	m.historyScrollOffset = maxInt(0, nMsg-viewportHeight)
+	m.historySelected = clampInt(nMsg-1, 0, maxInt(0, nMsg-1))
 }
 
 func (m *Model) handleFullscreenHistoryKey(msg tea.KeyPressMsg) tea.Cmd {
@@ -1950,7 +2170,7 @@ func (m *Model) handleFullscreenHistoryKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.historySelected = 0
 		m.ensureHistorySelectionVisible()
 	case "G":
-		m.historySelected = maxInt(0, len(m.lines)-1)
+		m.historySelected = maxInt(0, m.historyMsgLen()-1)
 		m.ensureHistorySelectionVisible()
 	case "ctrl+y":
 		if content := m.getSelectedHistoryContent(); content != "" {
@@ -1961,22 +2181,25 @@ func (m *Model) handleFullscreenHistoryKey(msg tea.KeyPressMsg) tea.Cmd {
 }
 
 func (m *Model) scrollFullscreenHistory(delta int) {
-	maxOffset := maxInt(0, len(m.lines)-m.historyViewportHeight())
+	nMsg := m.historyMsgLen()
+	maxOffset := maxInt(0, nMsg-m.historyViewportHeight())
 	m.historyScrollOffset = clampInt(m.historyScrollOffset+delta, 0, maxOffset)
-	m.historySelected = clampInt(m.historySelected+delta, 0, maxInt(0, len(m.lines)-1))
+	m.historySelected = clampInt(m.historySelected+delta, 0, maxInt(0, nMsg-1))
 	m.ensureHistorySelectionVisible()
 }
 
 func (m *Model) moveHistorySelection(delta int) {
-	if len(m.lines) == 0 {
+	nMsg := m.historyMsgLen()
+	if nMsg == 0 {
 		return
 	}
-	m.historySelected = clampInt(m.historySelected+delta, 0, len(m.lines)-1)
+	m.historySelected = clampInt(m.historySelected+delta, 0, nMsg-1)
 	m.ensureHistorySelectionVisible()
 }
 
 func (m *Model) ensureHistorySelectionVisible() {
-	if len(m.lines) == 0 {
+	nMsg := m.historyMsgLen()
+	if nMsg == 0 {
 		m.historyScrollOffset = 0
 		m.historySelected = 0
 		return
@@ -1988,30 +2211,34 @@ func (m *Model) ensureHistorySelectionVisible() {
 	if m.historySelected >= m.historyScrollOffset+viewportHeight {
 		m.historyScrollOffset = m.historySelected - viewportHeight + 1
 	}
-	maxOffset := maxInt(0, len(m.lines)-viewportHeight)
+	maxOffset := maxInt(0, nMsg-viewportHeight)
 	m.historyScrollOffset = clampInt(m.historyScrollOffset, 0, maxOffset)
 }
 
 func (m *Model) getSelectedHistoryContent() string {
-	if len(m.lines) == 0 {
+	nMsg := m.historyMsgLen()
+	if nMsg == 0 {
 		return ""
 	}
-	idx := clampInt(m.historySelected, 0, len(m.lines)-1)
-	return xansi.Strip(m.lines[idx])
+	idx := clampInt(m.historySelected, 0, nMsg-1)
+	msg := m.messages.Get(idx)
+	if msg == nil {
+		return ""
+	}
+	return msg.Content
 }
 
+// lastAssistantReply returns the most recent assistant message content,
+// walking the MessageStore backwards and skipping non-assistant roles.
 func (m *Model) lastAssistantReply() string {
-	for i := len(m.lines) - 1; i >= 0; i-- {
-		plain := xansi.Strip(m.lines[i])
-		if strings.TrimSpace(plain) == "" {
+	for i := m.messages.Len() - 1; i >= 0; i-- {
+		msg := m.messages.Get(i)
+		if msg == nil {
 			continue
 		}
-		if strings.HasPrefix(plain, "👤 ") || strings.HasPrefix(plain, "🛠 ") ||
-			strings.HasPrefix(plain, "🧠 ") || strings.HasPrefix(plain, "⚙ ") ||
-			strings.HasPrefix(plain, "❌ ") {
-			continue
+		if msg.Role == "assistant" || msg.Role == "assistant_stream" {
+			return msg.Content
 		}
-		return plain
 	}
 	return ""
 }
@@ -2062,16 +2289,25 @@ func maxInt(a, b int) int {
 // truncation. This prevents terminal auto-wrapping which would cause the
 // renderer's line count to differ from actual displayed lines, leading to
 // duplicate View output in non-AltScreen (inline) mode.
+// When showHelp is false only a compact "? 帮助" hint is returned so the user
+// knows the key exists but the line stays minimal.
 func (m *Model) buildHelpText() string {
-	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | ↑↓ 历史"
+	if !m.showHelp {
+		hint := "? 帮助"
+		if m.termWidth > 0 && lipgloss.Width(hint) <= m.termWidth {
+			return hint
+		}
+		return ""
+	}
+	full := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索历史 | Ctrl+F 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | Ctrl+C 退出 | Tab 补全 | [ 滚动 | PgUp/PgDn 翻页 | ↑↓ 历史 | ? 收起"
 	if m.termWidth <= 0 || lipgloss.Width(full) <= m.termWidth {
 		return full
 	}
-	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | Tab 补全"
+	short := "Enter 发送 | Ctrl+J 换行 | Ctrl+R 搜索 | Ctrl+F 搜索 | Ctrl+L 新会话 | Ctrl+P 命令 | PgUp/PgDn 翻页 | Tab 补全 | ? 收起"
 	if lipgloss.Width(short) <= m.termWidth {
 		return short
 	}
-	minimal := "Enter发送 | ^J换行 | ^R搜索 | ^L新会话"
+	minimal := "Enter发送 | ^J换行 | ^R搜索 | ^F搜索 | ^L新会话 | PgUp/PgDn | ?收起"
 	if lipgloss.Width(minimal) <= m.termWidth {
 		return minimal
 	}
@@ -2104,8 +2340,29 @@ func (m *Model) safeWrapWidth() int {
 	return maxInt(m.termWidth-formattedLinePrefixReserve, 1)
 }
 
-func (m *Model) wrapFormattedLine(line string) string {
-	return truncateLines(wordwrap.String(line, m.safeWrapWidth()), m.termWidth)
+// safeWrapWidthForRole returns the word-wrap budget appropriate for the given
+// message role. Roles whose formatLine output includes an emoji prefix reserve
+// formattedLinePrefixReserve columns so the first rendered line never exceeds
+// termWidth. Roles without a prefix (assistant_stream, and the catch-all
+// default case) use the full terminal width.
+func (m *Model) safeWrapWidthForRole(role string) int {
+	switch role {
+	case "assistant_stream", "":
+		if m.termWidth <= 0 {
+			return defaultMarkdownRenderWidth
+		}
+		return m.termWidth
+	default:
+		return m.safeWrapWidth()
+	}
+}
+
+// wrapFormattedLineForRole wraps and truncates line using the wrap budget
+// appropriate for the given role. Roles without an emoji prefix (e.g.
+// assistant_stream) use the full terminal width via safeWrapWidthForRole;
+// emoji-prefix roles reserve formattedLinePrefixReserve columns.
+func (m *Model) wrapFormattedLineForRole(role, line string) string {
+	return truncateLines(wordwrap.String(line, m.safeWrapWidthForRole(role)), m.termWidth)
 }
 
 // Message defines the message structure
@@ -2132,11 +2389,6 @@ func spinnerTickCmd() tea.Cmd {
 }
 
 func (m *Model) shouldAnimateSpinner() bool {
-	// Avoid inline renderer line-count conflicts by skipping spinner redraws
-	// immediately after tea.Printf emits streaming scrollback content.
-	if !m.lastFlushTime.IsZero() && time.Since(m.lastFlushTime) < spinnerTickInterval {
-		return false
-	}
 	return m.isSpinnerPhase()
 }
 
@@ -2206,6 +2458,17 @@ type SpawnTeammateMsg struct {
 // TaskCompletionMsg signals that the entire agent turn has completed.
 type TaskCompletionMsg struct {
 	Reason string
+}
+
+// ImagePasteSuccessMsg is sent when an image is successfully pasted from clipboard
+type ImagePasteSuccessMsg struct {
+	Image llm.MultimodalImage
+	Path  string
+}
+
+// ImagePasteErrorMsg is sent when image paste fails
+type ImagePasteErrorMsg struct {
+	Error error
 }
 
 func formatLine(kind, s string) string {
@@ -2284,6 +2547,15 @@ func (m *Model) ShowConfirmation(message string, toolInfo map[string]interface{}
 // "始终允许" (option 2) in the confirmation dialog.
 func (m *Model) SetAllowlistHandler(h func(toolName string, params map[string]interface{})) {
 	m.allowlistHandler = h
+}
+
+// SetBannerArt stores the rendered product banner artwork that the inline
+// View() displays above the input area while the conversation is empty.
+// Callers (the UI adapter / CLI bootstrap) pass the static last frame of the
+// startup banner animation so the TUI is never blank of product identity.
+// Pass an empty string to disable banner display.
+func (m *Model) SetBannerArt(art string) {
+	m.bannerArt = art
 }
 
 // SetPermissionManager wires a permission.Manager so that slash commands
@@ -2409,6 +2681,11 @@ func (m *Model) SetRoutinesResumer(fn func(string) string) {
 	m.localDispatcher = nil
 }
 
+func (m *Model) SetRoutinesRunner(fn func(string) string) {
+	m.routinesRunner = fn
+	m.localDispatcher = nil
+}
+
 // getLocalDispatcher returns the lazily-constructed LocalDispatcher.
 func (m *Model) getLocalDispatcher() *slash.LocalDispatcher {
 	if m.localDispatcher == nil {
@@ -2462,6 +2739,9 @@ func (m *Model) getLocalDispatcher() *slash.LocalDispatcher {
 		if m.routinesResumer != nil {
 			d = d.WithRoutinesResumer(m.routinesResumer)
 		}
+		if m.routinesRunner != nil {
+			d = d.WithRoutinesRunner(m.routinesRunner)
+		}
 		m.localDispatcher = d
 	}
 	return m.localDispatcher
@@ -2472,23 +2752,36 @@ func (m *Model) getLocalDispatcher() *slash.LocalDispatcher {
 // input (in which case the resulting message has already been appended to
 // the conversation), or (false, nil) for the caller to fall through to its
 // existing pipeline.
+//
+// Note: this helper does not surface the dispatcher's ShouldSubmit branch.
+// Callers that need to forward a rewritten command to the agent should call
+// the dispatcher directly and use recordLocalSlashResult to render local
+// messages.
 func (m *Model) handleLocalSlashCommand(input string) (bool, tea.Cmd) {
 	r := m.getLocalDispatcher().Dispatch(input)
 	if !r.Handled {
 		return false, nil
 	}
+	return m.recordLocalSlashResult(r)
+}
+
+// recordLocalSlashResult appends a dispatcher Result message to the
+// transcript, mapping the dispatcher level to a UI role.
+func (m *Model) recordLocalSlashResult(r slash.Result) (bool, tea.Cmd) {
 	level := r.Level
 	if level == "" {
 		level = "info"
 	}
 	uiLevel := level
-	switch level {
-	case "warning":
+	if level == "warning" {
 		uiLevel = "info" // renderPermissionFeedback only knows success/error/info
 	}
-	line := m.renderPermissionFeedback(uiLevel, r.Message, "")
-	m.lines = append(m.lines, line)
-	return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+	role := "system"
+	if uiLevel == "error" {
+		role = "error"
+	}
+	m.recordMessage(role, r.Message)
+	return true, nil
 }
 
 // handlePermissionSlashCommand intercepts locally-handled slash commands and
@@ -2509,43 +2802,37 @@ func (m *Model) handlePermissionSlashCommand(input string) (bool, tea.Cmd) {
 	switch {
 	case lower == "/yolo":
 		if pm == nil {
-			line := m.renderPermissionFeedback("error", "❌ 权限管理器未初始化", "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			m.recordPermissionFeedback("error", "❌ 权限管理器未初始化", "")
+			return true, nil
 		}
 		pm.SetMode(permission.ModeYOLO)
 		m.permissionMode = string(permission.ModeYOLO)
-		line := m.renderPermissionFeedback("success",
+		m.recordPermissionFeedback("success",
 			"⚡ YOLO 模式已激活",
 			"所有工具将自动执行，无需确认。使用 /permission default 恢复。")
-		m.lines = append(m.lines, line)
-		return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+		return true, nil
 
 	case lower == "/plan":
 		if pm == nil {
-			line := m.renderPermissionFeedback("error", "❌ 权限管理器未初始化", "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			m.recordPermissionFeedback("error", "❌ 权限管理器未初始化", "")
+			return true, nil
 		}
 		pm.SetMode(permission.ModePlan)
 		m.permissionMode = string(permission.ModePlan)
-		line := m.renderPermissionFeedback("success",
+		m.recordPermissionFeedback("success",
 			"📋 Plan 模式已激活",
 			"只允许只读工具执行（用于安全代码分析）。使用 /permission default 恢复。")
-		m.lines = append(m.lines, line)
-		return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+		return true, nil
 
 	case lower == "/permissions":
-		line := m.renderPermissionsPanel()
-		m.lines = append(m.lines, line)
-		return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+		m.recordMessage("system", m.renderPermissionsPanel())
+		return true, nil
 
 	case strings.HasPrefix(lower, "/permission "):
 		arg := strings.TrimSpace(input[len("/permission "):])
 		if pm == nil {
-			line := m.renderPermissionFeedback("error", "❌ 权限管理器未初始化", "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			m.recordPermissionFeedback("error", "❌ 权限管理器未初始化", "")
+			return true, nil
 		}
 		// Normalize arg to lowercase for case-insensitive matching
 		mode := permission.PermissionMode(strings.ToLower(arg))
@@ -2566,51 +2853,44 @@ func (m *Model) handlePermissionSlashCommand(input string) (bool, tea.Cmd) {
 		case permission.ModeDefault, permission.ModeAcceptEdits, permission.ModePlan, permission.ModeAuto, permission.ModeYOLO:
 			pm.SetMode(mode)
 			m.permissionMode = string(mode)
-			line := m.renderPermissionFeedback("success",
+			m.recordPermissionFeedback("success",
 				fmt.Sprintf("✅ 权限模式已切换为：%s", mode), "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			return true, nil
 		default:
-			line := m.renderPermissionFeedback("error",
+			m.recordPermissionFeedback("error",
 				fmt.Sprintf("❌ 未知模式：%s", arg),
 				"可选：default / acceptEdits / plan / auto / yolo")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			return true, nil
 		}
 
 	case strings.HasPrefix(lower, "/allow "):
 		raw := strings.TrimSpace(input[len("/allow "):])
 		if raw == "" {
-			line := m.renderPermissionFeedback("error",
+			m.recordPermissionFeedback("error",
 				"❌ 规则不能为空",
 				"示例：/allow Bash(git *) 或 /allow write_file(*.go)")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			return true, nil
 		}
 		if pm == nil {
-			line := m.renderPermissionFeedback("error", "❌ 权限管理器未初始化", "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			m.recordPermissionFeedback("error", "❌ 权限管理器未初始化", "")
+			return true, nil
 		}
 		rule := permission.ParseRule(raw)
 		if rule.ToolName == "" {
-			line := m.renderPermissionFeedback("error",
+			m.recordPermissionFeedback("error",
 				fmt.Sprintf("❌ 无效规则：%q", raw), "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			return true, nil
 		}
 		pm.GetSessionAllowlist().AddRule(rule)
-		line := m.renderPermissionFeedback("success",
+		m.recordPermissionFeedback("success",
 			fmt.Sprintf("✅ 已添加白名单规则：%s", rule.RawPattern), "")
-		m.lines = append(m.lines, line)
-		return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+		return true, nil
 
 	case strings.HasPrefix(lower, "/disallow "):
 		raw := strings.TrimSpace(input[len("/disallow "):])
 		if pm == nil {
-			line := m.renderPermissionFeedback("error", "❌ 权限管理器未初始化", "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			m.recordPermissionFeedback("error", "❌ 权限管理器未初始化", "")
+			return true, nil
 		}
 		pm.GetSessionAllowlist().RemoveRule(raw)
 		// Also remove from persistent storage
@@ -2619,24 +2899,20 @@ func (m *Model) handlePermissionSlashCommand(input string) (bool, tea.Cmd) {
 				logger.Warnf("Failed to remove persistent allowlist rule %q: %v", raw, err)
 			}
 		}
-		line := m.renderPermissionFeedback("success",
+		m.recordPermissionFeedback("success",
 			fmt.Sprintf("🗑️ 已移除白名单规则：%s", raw), "")
-		m.lines = append(m.lines, line)
-		return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+		return true, nil
 
 	case strings.HasPrefix(lower, "/think"):
 		// Handle /think command via Engine
 		if m.engine == nil {
-			line := m.renderPermissionFeedback("error", "❌ Engine 未初始化", "")
-			m.lines = append(m.lines, line)
-			return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+			m.recordPermissionFeedback("error", "❌ Engine 未初始化", "")
+			return true, nil
 		}
 		// Extract args after /think
 		args := strings.TrimSpace(input[len("/think"):])
-		result := m.engine.HandleThinkCommand(args)
-		line := m.renderPermissionFeedback("info", result, "")
-		m.lines = append(m.lines, line)
-		return true, tea.Printf("%s", truncateLines(line, m.termWidth))
+		m.recordPermissionFeedback("info", m.engine.HandleThinkCommand(args), "")
+		return true, nil
 
 	case lower == "/clear", lower == "/new":
 		// /clear or /new: Start a new session (clear context) - equivalent to Ctrl+L
@@ -2644,6 +2920,26 @@ func (m *Model) handlePermissionSlashCommand(input string) (bool, tea.Cmd) {
 	}
 
 	return false, nil
+}
+
+// recordPermissionFeedback records the permission-feedback into the shared
+// MessageStore. The returned string is the already-styled feedback line for
+// callers that need the raw text.
+//
+// The role used is derived from `level`: "error" becomes the "error" role,
+// everything else becomes "system".
+func (m *Model) recordPermissionFeedback(level, title, detail string) string {
+	line := m.renderPermissionFeedback(level, title, detail)
+	content := title
+	if detail != "" {
+		content = title + "\n" + detail
+	}
+	role := "system"
+	if level == "error" {
+		role = "error"
+	}
+	m.recordMessage(role, content)
+	return line
 }
 
 // renderPermissionFeedback renders a colored feedback panel for permission commands.
@@ -3123,4 +3419,69 @@ func (m *Model) renderCommandsPalette(b *strings.Builder) {
 		box := lipgloss.NewStyle().Padding(1, 2).Render(pb.String())
 		b.WriteString(box + "\n" + help + "\n")
 	}
+}
+
+// handleImagePaste handles image paste events from clipboard
+func (m *Model) handleImagePaste() tea.Cmd {
+	return func() tea.Msg {
+		imgData, err := clipboard.ReadImage()
+		if err != nil {
+			return ImagePasteErrorMsg{Error: err}
+		}
+
+		path, err := m.attachmentMgr.SaveImage(imgData, "image/png")
+		if err != nil {
+			return ImagePasteErrorMsg{Error: err}
+		}
+
+		img, err := m.attachmentMgr.ToMultimodalImage(path)
+		if err != nil {
+			return ImagePasteErrorMsg{Error: err}
+		}
+
+		return ImagePasteSuccessMsg{Image: img, Path: path}
+	}
+}
+
+// handleFilePaste handles file paste events from clipboard
+func (m *Model) handleFilePaste() tea.Cmd {
+	return func() tea.Msg {
+		filePaths, err := clipboard.ReadFilePaths()
+		if err != nil || len(filePaths) == 0 {
+			return ImagePasteErrorMsg{Error: fmt.Errorf("no files in clipboard")}
+		}
+
+		// Process first file only for now
+		srcPath := filePaths[0]
+		if !attachment.IsImageFile(srcPath) {
+			return ImagePasteErrorMsg{Error: fmt.Errorf("file is not an image: %s", srcPath)}
+		}
+
+		destPath, err := m.attachmentMgr.SaveFile(srcPath)
+		if err != nil {
+			return ImagePasteErrorMsg{Error: err}
+		}
+
+		img, err := m.attachmentMgr.ToMultimodalImage(destPath)
+		if err != nil {
+			return ImagePasteErrorMsg{Error: err}
+		}
+
+		return ImagePasteSuccessMsg{Image: img, Path: destPath}
+	}
+}
+
+// updateImageIndicator updates the UI indicator showing attached images
+func (m *Model) updateImageIndicator() {
+	count := len(m.pendingImages)
+	if count == 0 {
+		m.imageIndicator = ""
+		return
+	}
+	m.imageIndicator = fmt.Sprintf("📎 %d image(s) attached", count)
+}
+
+// SetAttachmentManager sets the attachment manager for this model
+func (m *Model) SetAttachmentManager(mgr *attachment.Manager) {
+	m.attachmentMgr = mgr
 }

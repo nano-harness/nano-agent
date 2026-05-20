@@ -33,7 +33,7 @@ Metadata/list subcommands accept `--json` for machine-readable output.
 
 | Subcommand               | Purpose                                                  |
 | ------------------------ | -------------------------------------------------------- |
-| `binary query <prompt>`  | Run a single prompt and exit (replaces `--binary-mode`)  |
+| `binary exec <prompt>`  | Run a single prompt and exit (replaces `--binary-mode`)  |
 | `binary list-models`     | List configured provider/model presets                   |
 | `binary list-tools`      | List built-in tool descriptors                           |
 | `binary list-slash`      | List built-in slash commands                             |
@@ -76,8 +76,10 @@ silently ignored.
 
 ## Migration notes
 
-- `--binary-mode` → `nano binary swebench` (or `nano binary query`).
+- `--binary-mode` → `nano binary swebench` (or `nano binary exec`).
   See `swe_bench_test/run_swe_bench.py` for the updated invocation.
+- `nano binary exec` supports embedded goal loops with `--goal`,
+  `--goal-max-turns`, or a first-line `/goal <condition>` prompt directive.
 - `nano mcp servers stop <name>` now persistently disables the server in
   the active config rather than pretending to "stop a process". Use
   `nano mcp servers start <name>` to re-probe and re-enable.

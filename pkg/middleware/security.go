@@ -42,10 +42,9 @@ func (a Action) String() string {
 
 // Layer identifies which decision layer produced the result.
 const (
-	LayerConfig     = 1
-	LayerHook       = 2
-	LayerAnalyzer   = 3
-	LayerUserDialog = 4
+	LayerConfig   = 1
+	LayerHook     = 2
+	LayerAnalyzer = 3
 )
 
 // Decision is the result of the four-layer permission decision pipeline.

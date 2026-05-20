@@ -100,6 +100,52 @@ func TestBuildBaseSystemPrompt_GitContextOptional(t *testing.T) {
 	}
 }
 
+func TestBuildBaseSystemPromptUsesClaudeCodeStylePrimaryEngineeringRole(t *testing.T) {
+	spb := newTestSystemPromptBuilder()
+	prompt := spb.BuildBaseSystemPrompt()
+	for _, want := range []string{
+		"interactive AI assistant",
+		"primarily helps users with software engineering tasks",
+		"software engineering",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("BuildBaseSystemPrompt() should contain %q", want)
+		}
+	}
+}
+
+func TestBuildBaseSystemPromptDoesNotRefuseNonProgrammingByDefault(t *testing.T) {
+	spb := newTestSystemPromptBuilder()
+	prompt := spb.BuildBaseSystemPrompt()
+	for _, want := range []string{
+		"Do not refuse a request merely because it is not about programming",
+		"safe general information tasks",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("BuildBaseSystemPrompt() should contain %q", want)
+		}
+	}
+}
+
+func TestBuildBaseSystemPromptGuidesCurrentInfoToWebTools(t *testing.T) {
+	spb := newTestSystemPromptBuilder()
+	prompt := spb.BuildBaseSystemPrompt()
+	for _, want := range []string{
+		"web_search",
+		"web_fetch",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("BuildBaseSystemPrompt() should reference %q", want)
+		}
+	}
+	if !strings.Contains(prompt, "current information") && !strings.Contains(prompt, "facts that may change over time") {
+		t.Error("BuildBaseSystemPrompt() should mention 'current information' or 'facts that may change over time'")
+	}
+	if !strings.Contains(prompt, "ask the user for the key parameters") {
+		t.Error("BuildBaseSystemPrompt() should instruct asking for missing required parameters before using web tools")
+	}
+}
+
 func TestBuildEnhancedSystemPromptContainsBlockingRequirement(t *testing.T) {
 	spb := newTestSystemPromptBuilder()
 	sm := newTestSkillManagerWithSkill(t)

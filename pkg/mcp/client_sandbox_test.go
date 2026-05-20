@@ -37,6 +37,38 @@ func TestCreateTransportWrapsStdioCommandWithSandboxRuntime(t *testing.T) {
 	}
 }
 
+func TestCreateTransportHTTPAliasUsesStreamableTransport(t *testing.T) {
+	client := NewMCPClient(&MCPConfig{})
+
+	transport, cmd, err := client.createTransport(context.Background(), MCPServerConfig{
+		Name:      "legacy-http",
+		Transport: "http",
+		URL:       "http://127.0.0.1:3000/mcp",
+	})
+	if err != nil {
+		t.Fatalf("createTransport returned error: %v", err)
+	}
+	if transport == nil {
+		t.Fatal("expected streamable transport for http alias")
+	}
+	if cmd != nil {
+		t.Fatalf("expected no command for http alias, got %#v", cmd)
+	}
+}
+
+func TestCreateTransportWebsocketStillUnsupported(t *testing.T) {
+	client := NewMCPClient(&MCPConfig{})
+
+	_, _, err := client.createTransport(context.Background(), MCPServerConfig{
+		Name:      "legacy-ws",
+		Transport: "websocket",
+		URL:       "ws://127.0.0.1:3000/mcp",
+	})
+	if err == nil {
+		t.Fatal("expected websocket to remain unsupported")
+	}
+}
+
 type recordingSandboxRuntime struct {
 	prepareCount int
 	lastReq      sandbox.SandboxRequest

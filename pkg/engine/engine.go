@@ -38,6 +38,29 @@ type Engine struct {
 	cronNotifier func(event.StreamEvent)
 }
 
+// EngineOption configures optional Engine behavior.
+type EngineOption func(*engineOptions)
+
+type engineOptions struct {
+	enableScheduler bool
+	agentOpts       []agent.Option
+}
+
+// WithScheduler enables cron task scheduling for this Engine instance.
+// Use this for TUI, Daemon, and Lead modes. Omit for ACP and Teammate modes.
+func WithScheduler() EngineOption {
+	return func(o *engineOptions) {
+		o.enableScheduler = true
+	}
+}
+
+// WithAgentOpts passes agent.Option values through to agent.New().
+func WithAgentOpts(opts ...agent.Option) EngineOption {
+	return func(o *engineOptions) {
+		o.agentOpts = append(o.agentOpts, opts...)
+	}
+}
+
 func (e *Engine) SetCronNotifier(fn func(event.StreamEvent)) {
 	e.cronNotifier = fn
 }
@@ -96,8 +119,13 @@ func buildCronApprovalHandler(policy string) func(*agent.ToolCallInfo) bool {
 
 // New builds an Engine from the provided config and optional approval handler.
 // The approvalHandler may be nil (all tool calls are auto-approved).
-func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opts ...agent.Option) (*Engine, error) {
-	agentInstance, err := agent.New(cfg, approvalHandler, opts...)
+func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opts ...EngineOption) (*Engine, error) {
+	parsed := &engineOptions{}
+	for _, opt := range opts {
+		opt(parsed)
+	}
+
+	agentInstance, err := agent.New(cfg, approvalHandler, parsed.agentOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("engine: create agent: %w", err)
 	}
@@ -111,19 +139,16 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opt
 		StateStore: agentInstance.GetStateStore(),
 	}
 
-	// Determine cron configuration defaults
-	cronCfg := cfg.Cron
-	if cronCfg == nil {
-		cronCfg = &config.CronConfig{
-			PermissionPolicy:   "auto_approve",
-			TurnTimeout:        10 * time.Minute,
-			LogRetentionDays:   30,
-			LogCleanupInterval: 24 * time.Hour,
-		}
+	if parsed.enableScheduler {
+		e.attachScheduler(cfg, agentInstance)
 	}
 
-	// Build the rich executor that the scheduler uses to run commands.
-	executeTaskWithMeta := func(command, taskID string) (cron.TaskExecutionMetadata, error) {
+	return e, nil
+}
+
+// buildCronExecutor creates the rich task executor closure used by the scheduler.
+func (e *Engine) buildCronExecutor(agentInstance *agent.Agent, cronCfg *config.CronConfig) func(command, taskID string) (cron.TaskExecutionMetadata, error) {
+	return func(command, taskID string) (cron.TaskExecutionMetadata, error) {
 		meta := cron.TaskExecutionMetadata{}
 
 		meta.SessionID = cronTaskSessionID(taskID)
@@ -215,6 +240,22 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opt
 
 		return meta, err
 	}
+}
+
+// attachScheduler creates the cron scheduler, wires the executor, and binds it to the agent.
+func (e *Engine) attachScheduler(cfg *config.Config, agentInstance *agent.Agent) {
+	cronCfg := cfg.Cron
+	if cronCfg == nil {
+		cronCfg = &config.CronConfig{
+			PermissionPolicy:   "auto_approve",
+			TurnTimeout:        10 * time.Minute,
+			LogRetentionDays:   30,
+			LogCleanupInterval: 24 * time.Hour,
+		}
+	}
+
+	// Build the rich executor that the scheduler uses to run commands.
+	executeTaskWithMeta := e.buildCronExecutor(agentInstance, cronCfg)
 
 	// Provide legacy wrapper for backward compatibility
 	executeTask := func(command string) error {
@@ -247,8 +288,6 @@ func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opt
 	e.Scheduler.SetExecuteTaskRich(executeTaskWithMeta)
 
 	agentInstance.SetScheduler(e.Scheduler)
-
-	return e, nil
 }
 
 // NewLeadEngine creates an Engine for a team-lead agent with swarm capabilities.
@@ -290,128 +329,7 @@ func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo)
 		StateStore: agentInstance.GetStateStore(),
 	}
 
-	// Setup scheduler (same as New())
-	cronCfg := cfg.Cron
-	if cronCfg == nil {
-		cronCfg = &config.CronConfig{
-			PermissionPolicy:   "auto_approve",
-			TurnTimeout:        10 * time.Minute,
-			LogRetentionDays:   30,
-			LogCleanupInterval: 24 * time.Hour,
-		}
-	}
-
-	executeTaskWithMeta := func(command, taskID string) (cron.TaskExecutionMetadata, error) {
-		meta := cron.TaskExecutionMetadata{}
-		meta.SessionID = cronTaskSessionID(taskID)
-
-		eventsDir := cronCfg.EventsDir
-		if eventsDir == "" {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				eventsDir = filepath.Join(home, ".nano", "cron-events")
-			}
-		}
-
-		var eventsFile *os.File
-		if eventsDir != "" {
-			taskEventsDir := filepath.Join(eventsDir, taskID)
-			if err := os.MkdirAll(taskEventsDir, 0o755); err == nil {
-				eventsPath := filepath.Join(taskEventsDir, fmt.Sprintf("%s.jsonl", meta.SessionID))
-				meta.EventsPath = eventsPath
-				eventsFile, _ = os.OpenFile(eventsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-				if eventsFile != nil {
-					defer func() { _ = eventsFile.Close() }()
-				}
-			}
-		}
-
-		var toolCallCount int
-		var tokenUsage int64
-		var lastToolName string
-
-		callback := func(se event.StreamEvent) {
-			if eventsFile != nil {
-				data, _ := json.Marshal(se)
-				_, _ = eventsFile.Write(append(data, '\n'))
-			}
-
-			if se.Type == event.EventTypeToolCall {
-				toolCallCount++
-				if len(se.ToolCalls) > 0 && se.ToolCalls[0] != nil {
-					lastToolName = se.ToolCalls[0].Name
-				}
-			}
-			if se.Type == event.EventTypeTokenStats && se.TokenStats != nil {
-				tokenUsage += int64(se.TokenStats.TotalTokens)
-			}
-
-			logger.Debugf("engine: cron task %s event [%s]: %s", taskID, se.Type, se.Content)
-		}
-
-		timeout := cronCfg.TurnTimeout
-		if timeout == 0 {
-			timeout = 10 * time.Minute
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		cronHandler := buildCronApprovalHandler(cronCfg.PermissionPolicy)
-		if cronHandler != nil {
-			ctx = agent.WithApprovalHandler(ctx, cronHandler)
-		}
-
-		started := time.Now()
-		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskStarted, taskID, command, meta.SessionID, true, 0, nil))
-		err := agentInstance.ProcessStreamWithMultimodalAndSession(ctx, meta.SessionID, command, nil, callback)
-		e.notifyCronLifecycle(newCronLifecycleEvent(event.EventTypeCronTaskFinished, taskID, command, meta.SessionID, err == nil, time.Since(started).Milliseconds(), err))
-
-		meta.ToolCallCount = toolCallCount
-		meta.TokenUsage = tokenUsage
-
-		if err != nil {
-			meta.FailedTool = lastToolName
-			if errors.Is(err, context.DeadlineExceeded) {
-				meta.FailureStage = "timeout"
-			} else if strings.Contains(err.Error(), "tool execution failed") {
-				meta.FailureStage = "tool_exec"
-			} else if strings.Contains(err.Error(), "llm") || strings.Contains(err.Error(), "LLM") {
-				meta.FailureStage = "llm_call"
-			} else if errors.Is(err, context.Canceled) {
-				meta.FailureStage = "context_cancel"
-			} else {
-				meta.FailureStage = "unknown"
-			}
-		}
-
-		return meta, err
-	}
-
-	executeTask := func(command string) error {
-		_, err := executeTaskWithMeta(command, "legacy")
-		return err
-	}
-
-	e.Scheduler = cron.New(executeTask)
-	if e.StateStore != nil {
-		e.Scheduler.SetStateStore(e.StateStore)
-	}
-
-	logPath := cronCfg.LogPath
-	if logPath == "" {
-		var err error
-		logPath, err = cron.DefaultTaskLogPath()
-		if err != nil {
-			logger.Warnf("engine: could not determine default task log path: %v", err)
-		}
-	}
-	if logPath != "" {
-		taskLog := cron.NewTaskLog(logPath)
-		e.Scheduler.SetTaskLog(taskLog)
-		e.Scheduler.SetLogRetention(cronCfg.LogRetentionDays, cronCfg.LogCleanupInterval)
-	}
-
-	e.Scheduler.SetExecuteTaskRich(executeTaskWithMeta)
-	agentInstance.SetScheduler(e.Scheduler)
+	e.attachScheduler(cfg, agentInstance)
 
 	logger.Infof("Created team-lead engine for team '%s'", teamName)
 	return e, nil
@@ -467,14 +385,17 @@ func NewTeammateEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallI
 	return e, nil
 }
 
-// Start activates the scheduler (loading any persisted tasks).
-// Call this after setting up any UI-specific event bridges.
+// Start activates optional background services (scheduler, log cleanup).
+// Safe to call even when no Scheduler is configured — becomes a no-op.
 func (e *Engine) Start() error {
-	if e.Scheduler != nil {
-		e.Scheduler.Start()
-		if err := e.Scheduler.LoadPersistedTasks(); err != nil {
-			logger.Warnf("engine: failed to reload persisted tasks: %v", err)
-		}
+	if e.Scheduler == nil {
+		logger.Debug("engine: Start() called without scheduler, skipping")
+		return nil
+	}
+
+	e.Scheduler.Start()
+	if err := e.Scheduler.LoadPersistedTasks(); err != nil {
+		logger.Warnf("engine: failed to reload persisted tasks: %v", err)
 	}
 
 	return nil

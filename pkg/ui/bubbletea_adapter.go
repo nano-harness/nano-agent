@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
@@ -25,15 +27,38 @@ type BubbleTeaAdapter struct {
 	// preserved and goroutine count stays bounded.
 	sendCh     chan tea.Msg
 	showBanner bool
+
+	// shutdownMu protects shutting state to prevent writing to closed channel
+	shutdownMu sync.RWMutex
+	shutting   bool
 }
 
 // Run starts the Bubble Tea program and blocks until exit.
 func (a *BubbleTeaAdapter) Run(ctx context.Context, src eventsource.EventSource) error {
 	if a.showBanner {
-		_ = banner.Play(os.Stdout, banner.Options{
-			Theme:    banner.DefaultTheme,
-			Colorize: banner.IsInteractiveTTY(),
-		})
+		_, isFullscreen := a.model.(*bubbletea.FullscreenModel)
+		// Fullscreen (alt-screen) mode clears the terminal on start, so
+		// playing the animation to stdout would be invisible. Skip Play()
+		// and only inject the static banner art into the model.
+		if !isFullscreen {
+			_ = banner.Play(os.Stdout, banner.Options{
+				Theme:    banner.DefaultTheme,
+				Colorize: banner.IsInteractiveTTY(),
+				IconMode: banner.IconTea,
+			})
+		}
+		// Persist the static last frame inside the inline View so the TUI
+		// keeps showing the product mark after the animation finishes.
+		if m, ok := a.model.(*bubbletea.Model); ok {
+			if art, err := banner.LastFrameRendered(banner.DefaultTheme, banner.IsInteractiveTTY(), banner.IconTea); err == nil {
+				m.SetBannerArt(art)
+			}
+		}
+		if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+			if art, err := banner.LastFrameRendered(banner.DefaultTheme, banner.IsInteractiveTTY(), banner.IconMilkTea); err == nil {
+				m.SetBannerArt(art)
+			}
+		}
 	}
 
 	// Bind outbound channel based on model type
@@ -52,15 +77,51 @@ func (a *BubbleTeaAdapter) Run(ctx context.Context, src eventsource.EventSource)
 		return err
 	}
 
+	// Use WaitGroup to ensure both goroutines complete before returning
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	go func() {
+		defer wg.Done()
 		for msg := range a.sendCh {
 			a.program.Send(msg)
 		}
 	}()
-	go a.pumpInbound(childCtx, src)
+	go func() {
+		defer wg.Done()
+		a.pumpInbound(childCtx, src)
+	}()
 
 	_, err := a.program.Run()
+
+	// Signal that we're shutting down to prevent writes to closed channel
+	a.shutdownMu.Lock()
+	a.shutting = true
+	a.shutdownMu.Unlock()
+
+	// Close event source first to unblock pumpInbound
 	_ = src.Close()
+
+	// Cancel context to signal goroutines to exit
+	cancel()
+
+	// Close sendCh to stop the message pump goroutine
+	close(a.sendCh)
+
+	// Wait for all goroutines to complete with a timeout to prevent hanging
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All goroutines completed successfully
+	case <-time.After(2 * time.Second):
+		// Timeout waiting for goroutines - this shouldn't happen but prevents indefinite hang
+	}
+
 	return err
 }
 
@@ -68,6 +129,16 @@ func (a *BubbleTeaAdapter) send(msg tea.Msg) {
 	if a.program == nil {
 		return
 	}
+
+	// Check if we're shutting down to avoid writing to closed channel
+	a.shutdownMu.RLock()
+	isShutting := a.shutting
+	a.shutdownMu.RUnlock()
+
+	if isShutting {
+		return
+	}
+
 	select {
 	case a.sendCh <- msg:
 	default:
@@ -75,7 +146,14 @@ func (a *BubbleTeaAdapter) send(msg tea.Msg) {
 		// TaskCompletionMsg, ShowConfirmationMsg) are never silently dropped.
 		// Ordering may be affected under extreme event bursts, but correctness
 		// is preferred over strict ordering in the overflow case.
-		go func() { a.sendCh <- msg }()
+		go func() {
+			// Re-check shutting state in the goroutine
+			a.shutdownMu.RLock()
+			defer a.shutdownMu.RUnlock()
+			if !a.shutting {
+				a.sendCh <- msg
+			}
+		}()
 	}
 }
 
@@ -107,53 +185,13 @@ func (a *BubbleTeaAdapter) sendEvent(e event.StreamEvent) {
 	if a.program == nil {
 		return
 	}
+	// Delegate all standard event translation to the shared forwarder so both
+	// runBubbleTeaMode (root.go) and BubbleTeaAdapter stay in sync. The forwarder
+	// sends via a.send() (which serialises through sendCh) to preserve ordering.
+	// EventTypeWaitingForUser requires adapter-specific outbound handling, so it
+	// is processed below after the common switch.
+	// EventTypeToolUse also requires a UUID fallback for empty IDs, handled below.
 	switch e.Type {
-	case event.EventTypeCronTaskStarted, event.EventTypeCronTaskFinished, event.EventTypeCronTaskProgress:
-		return
-	case event.EventTypeStreamContent:
-		a.send(bubbletea.Message{Role: "assistant_stream", Content: e.Content})
-	case event.EventTypeContent:
-		if e.Source != "llm_client" {
-			a.send(bubbletea.Message{Role: "assistant_stream", Content: e.Content})
-		}
-	case event.EventTypeError:
-		a.send(bubbletea.Message{Role: "error", Content: e.Error})
-	case event.EventTypeThinking:
-		a.send(bubbletea.ThinkingMsg{
-			Title:          e.Content,
-			Reasoning:      e.Reasoning,
-			ReasoningDelta: e.ReasoningDelta,
-			Metadata:       e.Metadata,
-		})
-	case event.EventTypeDone:
-		a.send(bubbletea.StatusUpdate("完成"))
-	case event.EventTypeTaskCompletion:
-		a.send(bubbletea.TaskCompletionMsg{Reason: stringFromMetadata(e.Metadata, "reason")})
-	case event.EventTypeTokenStats:
-		if e.TokenStats != nil {
-			a.send(bubbletea.TokenStatsUpdate{
-				InputTokens:       e.TokenStats.InputTokens,
-				OutputTokens:      e.TokenStats.OutputTokens,
-				TotalTokens:       e.TokenStats.TotalTokens,
-				Peak:              e.TokenStats.PeakTokensPerSecond,
-				ContextWindowMax:  e.TokenStats.ContextWindowMax,
-				ContextUsedTokens: e.TokenStats.ContextUsedTokens,
-			})
-		}
-	case event.EventTypeToolUse:
-		if e.ToolUse != nil {
-			toolID := e.ToolUse.ID
-			if strings.TrimSpace(toolID) == "" {
-				toolID = fmt.Sprintf("tooluse-%s", uuid.New().String())
-			}
-			a.send(bubbletea.ToolUseMsg{
-				ID:       toolID,
-				ToolName: e.ToolUse.ToolName,
-				Status:   e.ToolUse.Status,
-				Params:   e.ToolUse.Parameters,
-				Result:   e.ToolUse.Result,
-			})
-		}
 	case event.EventTypeWaitingForUser:
 		if req, ok := approvalFromEvent(e); ok {
 			callID := req.callID
@@ -193,14 +231,26 @@ func (a *BubbleTeaAdapter) sendEvent(e event.StreamEvent) {
 				},
 			})
 		}
-	case event.EventTypeMailboxSent:
-		a.send(bubbletea.MailboxMsg{
-			From:    stringFromMetadata(e.Metadata, "from"),
-			To:      stringFromMetadata(e.Metadata, "to"),
-			Kind:    stringFromMetadata(e.Metadata, "kind"),
-			Preview: e.Content,
-		})
+		return
+	case event.EventTypeToolUse:
+		// Generate a UUID when the upstream tool ID is empty so the dedup
+		// map in the TUI model always has a stable key.
+		if e.ToolUse != nil {
+			toolID := e.ToolUse.ID
+			if strings.TrimSpace(toolID) == "" {
+				toolID = fmt.Sprintf("tooluse-%s", uuid.New().String())
+			}
+			a.send(bubbletea.ToolUseMsg{
+				ID:       toolID,
+				ToolName: e.ToolUse.ToolName,
+				Status:   e.ToolUse.Status,
+				Params:   e.ToolUse.Parameters,
+				Result:   e.ToolUse.Result,
+			})
+		}
+		return
 	}
+	bubbletea.ForwardStreamEvent(a.send, e)
 }
 
 func (a *BubbleTeaAdapter) AttachCronTracker(t *CronStatusTracker) {
@@ -220,13 +270,20 @@ func (a *BubbleTeaAdapter) Stop() {
 }
 
 // ── Capability setters ───────────────────────────────────────────────────────
-// These methods forward configuration to the underlying bubbletea.Model (inline mode only).
-// Fullscreen model does not support these capabilities yet.
+// These methods forward configuration to the underlying bubbletea model.
+// Inline (Model) mode receives every setter. Fullscreen (FullscreenModel)
+// mode receives the subset it implements (permission manager, new-session
+// handler, model lister); other setters are intentionally no-ops there
+// until the corresponding feature is ported.
 
 // SetPermissionManager enables /yolo, /permission, /allow, /disallow, /permissions
 // slash commands and Shift+Tab permission-mode cycling.
 func (a *BubbleTeaAdapter) SetPermissionManager(mgr *permission.Manager) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetPermissionManager(mgr)
+		return
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetPermissionManager(mgr)
 	}
 }
@@ -236,11 +293,17 @@ func (a *BubbleTeaAdapter) SetPersistentAllowlist(store *permission.PersistentAl
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetPersistentAllowlist(store, workdir)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetPersistentAllowlist(store, workdir)
+	}
 }
 
 // SetEngine enables /think and other engine-level slash commands.
 func (a *BubbleTeaAdapter) SetEngine(eng *engine.Engine) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetEngine(eng)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetEngine(eng)
 	}
 }
@@ -251,6 +314,9 @@ func (a *BubbleTeaAdapter) SetAllowlistHandler(h func(toolName string, params ma
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetAllowlistHandler(h)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetAllowlistHandler(h)
+	}
 }
 
 // SetAvailableToolNames provides tool names used for Tab completion of /allow <tool>.
@@ -258,11 +324,18 @@ func (a *BubbleTeaAdapter) SetAvailableToolNames(names []string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetAvailableToolNames(names)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetAvailableToolNames(names)
+	}
 }
 
 // SetNewSessionHandler registers the callback invoked by Ctrl+L / /clear.
 func (a *BubbleTeaAdapter) SetNewSessionHandler(h func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetNewSessionHandler(h)
+		return
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetNewSessionHandler(h)
 	}
 }
@@ -272,10 +345,17 @@ func (a *BubbleTeaAdapter) SetTeamName(name string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetTeamName(name)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetTeamName(name)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelLister(fn func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelLister(fn)
+		return
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetModelLister(fn)
 	}
 }
@@ -284,10 +364,16 @@ func (a *BubbleTeaAdapter) SetSkillLister(fn func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetSkillLister(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetSkillLister(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelStatusGetter(fn func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelStatusGetter(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetModelStatusGetter(fn)
 	}
 }
@@ -296,10 +382,16 @@ func (a *BubbleTeaAdapter) SetModelSwitcher(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetModelSwitcher(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetModelSwitcher(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetModelFallbackHandler(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetModelFallbackHandler(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetModelFallbackHandler(fn)
 	}
 }
@@ -308,10 +400,16 @@ func (a *BubbleTeaAdapter) SetModelDoctor(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetModelDoctor(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetModelDoctor(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetContextStatusGetter(fn func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetContextStatusGetter(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetContextStatusGetter(fn)
 	}
 }
@@ -320,16 +418,25 @@ func (a *BubbleTeaAdapter) SetDoctorReporter(fn func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetDoctorReporter(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetDoctorReporter(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetEventsQuerier(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetEventsQuerier(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetEventsQuerier(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetAuditQuerier(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetAuditQuerier(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetAuditQuerier(fn)
 	}
 }
@@ -339,11 +446,17 @@ func (a *BubbleTeaAdapter) SetRoutinesLister(fn func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetRoutinesLister(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetRoutinesLister(fn)
+	}
 }
 
 // SetRunningStatusLister wires the callback for /routines status.
 func (a *BubbleTeaAdapter) SetRunningStatusLister(fn func() string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRunningStatusLister(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetRunningStatusLister(fn)
 	}
 }
@@ -352,10 +465,16 @@ func (a *BubbleTeaAdapter) SetRoutinesAdder(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetRoutinesAdder(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetRoutinesAdder(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetRoutinesRemover(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRoutinesRemover(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
 		m.SetRoutinesRemover(fn)
 	}
 }
@@ -364,11 +483,26 @@ func (a *BubbleTeaAdapter) SetRoutinesPauser(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetRoutinesPauser(fn)
 	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetRoutinesPauser(fn)
+	}
 }
 
 func (a *BubbleTeaAdapter) SetRoutinesResumer(fn func(string) string) {
 	if m, ok := a.model.(*bubbletea.Model); ok {
 		m.SetRoutinesResumer(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetRoutinesResumer(fn)
+	}
+}
+
+func (a *BubbleTeaAdapter) SetRoutinesRunner(fn func(string) string) {
+	if m, ok := a.model.(*bubbletea.Model); ok {
+		m.SetRoutinesRunner(fn)
+	}
+	if m, ok := a.model.(*bubbletea.FullscreenModel); ok {
+		m.SetRoutinesRunner(fn)
 	}
 }
 

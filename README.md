@@ -9,6 +9,7 @@ A lightweight AI-powered code assistant built in Go, featuring a modular tool ar
 - **Swarm Multi-Agent System**: Team-lead agents can spawn and coordinate multiple teammate agents for parallel task execution, with mailbox-based communication and daemon API for team session management
 - **Dual Operating Modes**: TUI interactive mode and Daemon background service mode
 - **Turn-Based Architecture**: Eliminates over-planning for simple queries with intelligent workflow selection
+- **Anthropic Native SDK**: Native Anthropic SDK integration with prompt caching support for improved performance and cost optimization
 - **Dynamic Planning System**: Real-time todo list generation and adaptive execution
 - **Expert System**: Specialized agents triggered via `@expert-name` syntax - built-in experts for codebase investigation, CLI help, and general tasks with support for custom expert definitions
 - **Multi-Agent Mailbox**: Asynchronous message passing between parent and child agents via the Mailbox abstraction, enabling structured communication during fork-based parallel execution with support for memory and file-based backends
@@ -31,7 +32,11 @@ A lightweight AI-powered code assistant built in Go, featuring a modular tool ar
 - **Middleware Chain**: Pluggable security, audit, metrics, and resilience middleware for tool execution
 - **Event System**: Structured event dispatching, monitoring, and validation for observability
 - **Safety Features**: Command validation, workdir-aware auto-approval, file size limits, path validation, and backup support
-- **Enhanced TUI Interface**: Modern terminal UI with cinematic animated banner. Default dashboard built with `tview`; optional non alt-screen Bubble Tea TUI with Claude-like styling and Standard Figlet thin-line ASCII art banner (experimental)
+- **Enhanced TUI Interface**: Modern terminal UI with multiple modes and themes:
+  - Default `tview` dashboard with cinematic animated banner
+  - `--tea`: Inline Bubble Tea TUI (non alt-screen) with Claude-like styling and customizable ASCII art banners (teacup mascot)
+  - `--milktea`: Fullscreen TUI with virtual scrolling (alt-screen mode) and bubble tea cup banner
+  - All modes support Standard Figlet thin-line ASCII art and persistent banner in idle view (experimental)
 - **Cross-Platform Support**: Native builds for Linux, macOS, and Windows
 - **Development Tools**: Comprehensive build system with testing, linting, and release automation
 
@@ -226,32 +231,57 @@ curl -X POST http://localhost:8080/api/v1/sessions/sess_demo/execute \
   -d '{"command": "implement feature X", "include_steps": true}'
 ```
 
-#### 4. Bubble Tea TUI (Experimental, Non Alt-Screen)
-An alternative TUI built with Bubble Tea and lipgloss, styled similarly to Claude Code. Runs in the normal screen buffer (non alt-screen), suitable for terminals where alt-screen is undesirable.
+#### 4. Bubble Tea TUI (Experimental)
+Two alternative TUI modes built with Bubble Tea and lipgloss, styled similarly to Claude Code:
+
+**Inline Mode (`--tea`)**: Non alt-screen mode
+- Runs in the normal screen buffer, suitable for terminals where alt-screen is undesirable
+- Messages scroll naturally in your terminal history
+- Classic teacup ASCII art banner with steam animation
 
 ```bash
-# Start Bubble Tea TUI (non alt-screen)
+# Start inline Bubble Tea TUI
 nano --tea "quick task"
 
-# Start Bubble Tea TUI and type interactively
+# Start inline mode and type interactively
 nano --tea
 ```
 
-Key features:
-- Header box shows welcome, help, `cwd`, and Overrides
-- API Base shown from `NANO_BASE_URL` (if set)
-- Colored messages: assistant (green), user (bold cyan), error (red)
-- Streaming output with throttled flush and final content consolidation
+**Fullscreen Mode (`--milktea`)**: Alt-screen mode with virtual scrolling
+- Full-screen interface with virtual scrolling for handling long conversations
+- Isolated from terminal history, similar to vim/less
+- Bubble tea cup ASCII art banner (dome-lid style)
+- Optimized for extended sessions with better viewport management
+- Note: startup animation is skipped in fullscreen mode (only the static banner is shown)
+
+```bash
+# Start fullscreen Bubble Tea TUI
+nano --milktea "quick task"
+
+# Start fullscreen mode and type interactively
+nano --milktea
+```
+
+Key features (both modes):
+- Colored messages: assistant (sage green), user (soft blue), error (coral red) — unified palette across both modes
+- Streaming output with 100 ms throttled flush (`--tea` mode and `--milktea` mode both throttle)
+- Animated ASCII art banner with cinematic frames (20 frames for default atomic mascot; inline `--tea` only; `--milktea` shows static last frame only)
+- Banner persists in idle view for consistent product identity
+- Tools auto-run without per-call confirmation; status and results are summarized inline
+- Shortcuts: Ctrl+P command palette · Ctrl+L new session · Ctrl+T toggle thinking · Ctrl+Y copy reply · Shift+Tab cycle permission mode · Tab slash-complete · ↑↓ input history
+- `?`: toggle full shortcut cheatsheet (hint shown in status bar by default)
+- `cwd` basename and API base URL (when set) displayed in the status bar
+
+Mode-specific capabilities:
+- `--tea` only: `@filename:start-end` file references, Ctrl+R reverse history search, Ctrl+F full-screen history
+- `--milktea` only: PgUp/PgDn/Home/End virtual scrolling, responsive layout (normal/narrow/minimal), `[` dump history to scrollback, terminal capability detection (ASCII fallback)
+- Slash commands (`/models`, `/routines`, `/cron`, `/skills`, etc.) are supported in **both** modes
 
 Shortcuts:
 - Enter: send input
 - `Ctrl+Z`: cancel current task
-- `Ctrl+C`: exit
-- `?`: show shortcuts hint
-
-Notes:
-- Non alt-screen by default. If you prefer full-screen, use the classic `--tui` dashboard.
-- Tools auto-run without per-call confirmation; status and results are summarized inline.
+- `Ctrl+C`: exit (idle) or cancel (active turn in `--tea`); exits immediately in `--milktea`
+- `?`: toggle shortcut cheatsheet
 
 #### 5. Binary Mode (Non-Interactive)
 Run a single command without entering the interactive TUI:
@@ -741,7 +771,9 @@ Proposals flow through a structured DAG: `proposal → specs → design → task
 1. **TUI Mode** (Interactive): Enhanced real-time terminal interface with improved message display, streaming animations, user-friendly confirmation dialogs, and text selection/copy functionality (Ctrl+A to select all, Ctrl+C to copy) for development and debugging
 2. **Daemon Mode** (Service): Background service with REST API for production environments
 3. **Client Mode**: Communicate with running daemon via command line or API
-4. **Bubble Tea TUI** (Experimental): Non alt-screen TUI with Claude-like styling
+4. **Bubble Tea TUI** (Experimental): Two modes available:
+   - **Inline (`--tea`)**: Non alt-screen TUI with Claude-like styling for scrollable terminal history
+   - **Fullscreen (`--milktea`)**: Alt-screen mode with virtual scrolling for extended sessions
 5. **Binary Mode** (Non-Interactive): Run a single command directly without entering the TUI
 
 ### Workflow Types
@@ -786,6 +818,7 @@ API key environment variables:
 model: "deepseek/deepseek-chat"
 fallbacks:
   - "openai/gpt-4.1"
+  - "anthropic/claude-sonnet-4.6"
   - "moonshot/kimi-k2"
 
 providers:
@@ -793,9 +826,17 @@ providers:
     api_key_env: NANO_DEEPSEEK_API_KEY
   openai:
     api_key_env: OPENAI_API_KEY
+  anthropic:
+    api_key_env: ANTHROPIC_API_KEY
   moonshot:
     api_key_env: MOONSHOT_API_KEY
 ```
+
+**Anthropic Provider Features:**
+- Native Anthropic SDK integration with automatic prompt caching support
+- Prompt caching significantly reduces costs and latency for repeated context (system prompts, long documents)
+- Caching is automatically applied to eligible content without additional configuration
+- Supported models: Claude 3.5 Sonnet and newer Claude models
 
 If `providers:` is present alongside the legacy endpoint fields, the provider
 schema takes precedence and nano-agent logs a deprecation warning. Plain

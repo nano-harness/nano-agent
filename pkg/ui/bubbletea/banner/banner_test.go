@@ -127,6 +127,28 @@ func TestPlay_RespectsMaxDuration(t *testing.T) {
 	}
 }
 
+func TestPlay_ClearsFinalFrameAfterCompletion(t *testing.T) {
+	buf := &bytes.Buffer{}
+
+	err := Play(buf, Options{
+		Theme:    DefaultTheme,
+		Colorize: true,
+	})
+	if err != nil {
+		t.Fatalf("Play() failed: %v", err)
+	}
+
+	frames, err := LoadFrames()
+	if err != nil {
+		t.Fatalf("LoadFrames() failed: %v", err)
+	}
+	finalClear := clearFrameSequence(frames[len(frames)-1].Content)
+	output := buf.String()
+	if !strings.Contains(output, finalClear) {
+		t.Fatalf("expected output to clear final frame before restoring cursor; suffix=%q", output[max(0, len(output)-32):])
+	}
+}
+
 func TestPlay_NoColorize_PrintsStaticFrame(t *testing.T) {
 	buf := &bytes.Buffer{}
 
@@ -293,5 +315,96 @@ func TestNanoAgentSpacing(t *testing.T) {
 
 	if !found {
 		t.Error("Could not find NANO/AGENT spacing pattern in final frame")
+	}
+}
+
+func TestApplyIconMode_Tea(t *testing.T) {
+	frames, err := LoadFrames()
+	if err != nil {
+		t.Fatalf("LoadFrames() failed: %v", err)
+	}
+	applyIconMode(frames, IconTea)
+	for i, f := range frames {
+		if !isSettledFrame(f) {
+			continue
+		}
+		if strings.Contains(f.Content, "⚛") {
+			t.Errorf("Frame %d (%s): settled frame still contains ⚛ after tea mode", i, f.Title)
+		}
+		if !strings.Contains(f.Content, "|_____|)") {
+			t.Errorf("Frame %d (%s): settled frame missing '|_____|)' in tea mode", i, f.Title)
+		}
+		if !strings.Contains(f.Content, "\\___/") {
+			t.Errorf("Frame %d (%s): settled frame missing '\\___/' in tea mode", i, f.Title)
+		}
+	}
+}
+
+func TestApplyIconMode_MilkTea(t *testing.T) {
+	frames, err := LoadFrames()
+	if err != nil {
+		t.Fatalf("LoadFrames() failed: %v", err)
+	}
+	applyIconMode(frames, IconMilkTea)
+	for i, f := range frames {
+		if !isSettledFrame(f) {
+			continue
+		}
+		if strings.Contains(f.Content, "⚛") {
+			t.Errorf("Frame %d (%s): settled frame still contains ⚛ after milktea mode", i, f.Title)
+		}
+		if !strings.Contains(f.Content, ".=|=.") {
+			t.Errorf("Frame %d (%s): settled frame missing '.=|=.' in milktea mode", i, f.Title)
+		}
+		if !strings.Contains(f.Content, "\\_/") {
+			t.Errorf("Frame %d (%s): settled frame missing '\\_/' in milktea mode", i, f.Title)
+		}
+	}
+}
+
+func TestApplyIconMode_Default(t *testing.T) {
+	frames, err := LoadFrames()
+	if err != nil {
+		t.Fatalf("LoadFrames() failed: %v", err)
+	}
+	origContents := make([]string, len(frames))
+	for i, f := range frames {
+		origContents[i] = f.Content
+	}
+	applyIconMode(frames, IconDefault)
+	for i, f := range frames {
+		if f.Content != origContents[i] {
+			t.Errorf("Frame %d (%s): content changed in default mode", i, f.Title)
+		}
+	}
+}
+
+func TestApplyIconMode_FlyingFramesUnchanged(t *testing.T) {
+	frames, err := LoadFrames()
+	if err != nil {
+		t.Fatalf("LoadFrames() failed: %v", err)
+	}
+	// Record content of flying frames (contain ⚛ but not ∘) before applying icon mode.
+	type savedFrame struct {
+		idx     int
+		content string
+	}
+	var flyingFrames []savedFrame
+	for i, f := range frames {
+		if strings.Contains(f.Content, "⚛") && !strings.Contains(f.Content, "∘") {
+			flyingFrames = append(flyingFrames, savedFrame{i, f.Content})
+		}
+	}
+	if len(flyingFrames) == 0 {
+		t.Fatal("No flying frames found (frames with ⚛ but without ∘)")
+	}
+	for _, mode := range []IconMode{IconTea, IconMilkTea} {
+		reloaded, _ := LoadFrames()
+		applyIconMode(reloaded, mode)
+		for _, sf := range flyingFrames {
+			if reloaded[sf.idx].Content != sf.content {
+				t.Errorf("Mode %q: flying frame %d content changed", mode, sf.idx)
+			}
+		}
 	}
 }

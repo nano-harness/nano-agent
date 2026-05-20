@@ -1,5 +1,27 @@
 package bubbletea
 
+import "sort"
+
+// Virtual scrolling constants modeled after Claude Code's fullscreen renderer.
+// These bound the amount of work the renderer performs per frame even when
+// history grows arbitrarily large.
+const (
+	// DefaultOverscanRows renders this many extra rows above and below the
+	// visible viewport so small scroll deltas don't require re-laying out
+	// the message list. Mirrors Claude Code's OVERSCAN_ROWS = 80.
+	DefaultOverscanRows = 80
+
+	// DefaultMaxMounted caps the number of FormattedMessage entries the
+	// renderer materializes per frame. Mirrors Claude Code's
+	// MAX_MOUNTED_ITEMS = 300.
+	DefaultMaxMounted = 300
+
+	// DefaultScrollQuantum batches scroll deltas under this size into a
+	// single frame to reduce reflow churn during fast wheel events.
+	// Mirrors Claude Code's SCROLL_QUANTUM = 40.
+	DefaultScrollQuantum = 40
+)
+
 // ViewportState manages virtual scrolling for the fullscreen TUI.
 // It tracks scroll position, viewport dimensions, and auto-scroll behavior.
 type ViewportState struct {
@@ -7,6 +29,16 @@ type ViewportState struct {
 	ViewportHeight int  // Height of visible viewport (in lines)
 	TotalHeight    int  // Total height of all messages combined
 	IsSticky       bool // Auto-scroll to bottom when new content arrives
+
+	// OverscanRows is the number of extra rows to render above and below the
+	// visible viewport. Defaults to DefaultOverscanRows.
+	OverscanRows int
+	// MaxMounted caps how many messages VisibleRange will materialize per
+	// frame. Defaults to DefaultMaxMounted.
+	MaxMounted int
+	// ScrollQuantum is the minimum scroll delta the viewport responds to.
+	// Defaults to DefaultScrollQuantum; if 0 every delta is applied.
+	ScrollQuantum int
 }
 
 // NewViewportState creates a new viewport with sticky scroll enabled by default.
@@ -16,6 +48,9 @@ func NewViewportState(viewportHeight int) *ViewportState {
 		ViewportHeight: viewportHeight,
 		TotalHeight:    0,
 		IsSticky:       true,
+		OverscanRows:   DefaultOverscanRows,
+		MaxMounted:     DefaultMaxMounted,
+		ScrollQuantum:  DefaultScrollQuantum,
 	}
 }
 
@@ -118,38 +153,53 @@ func (v *ViewportState) isAtBottom() bool {
 }
 
 // VisibleRange calculates which message indices should be rendered based on
-// the current scroll position. Returns (startIdx, endIdx) where endIdx is exclusive.
+// the current scroll position. Returns (startIdx, endIdx) where endIdx is
+// exclusive.
+//
+// The range is widened by OverscanRows above and below the literal viewport,
+// then capped by MaxMounted so a frame never materializes an unbounded number
+// of messages — both behaviours mirror Claude Code's virtual scroller.
+// Boundary lookups use binary search on the cumulative-height prefix sum.
 func (v *ViewportState) VisibleRange(heights []int) (startIdx, endIdx int) {
 	if len(heights) == 0 || v.ViewportHeight <= 0 {
 		return 0, 0
 	}
 
-	// Build cumulative offset array for O(1) position lookup
+	// Build cumulative offset array for O(log n) position lookup.
 	offsets := make([]int, len(heights)+1)
 	for i := 0; i < len(heights); i++ {
 		offsets[i+1] = offsets[i] + heights[i]
 	}
 
-	// Find start index: first message that intersects viewport top
-	viewportTop := v.ScrollOffset
-	viewportBottom := v.ScrollOffset + v.ViewportHeight
+	overscan := v.OverscanRows
+	if overscan < 0 {
+		overscan = 0
+	}
+	viewportTop := v.ScrollOffset - overscan
+	if viewportTop < 0 {
+		viewportTop = 0
+	}
+	viewportBottom := v.ScrollOffset + v.ViewportHeight + overscan
 
-	// Binary search for start message
-	startIdx = 0
-	for i := 0; i < len(heights); i++ {
-		if offsets[i+1] > viewportTop {
-			startIdx = i
-			break
-		}
+	// Binary search for the first message whose end offset crosses viewportTop.
+	startIdx = sort.Search(len(heights), func(i int) bool {
+		return offsets[i+1] > viewportTop
+	})
+	if startIdx >= len(heights) {
+		return len(heights), len(heights)
 	}
 
-	// Linear search from start for end message (usually only a few items)
-	endIdx = startIdx
-	for i := startIdx; i < len(heights); i++ {
-		if offsets[i] >= viewportBottom {
-			break
-		}
-		endIdx = i + 1
+	// Binary search for the first message whose start offset >= viewportBottom.
+	endIdx = sort.Search(len(heights), func(i int) bool {
+		return offsets[i] >= viewportBottom
+	})
+	if endIdx < startIdx {
+		endIdx = startIdx
+	}
+
+	// Cap by MaxMounted so we never materialise an unbounded list per frame.
+	if v.MaxMounted > 0 && endIdx-startIdx > v.MaxMounted {
+		endIdx = startIdx + v.MaxMounted
 	}
 
 	return startIdx, endIdx

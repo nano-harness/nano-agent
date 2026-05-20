@@ -39,6 +39,15 @@ func (m *FormattedMessage) Toggle() {
 	m.Collapsed = !m.Collapsed
 }
 
+// InvalidateCache clears the cached Rendered string and Height so the
+// next render pass recomputes them. Callers should invoke this after
+// mutating Content or after a layout-affecting change (e.g. terminal
+// resize, theme switch, or streaming-token append).
+func (m *FormattedMessage) InvalidateCache() {
+	m.Rendered = ""
+	m.Height = 0
+}
+
 // countLines counts the number of lines in a string.
 func countLines(s string) int {
 	if s == "" {

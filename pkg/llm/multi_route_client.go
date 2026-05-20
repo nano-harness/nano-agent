@@ -37,7 +37,7 @@ func newMultiRouteClient(routes []ResolvedRoute, tools []interfaces.Tool, cfg *c
 	}
 	if factory == nil {
 		factory = func(route ResolvedRoute, tools []interfaces.Tool) LLMClient {
-			return NewClient(route.APIKey, route.BaseURL, route.Model, tools)
+			return NewClientForRoute(route, tools, cfg)
 		}
 	}
 	copiedRoutes := append([]ResolvedRoute(nil), routes...)

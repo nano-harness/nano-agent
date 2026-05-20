@@ -288,6 +288,7 @@ type Model struct {
 	connectionDetail string
 	swarmRoster      string
 	cronIndicator    string
+	goalIndicator    string
 
 	// New state management
 	stateManager *StateManager
@@ -372,7 +373,7 @@ func NewModel() *Model {
 	m.activeMinRenderInterval = 33 * time.Millisecond // 状态更新/动画时更高刷新频率（约30fps）
 
 	// Initialize new state manager
-	m.stateManager = NewStateManager()
+	m.stateManager = NewStateManager(nil)
 	m.stateManager.SetUpdateCallback(func(_ UIState) {
 		// 标记最近状态更新时间以触发更高频批量渲染
 		m.renderMutex.Lock()
@@ -1898,6 +1899,15 @@ func (m *Model) SetCronIndicator(s string) {
 	m.updateStatusBar()
 }
 
+func (m *Model) SetGoalIndicator(active bool) {
+	if active {
+		m.goalIndicator = "◎ /goal active"
+	} else {
+		m.goalIndicator = ""
+	}
+	m.updateStatusBar()
+}
+
 // setStatusBarText 统一的状态栏更新入口，纳入批量渲染与节流
 func (m *Model) setStatusBarText(text string) {
 	if m.statusBar == nil {
@@ -1925,6 +1935,9 @@ func (m *Model) updateStatusBar() {
 	if m.cronIndicator != "" {
 		fmt.Fprintf(&status, "%s | ", m.cronIndicator)
 	}
+	if m.goalIndicator != "" {
+		fmt.Fprintf(&status, "%s | ", m.goalIndicator)
+	}
 	// Keyboard shortcuts hint – sourced from the configured keymap so the
 	// status bar stays in sync if bindings change.
 	fmt.Fprintf(&status, "%s%s%s | ",
@@ -1951,6 +1964,9 @@ func (m *Model) updateStatusBarDirect() {
 		hint := m.styles.GetColorTag("muted") + formatStatusHints() + m.styles.GetResetTag()
 		if m.cronIndicator != "" {
 			hint = m.cronIndicator + " | " + hint
+		}
+		if m.goalIndicator != "" {
+			hint = m.goalIndicator + " | " + hint
 		}
 		conn := ""
 		if m.connectionState != "" {

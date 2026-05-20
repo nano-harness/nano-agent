@@ -2,6 +2,8 @@ package slash
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -157,12 +159,13 @@ func TestLocalDispatcher_Routines(t *testing.T) {
 		t.Errorf("expected status fallback hint, got %+v", r)
 	}
 
-	var added, removed, paused, resumed string
+	var added, removed, paused, resumed, run string
 	d = NewLocalDispatcher("", t.TempDir()).
 		WithRoutinesAdder(func(s string) string { added = s; return "added " + s }).
 		WithRoutinesRemover(func(s string) string { removed = s; return "removed " + s }).
 		WithRoutinesPauser(func(s string) string { paused = s; return "paused " + s }).
-		WithRoutinesResumer(func(s string) string { resumed = s; return "resumed " + s })
+		WithRoutinesResumer(func(s string) string { resumed = s; return "resumed " + s }).
+		WithRoutinesRunner(func(s string) string { run = s; return "run " + s })
 	for _, tc := range []struct {
 		input string
 		want  *string
@@ -172,11 +175,25 @@ func TestLocalDispatcher_Routines(t *testing.T) {
 		{"/routines remove task-1", &removed, "task-1"},
 		{"/routines pause task-1", &paused, "task-1"},
 		{"/routines resume task-1", &resumed, "task-1"},
+		{"/routines run task-1", &run, "task-1"},
 	} {
 		r = d.Dispatch(tc.input)
 		if !r.Handled || r.Level != "success" || *tc.want != tc.arg {
 			t.Errorf("expected %q callback success, got result=%+v callback=%q", tc.input, r, *tc.want)
 		}
+	}
+
+	// Test /routines run without argument
+	r = d.Dispatch("/routines run")
+	if !r.Handled || r.Level != "error" {
+		t.Errorf("expected /routines run without arg to return error, got %+v", r)
+	}
+
+	// Test /routines run without handler
+	d2 := NewLocalDispatcher("", t.TempDir())
+	r = d2.Dispatch("/routines run task-1")
+	if !r.Handled || r.Level != "warning" || !strings.Contains(r.Message, "未连接") {
+		t.Errorf("expected /routines run without handler to return warning, got %+v", r)
 	}
 }
 
@@ -217,5 +234,62 @@ func TestLocalDispatcher_AgentsListsTeams(t *testing.T) {
 	}
 	if !strings.Contains(r.Message, "active") || !strings.Contains(r.Message, "idle") {
 		t.Errorf("expected status indicators, got %q", r.Message)
+	}
+}
+
+func TestLocalDispatcher_AgentProfileSlash(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".nano", "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "reviewer.yaml"), []byte(`description: Review code
+initial_prompt: Review the requested changes.
+permission_mode: acceptEdits
+model: gpt-5-mini
+fallbacks: [openai/gpt-4.1]
+context_providers: [memory, skills]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewLocalDispatcher("", cwd)
+
+	r := d.Dispatch("/reviewer check pkg/agent")
+	if r.Handled {
+		t.Fatalf("agent profile dispatch should not set Handled, got %+v", r)
+	}
+	if !r.ShouldSubmit {
+		t.Fatalf("expected ShouldSubmit, got %+v", r)
+	}
+	for _, want := range []string{
+		"spawn_teammate",
+		`name="reviewer"`,
+		`permission_mode="acceptEdits"`,
+		`model="gpt-5-mini"`,
+		`fallbacks=["openai/gpt-4.1"]`,
+		`context_providers="memory,skills"`,
+		"check pkg/agent",
+	} {
+		if !strings.Contains(r.SubmitInput, want) {
+			t.Errorf("SubmitInput missing %q: %s", want, r.SubmitInput)
+		}
+	}
+
+	// No prompt -> profile InitialPrompt is used.
+	r = d.Dispatch("/reviewer")
+	if !r.ShouldSubmit {
+		t.Fatalf("expected ShouldSubmit for /reviewer, got %+v", r)
+	}
+	if !strings.Contains(r.SubmitInput, "Review the requested changes.") {
+		t.Errorf("SubmitInput missing default initial_prompt: %s", r.SubmitInput)
+	}
+}
+
+func TestLocalDispatcher_UnknownSlashUnchanged(t *testing.T) {
+	d := NewLocalDispatcher("", t.TempDir())
+	r := d.Dispatch("/totally-unknown-command arg1 arg2")
+	if r.Handled || r.ShouldSubmit {
+		t.Fatalf("unknown slash should be unhandled, got %+v", r)
 	}
 }

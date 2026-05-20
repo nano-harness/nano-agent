@@ -3,240 +3,197 @@ package acp
 import (
 	"context"
 	"fmt"
-	"io"
-	"os/exec"
-	"sync"
-	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/logger"
 )
 
-// TerminalBridge bridges nano-agent shell commands to ACP terminal/* operations
+// TerminalBridge bridges nano-agent shell commands to ACP terminal/* RPC operations
+// Unlike the previous implementation, this makes RPC calls to the Client (Agent→Client direction)
 type TerminalBridge struct {
-	acpSessionID string
-	transport    *Transport
-	mu           sync.Mutex
-	processes    map[string]*TerminalProcess
-	nextID       int
+	acpSessionID      string
+	transport         *Transport
+	clientHasTermCaps bool
 }
 
-// TerminalProcess represents a running terminal process
-type TerminalProcess struct {
-	ID       string
-	Cmd      *exec.Cmd
-	Stdin    io.WriteCloser
-	Stdout   io.ReadCloser
-	Stderr   io.ReadCloser
-	Running  bool
-	ExitCode *int
-	mu       sync.Mutex
+// TerminalExitStatus represents terminal exit status
+type TerminalExitStatus struct {
+	ExitCode int    `json:"exitCode"`
+	Signal   string `json:"signal,omitempty"`
 }
 
 // NewTerminalBridge creates a new terminal bridge
-func NewTerminalBridge(acpSessionID string, transport *Transport) *TerminalBridge {
+func NewTerminalBridge(acpSessionID string, transport *Transport, clientHasTermCaps bool) *TerminalBridge {
 	return &TerminalBridge{
-		acpSessionID: acpSessionID,
-		transport:    transport,
-		processes:    make(map[string]*TerminalProcess),
+		acpSessionID:      acpSessionID,
+		transport:         transport,
+		clientHasTermCaps: clientHasTermCaps,
 	}
 }
 
-// Run implements ACP terminal/run operation
-func (b *TerminalBridge) Run(ctx context.Context, command string, cwd string, env map[string]string) (string, error) {
-	b.mu.Lock()
-	processID := fmt.Sprintf("term-%s-%d", b.acpSessionID, b.nextID)
-	b.nextID++
-	b.mu.Unlock()
-
-	logger.Infof("ACP: Running terminal command %s: %s", processID, command)
-
-	// Create command
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
-
-	// Set working directory
-	if cwd != "" {
-		cmd.Dir = cwd
+// Create sends terminal/create RPC to the Client
+func (b *TerminalBridge) Create(ctx context.Context, cmd string, args []string, cwd string, env []EnvVariable) (string, error) {
+	if !b.clientHasTermCaps {
+		return "", fmt.Errorf("client does not support terminal capabilities")
 	}
 
-	// Set environment variables
-	if len(env) > 0 {
-		cmd.Env = append(cmd.Env, cmd.Environ()...)
-		for k, v := range env {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-		}
-	}
+	logger.Infof("ACP: Creating terminal via client RPC: %s %v", cmd, args)
 
-	// Create pipes for stdin/stdout/stderr
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return "", fmt.Errorf("create stdin pipe: %w", err)
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("create stdout pipe: %w", err)
-	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("create stderr pipe: %w", err)
-	}
-
-	// Start the process
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("start process: %w", err)
-	}
-
-	// Create process record
-	proc := &TerminalProcess{
-		ID:      processID,
-		Cmd:     cmd,
-		Stdin:   stdin,
-		Stdout:  stdout,
-		Stderr:  stderr,
-		Running: true,
-	}
-
-	b.mu.Lock()
-	b.processes[processID] = proc
-	b.mu.Unlock()
-
-	// Monitor process in background
-	go b.monitorProcess(proc)
-
-	return processID, nil
-}
-
-// monitorProcess monitors a running process and sends output events
-func (b *TerminalBridge) monitorProcess(proc *TerminalProcess) {
-	// Read stdout in background
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := proc.Stdout.Read(buf)
-			if n > 0 {
-				output := string(buf[:n])
-				// Send terminal/output notification
-				_ = b.transport.SendNotification("terminal/output", map[string]interface{}{
-					"sessionId": b.acpSessionID,
-					"processId": proc.ID,
-					"stream":    "stdout",
-					"data":      output,
-				})
-			}
-			if err != nil {
-				break
-			}
-		}
-	}()
-
-	// Read stderr in background
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := proc.Stderr.Read(buf)
-			if n > 0 {
-				output := string(buf[:n])
-				// Send terminal/output notification
-				_ = b.transport.SendNotification("terminal/output", map[string]interface{}{
-					"sessionId": b.acpSessionID,
-					"processId": proc.ID,
-					"stream":    "stderr",
-					"data":      output,
-				})
-			}
-			if err != nil {
-				break
-			}
-		}
-	}()
-
-	// Wait for process to finish
-	err := proc.Cmd.Wait()
-
-	proc.mu.Lock()
-	proc.Running = false
-	exitCode := proc.Cmd.ProcessState.ExitCode()
-	proc.ExitCode = &exitCode
-	proc.mu.Unlock()
-
-	// Send terminal/exit notification
-	exitEvent := map[string]interface{}{
+	params := map[string]interface{}{
 		"sessionId": b.acpSessionID,
-		"processId": proc.ID,
-		"exitCode":  exitCode,
+		"command":   cmd,
+		"args":      args,
+		"cwd":       cwd,
+		"env":       env,
 	}
-	if err != nil && exitCode != 0 {
-		exitEvent["error"] = err.Error()
-	}
-	_ = b.transport.SendNotification("terminal/exit", exitEvent)
 
-	logger.Infof("ACP: Terminal process %s exited with code %d", proc.ID, exitCode)
+	resp, err := b.transport.SendRPCRequest("terminal/create", params)
+	if err != nil {
+		return "", fmt.Errorf("RPC call failed: %w", err)
+	}
+
+	// Extract terminal ID from response
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("invalid response format")
+	}
+
+	terminalID, ok := resultMap["terminalId"].(string)
+	if !ok {
+		return "", fmt.Errorf("terminalId field missing or not a string")
+	}
+
+	return terminalID, nil
 }
 
-// Input implements ACP terminal/input operation
-func (b *TerminalBridge) Input(ctx context.Context, processID string, data string) error {
-	b.mu.Lock()
-	proc, ok := b.processes[processID]
-	b.mu.Unlock()
+// Output sends terminal/output RPC to the Client
+func (b *TerminalBridge) Output(ctx context.Context, terminalID string) (string, bool, *TerminalExitStatus, error) {
+	if !b.clientHasTermCaps {
+		return "", false, nil, fmt.Errorf("client does not support terminal capabilities")
+	}
 
+	logger.Debugf("ACP: Getting terminal output via client RPC: %s", terminalID)
+
+	params := map[string]interface{}{
+		"sessionId":  b.acpSessionID,
+		"terminalId": terminalID,
+	}
+
+	resp, err := b.transport.SendRPCRequest("terminal/output", params)
+	if err != nil {
+		return "", false, nil, fmt.Errorf("RPC call failed: %w", err)
+	}
+
+	// Extract output from response
+	resultMap, ok := resp.Result.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("process not found: %s", processID)
+		return "", false, nil, fmt.Errorf("invalid response format")
 	}
 
-	proc.mu.Lock()
-	running := proc.Running
-	proc.mu.Unlock()
+	output, _ := resultMap["output"].(string)
+	running, _ := resultMap["running"].(bool)
 
-	if !running {
-		return fmt.Errorf("process not running: %s", processID)
+	var exitStatus *TerminalExitStatus
+	if statusMap, ok := resultMap["exitStatus"].(map[string]interface{}); ok {
+		exitCode, _ := statusMap["exitCode"].(float64)
+		signal, _ := statusMap["signal"].(string)
+		exitStatus = &TerminalExitStatus{
+			ExitCode: int(exitCode),
+			Signal:   signal,
+		}
 	}
 
-	// Write to stdin
-	if _, err := proc.Stdin.Write([]byte(data)); err != nil {
-		return fmt.Errorf("write to stdin: %w", err)
+	return output, running, exitStatus, nil
+}
+
+// WaitForExit sends terminal/wait_for_exit RPC to the Client
+func (b *TerminalBridge) WaitForExit(ctx context.Context, terminalID string) (int, string, error) {
+	if !b.clientHasTermCaps {
+		return 0, "", fmt.Errorf("client does not support terminal capabilities")
+	}
+
+	logger.Infof("ACP: Waiting for terminal exit via client RPC: %s", terminalID)
+
+	params := map[string]interface{}{
+		"sessionId":  b.acpSessionID,
+		"terminalId": terminalID,
+	}
+
+	resp, err := b.transport.SendRPCRequest("terminal/wait_for_exit", params)
+	if err != nil {
+		return 0, "", fmt.Errorf("RPC call failed: %w", err)
+	}
+
+	// Extract exit info from response
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return 0, "", fmt.Errorf("invalid response format")
+	}
+
+	exitCode, _ := resultMap["exitCode"].(float64)
+	signal, _ := resultMap["signal"].(string)
+
+	return int(exitCode), signal, nil
+}
+
+// Kill sends terminal/kill RPC to the Client
+func (b *TerminalBridge) Kill(ctx context.Context, terminalID string) error {
+	if !b.clientHasTermCaps {
+		return fmt.Errorf("client does not support terminal capabilities")
+	}
+
+	logger.Infof("ACP: Killing terminal via client RPC: %s", terminalID)
+
+	params := map[string]interface{}{
+		"sessionId":  b.acpSessionID,
+		"terminalId": terminalID,
+	}
+
+	resp, err := b.transport.SendRPCRequest("terminal/kill", params)
+	if err != nil {
+		return fmt.Errorf("RPC call failed: %w", err)
+	}
+
+	// Check success
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid response format")
+	}
+
+	success, _ := resultMap["success"].(bool)
+	if !success {
+		return fmt.Errorf("kill operation failed")
 	}
 
 	return nil
 }
 
-// Kill implements ACP terminal/kill operation
-func (b *TerminalBridge) Kill(ctx context.Context, processID string) error {
-	b.mu.Lock()
-	proc, ok := b.processes[processID]
-	b.mu.Unlock()
+// Release sends terminal/release RPC to the Client
+func (b *TerminalBridge) Release(ctx context.Context, terminalID string) error {
+	if !b.clientHasTermCaps {
+		return fmt.Errorf("client does not support terminal capabilities")
+	}
 
+	logger.Infof("ACP: Releasing terminal via client RPC: %s", terminalID)
+
+	params := map[string]interface{}{
+		"sessionId":  b.acpSessionID,
+		"terminalId": terminalID,
+	}
+
+	resp, err := b.transport.SendRPCRequest("terminal/release", params)
+	if err != nil {
+		return fmt.Errorf("RPC call failed: %w", err)
+	}
+
+	// Check success
+	resultMap, ok := resp.Result.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("process not found: %s", processID)
+		return fmt.Errorf("invalid response format")
 	}
 
-	proc.mu.Lock()
-	running := proc.Running
-	proc.mu.Unlock()
-
-	if !running {
-		return fmt.Errorf("process not running: %s", processID)
-	}
-
-	logger.Infof("ACP: Killing terminal process: %s", processID)
-
-	// Kill the process
-	if err := proc.Cmd.Process.Kill(); err != nil {
-		return fmt.Errorf("kill process: %w", err)
-	}
-
-	// Wait with timeout for process to exit
-	done := make(chan struct{})
-	go func() {
-		proc.Cmd.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		logger.Infof("ACP: Terminal process %s killed successfully", processID)
-	case <-time.After(5 * time.Second):
-		logger.Warnf("ACP: Terminal process %s did not exit after kill", processID)
+	success, _ := resultMap["success"].(bool)
+	if !success {
+		return fmt.Errorf("release operation failed")
 	}
 
 	return nil

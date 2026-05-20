@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -32,6 +33,17 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
+)
+
+// Exit code constants following Unix conventions
+const (
+	ExitSuccess      = 0   // Success
+	ExitGeneralError = 1   // General error
+	ExitUsageError   = 2   // Usage/argument error
+	ExitConfigError  = 3   // Configuration error
+	ExitAPIError     = 4   // API call failure
+	ExitTimeout      = 5   // Timeout
+	ExitPipeError    = 141 // SIGPIPE (128+13), following Unix convention
 )
 
 // truncatePreview safely truncates preview text to a reasonable length
@@ -413,11 +425,11 @@ func runAgent(cmd *cobra.Command, args []string) {
 
 	if binaryMode {
 		fmt.Fprintln(os.Stderr,
-			"⚠️  --binary-mode is deprecated; use `nano binary swebench [prompt...]` (or `nano binary query`) instead. "+
+			"⚠️  --binary-mode is deprecated; use `nano binary swebench [prompt...]` (or `nano binary exec`) instead. "+
 				"This flag will be removed in a future release.")
 		if err := runBinaryMode(args, outputDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			os.Exit(ExitCode(err))
 		}
 		return
 	}
@@ -448,6 +460,30 @@ func runAgent(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 		return
+	}
+
+	// Check for stdin pipe input and auto-fallback to binary exec mode
+	// This allows `echo "prompt" | nano` to work automatically
+	if !forceTUI && !useTea && !useMilkTea && IsPipedStdin() {
+		// stdin is piped, try to read prompt from stdin
+		prompt, err := io.ReadAll(os.Stdin)
+		if err == nil && len(strings.TrimSpace(string(prompt))) > 0 {
+			// Get working directory
+			wd, wdErr := os.Getwd()
+			if wdErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", wdErr)
+				os.Exit(ExitGeneralError)
+			}
+			// Execute in binary mode
+			opts := binaryOptions{}
+			result, _, _, err := executeBinaryModeWithOptions(string(prompt), wd, opts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(ExitGeneralError)
+			}
+			fmt.Print(result)
+			return
+		}
 	}
 
 	// Enable TUI mode logging BEFORE any other initialization if we're going to use TUI
@@ -604,8 +640,8 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 
 	// Check TTY compatibility first
 	if !isatty.IsTerminal(os.Stdout.Fd()) {
-		color.Yellow("⚠️  TTY environment not supported for TUI mode")
-		color.Blue("💡 Falling back to daemon mode or direct execution")
+		fmt.Fprintln(os.Stderr, "⚠️  TTY environment not supported for TUI mode")
+		fmt.Fprintln(os.Stderr, "💡 Falling back to daemon mode or direct execution")
 
 		// If we have args, execute directly
 		if len(args) > 0 {
@@ -615,7 +651,7 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 		}
 
 		// Otherwise suggest daemon mode
-		color.Yellow("🔗 Consider using daemon mode: 'nano daemon start' then 'nano client exec \"your command\"'")
+		fmt.Fprintln(os.Stderr, "🔗 Consider using daemon mode: 'nano daemon start' then 'nano client exec \"your command\"'")
 		return fmt.Errorf("TTY environment not supported for TUI mode")
 	}
 
@@ -702,7 +738,7 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 		logger.Infof("Starting TUI in team-lead mode for team '%s'", teamName)
 		eng, err = engine.NewLeadEngine(cfg, approvalHandler, teamName)
 	} else {
-		eng, err = engine.New(cfg, approvalHandler)
+		eng, err = engine.New(cfg, approvalHandler, engine.WithScheduler())
 	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
@@ -727,9 +763,13 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 	agentInstance.SetTUIScheduler(tuiScheduler)
 
 	cronTracker := ui.NewCronStatusTracker()
+	cronTracker.SetScheduledCountFn(func() int {
+		return len(eng.Scheduler.ListTasks())
+	})
 	integration.SetCronTracker(cronTracker)
 	integration.SetRoutinesLister(tuiScheduler.FormatTasks)
 	integration.SetRunningStatusLister(cronTracker.FormatDetails)
+	eng.Scheduler.SetOnTaskListChanged(cronTracker.TriggerChange)
 	eng.SetCronNotifier(cronTracker.Handle)
 
 	// Start scheduler + watcher through the engine
@@ -975,12 +1015,12 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 
 	// Ensure we are in a terminal
 	if !isatty.IsTerminal(os.Stdout.Fd()) {
-		color.Yellow("⚠️  TTY environment not supported for Bubble Tea TUI")
+		fmt.Fprintln(os.Stderr, "⚠️  TTY environment not supported for Bubble Tea TUI")
 		if len(args) > 0 {
 			return runDaemonClientMode(nil, args)
 		}
 		// Escape inner quotes to avoid syntax issues
-		color.Yellow("🔗 Consider using daemon mode: 'nano daemon start' then 'nano client exec \"your command\"'")
+		fmt.Fprintln(os.Stderr, "🔗 Consider using daemon mode: 'nano daemon start' then 'nano client exec \"your command\"'")
 		return fmt.Errorf("TTY environment not supported for Bubble Tea TUI")
 	}
 
@@ -1037,6 +1077,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 
 	// Check for fullscreen mode flag
 	useFullscreen, _ := cmd.Flags().GetBool("milktea")
+	useTea, _ := cmd.Flags().GetBool("tea")
 
 	// Create Bubble Tea model (fullscreen or inline)
 	var m tea.Model
@@ -1081,10 +1122,39 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	// Play banner animation BEFORE redirecting stdout (so banner is visible to user)
 	noBanner, _ := cmd.Flags().GetBool("no-banner")
 	if !noBanner {
-		_ = banner.Play(os.Stdout, banner.Options{
-			Theme:    banner.DefaultTheme,
-			Colorize: banner.IsInteractiveTTY(),
-		})
+		// Fullscreen (alt-screen) clears the terminal, so animation is
+		// invisible. Only play for inline (--tea) mode.
+		if !useFullscreen {
+			iconMode := banner.IconDefault
+			if useTea {
+				iconMode = banner.IconTea
+			}
+			_ = banner.Play(os.Stdout, banner.Options{
+				Theme:    banner.DefaultTheme,
+				Colorize: banner.IsInteractiveTTY(),
+				IconMode: iconMode,
+			})
+		}
+		// Persist the static last frame inside the inline View so the TUI
+		// keeps showing the product mark after the animation finishes.
+		if inlineModel, ok := m.(*bubbletea.Model); ok {
+			lastIcon := banner.IconDefault
+			if useTea {
+				lastIcon = banner.IconTea
+			}
+			if art, err := banner.LastFrameRendered(banner.DefaultTheme, banner.IsInteractiveTTY(), lastIcon); err == nil {
+				inlineModel.SetBannerArt(art)
+			}
+		}
+		if fsModel, ok := m.(*bubbletea.FullscreenModel); ok {
+			lastIcon := banner.IconDefault
+			if useFullscreen {
+				lastIcon = banner.IconMilkTea
+			}
+			if art, err := banner.LastFrameRendered(banner.DefaultTheme, banner.IsInteractiveTTY(), lastIcon); err == nil {
+				fsModel.SetBannerArt(art)
+			}
+		}
 	}
 
 	// Redirect stdout to prevent third-party library logs from interfering with BubbleTea TUI
@@ -1118,7 +1188,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 		logger.Infof("Starting Bubble Tea TUI in team-lead mode for team '%s'", teamName)
 		eng, err = engine.NewLeadEngine(cfg, approvalHandler, teamName)
 	} else {
-		eng, err = engine.New(cfg, approvalHandler)
+		eng, err = engine.New(cfg, approvalHandler, engine.WithScheduler())
 	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
@@ -1145,51 +1215,126 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 
 	eventStore := daemon.NewTaskEventStore(5000)
 	cronTracker := ui.NewCronStatusTracker()
-	cronTracker.SetOnChange(func() {
-		p.Send(bubbletea.CronStatusMsg{Indicator: cronTracker.FormatIndicator()})
+	cronTracker.SetScheduledCountFn(func() int {
+		return len(eng.Scheduler.ListTasks())
 	})
+	cronTracker.SetOnChange(func() {
+		// Use a goroutine to avoid blocking when eng.Start() triggers
+		// notifications before BubbleTea's event loop (p.Run()) has started.
+		// p.Send is goroutine-safe but will block on an unbuffered channel
+		// if no consumer is running yet.
+		go p.Send(bubbletea.CronStatusMsg{Indicator: cronTracker.FormatIndicator()})
+	})
+	eng.Scheduler.SetOnTaskListChanged(cronTracker.TriggerChange)
 
-	// Only wire capabilities for inline model (fullscreen model doesn't support these yet)
-	if inlineModel, ok := m.(*bubbletea.Model); ok {
-		inlineModel.SetModelLister(slash.BuildModelLister(cfg))
-		inlineModel.SetModelStatusGetter(slash.BuildModelStatusGetter(cfg))
-		inlineModel.SetModelSwitcher(slash.BuildModelSwitcher(filepath.Join(cwd, ".nano.yaml")))
-		inlineModel.SetModelFallbackHandler(slash.BuildModelFallbackHandler(cfg))
-		inlineModel.SetModelDoctor(slash.BuildModelDoctor(cfg))
-		inlineModel.SetContextStatusGetter(slash.BuildContextStatusGetter(agentInstance))
-		inlineModel.SetDoctorReporter(slash.BuildDoctorReporter(cfg))
-		inlineModel.SetEventsQuerier(slash.BuildEventsQuerier(eventStore))
-		inlineModel.SetAuditQuerier(slash.BuildAuditQuerier(eventStore))
-		if sm := agentInstance.GetSkillManager(); sm != nil {
-			inlineModel.SetSkillLister(sm.ListSkillNames)
+	// Wire all 16 slash capabilities onto both the inline and fullscreen models.
+	// Building the closures once and assigning them symmetrically keeps both modes
+	// in sync without duplicating callback construction.
+	modelLister := slash.BuildModelLister(cfg)
+	modelStatusGetter := slash.BuildModelStatusGetter(cfg)
+	modelSwitcher := slash.BuildModelSwitcher(filepath.Join(cwd, ".nano.yaml"))
+	modelFallbackHandler := slash.BuildModelFallbackHandler(cfg)
+	modelDoctor := slash.BuildModelDoctor(cfg)
+	contextStatusGetter := slash.BuildContextStatusGetter(agentInstance)
+	doctorReporter := slash.BuildDoctorReporter(cfg)
+	eventsQuerier := slash.BuildEventsQuerier(eventStore)
+	auditQuerier := slash.BuildAuditQuerier(eventStore)
+	routinesAdder := func(description string) string {
+		id, err := btScheduler.AddRoutineFromDescription(description)
+		if err != nil {
+			return fmt.Sprintf("❌ 添加 routine 失败：%v", err)
 		}
-		inlineModel.SetRoutinesLister(btScheduler.FormatTasks)
-		inlineModel.SetRunningStatusLister(cronTracker.FormatDetails)
-		inlineModel.SetRoutinesAdder(func(description string) string {
-			id, err := btScheduler.AddRoutineFromDescription(description)
-			if err != nil {
-				return fmt.Sprintf("❌ 添加 routine 失败：%v", err)
-			}
-			return fmt.Sprintf("✅ 已添加 routine %s", id)
-		})
-		inlineModel.SetRoutinesRemover(func(taskID string) string {
-			if err := btScheduler.RemoveTask(strings.TrimSpace(taskID)); err != nil {
-				return fmt.Sprintf("❌ 删除 routine 失败：%v", err)
-			}
-			return fmt.Sprintf("✅ 已删除 routine %s", strings.TrimSpace(taskID))
-		})
-		inlineModel.SetRoutinesPauser(func(taskID string) string {
-			if err := btScheduler.PauseTask(strings.TrimSpace(taskID)); err != nil {
-				return fmt.Sprintf("❌ 暂停 routine 失败：%v", err)
-			}
-			return fmt.Sprintf("✅ 已暂停 routine %s", strings.TrimSpace(taskID))
-		})
-		inlineModel.SetRoutinesResumer(func(taskID string) string {
-			if err := btScheduler.ResumeTask(strings.TrimSpace(taskID)); err != nil {
-				return fmt.Sprintf("❌ 恢复 routine 失败：%v", err)
-			}
-			return fmt.Sprintf("✅ 已恢复 routine %s", strings.TrimSpace(taskID))
-		})
+		return fmt.Sprintf("✅ 已添加 routine %s", id)
+	}
+	routinesRemover := func(taskID string) string {
+		if err := btScheduler.RemoveTask(strings.TrimSpace(taskID)); err != nil {
+			return fmt.Sprintf("❌ 删除 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已删除 routine %s", strings.TrimSpace(taskID))
+	}
+	routinesPauser := func(taskID string) string {
+		if err := btScheduler.PauseTask(strings.TrimSpace(taskID)); err != nil {
+			return fmt.Sprintf("❌ 暂停 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已暂停 routine %s", strings.TrimSpace(taskID))
+	}
+	routinesResumer := func(taskID string) string {
+		if err := btScheduler.ResumeTask(strings.TrimSpace(taskID)); err != nil {
+			return fmt.Sprintf("❌ 恢复 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已恢复 routine %s", strings.TrimSpace(taskID))
+	}
+	routinesRunner := func(taskID string) string {
+		taskID = strings.TrimSpace(taskID)
+		if err := btScheduler.Scheduler().RunTaskNow(taskID); err != nil {
+			return fmt.Sprintf("❌ 触发 routine 失败：%v", err)
+		}
+		return fmt.Sprintf("✅ 已触发 routine %s 立即执行", taskID)
+	}
+	wireCapabilities := func(
+		setModelLister func(func() string),
+		setModelStatusGetter func(func() string),
+		setModelSwitcher func(func(string) string),
+		setModelFallbackHandler func(func(string) string),
+		setModelDoctor func(func(string) string),
+		setContextStatusGetter func(func() string),
+		setDoctorReporter func(func() string),
+		setEventsQuerier func(func(string) string),
+		setAuditQuerier func(func(string) string),
+		setSkillLister func(func() string),
+		setRoutinesLister func(func() string),
+		setRunningStatusLister func(func() string),
+		setRoutinesAdder func(func(string) string),
+		setRoutinesRemover func(func(string) string),
+		setRoutinesPauser func(func(string) string),
+		setRoutinesResumer func(func(string) string),
+		setRoutinesRunner func(func(string) string),
+	) {
+		setModelLister(modelLister)
+		setModelStatusGetter(modelStatusGetter)
+		setModelSwitcher(modelSwitcher)
+		setModelFallbackHandler(modelFallbackHandler)
+		setModelDoctor(modelDoctor)
+		setContextStatusGetter(contextStatusGetter)
+		setDoctorReporter(doctorReporter)
+		setEventsQuerier(eventsQuerier)
+		setAuditQuerier(auditQuerier)
+		if sm := agentInstance.GetSkillManager(); sm != nil {
+			setSkillLister(sm.ListSkillNames)
+		}
+		setRoutinesLister(btScheduler.FormatTasks)
+		setRunningStatusLister(cronTracker.FormatDetails)
+		setRoutinesAdder(routinesAdder)
+		setRoutinesRemover(routinesRemover)
+		setRoutinesPauser(routinesPauser)
+		setRoutinesResumer(routinesResumer)
+		setRoutinesRunner(routinesRunner)
+	}
+	if inlineModel, ok := m.(*bubbletea.Model); ok {
+		wireCapabilities(
+			inlineModel.SetModelLister, inlineModel.SetModelStatusGetter,
+			inlineModel.SetModelSwitcher, inlineModel.SetModelFallbackHandler,
+			inlineModel.SetModelDoctor, inlineModel.SetContextStatusGetter,
+			inlineModel.SetDoctorReporter, inlineModel.SetEventsQuerier,
+			inlineModel.SetAuditQuerier, inlineModel.SetSkillLister,
+			inlineModel.SetRoutinesLister, inlineModel.SetRunningStatusLister,
+			inlineModel.SetRoutinesAdder, inlineModel.SetRoutinesRemover,
+			inlineModel.SetRoutinesPauser, inlineModel.SetRoutinesResumer,
+			inlineModel.SetRoutinesRunner,
+		)
+	}
+	if fsModel, ok := m.(*bubbletea.FullscreenModel); ok {
+		wireCapabilities(
+			fsModel.SetModelLister, fsModel.SetModelStatusGetter,
+			fsModel.SetModelSwitcher, fsModel.SetModelFallbackHandler,
+			fsModel.SetModelDoctor, fsModel.SetContextStatusGetter,
+			fsModel.SetDoctorReporter, fsModel.SetEventsQuerier,
+			fsModel.SetAuditQuerier, fsModel.SetSkillLister,
+			fsModel.SetRoutinesLister, fsModel.SetRunningStatusLister,
+			fsModel.SetRoutinesAdder, fsModel.SetRoutinesRemover,
+			fsModel.SetRoutinesPauser, fsModel.SetRoutinesResumer,
+			fsModel.SetRoutinesRunner,
+		)
 	}
 	eng.SetCronNotifier(func(ev event.StreamEvent) {
 		eventStore.Add(ev)
@@ -1201,31 +1346,22 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 		logger.Warnf("Engine start failed: %v", startErr)
 	}
 
-	// Register allowlist handler so "始终允许" adds a rule to the session allowlist (inline model only).
-	if inlineModel, ok := m.(*bubbletea.Model); ok {
-		inlineModel.SetAllowlistHandler(func(toolName string, params map[string]interface{}) {
-			if pm := agentInstance.GetPermissionManager(); pm != nil {
-				rules := permission.BuildAllowlistRules(toolName, params)
-				for _, rule := range rules {
-					pm.GetSessionAllowlist().AddRule(rule)
-					// Persist the rule to disk
-					if _, err := allowlistStore.AddRuleForWorkdir(cwd, rule.RawPattern); err != nil {
-						logger.Warnf("Failed to persist allowlist rule %q: %v", rule.RawPattern, err)
-					}
+	// Wire permission manager, allowlist, engine and tool names onto both models
+	// so the --tea and --milktea surfaces are symmetric.
+	allowlistCallback := func(toolName string, params map[string]interface{}) {
+		if pm := agentInstance.GetPermissionManager(); pm != nil {
+			rules := permission.BuildAllowlistRules(toolName, params)
+			for _, rule := range rules {
+				pm.GetSessionAllowlist().AddRule(rule)
+				// Persist the rule to disk
+				if _, err := allowlistStore.AddRuleForWorkdir(cwd, rule.RawPattern); err != nil {
+					logger.Warnf("Failed to persist allowlist rule %q: %v", rule.RawPattern, err)
 				}
 			}
-		})
-
-		// Wire permission manager and tool names into the Bubble Tea model
-		inlineModel.SetPermissionManager(agentInstance.GetPermissionManager())
-		// Wire persistent allowlist store for /disallow cleanup
-		inlineModel.SetPersistentAllowlist(allowlistStore, cwd)
-		// Wire engine so /think command works
-		inlineModel.SetEngine(eng)
-		// Wire new session handler so Ctrl+R / /clear work
-		inlineModel.SetNewSessionHandler(func() string {
-			return agentInstance.StartNewSession()
-		})
+		}
+	}
+	newSessionCallback := func() string {
+		return agentInstance.StartNewSession()
 	}
 	allTools := agentInstance.GetToolbox().List()
 	toolNames := make([]string, 0, len(allTools))
@@ -1233,7 +1369,20 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 		toolNames = append(toolNames, t.Name())
 	}
 	if inlineModel, ok := m.(*bubbletea.Model); ok {
+		inlineModel.SetAllowlistHandler(allowlistCallback)
+		inlineModel.SetPermissionManager(agentInstance.GetPermissionManager())
+		inlineModel.SetPersistentAllowlist(allowlistStore, cwd)
+		inlineModel.SetEngine(eng)
+		inlineModel.SetNewSessionHandler(newSessionCallback)
 		inlineModel.SetAvailableToolNames(toolNames)
+	}
+	if fsModel, ok := m.(*bubbletea.FullscreenModel); ok {
+		fsModel.SetAllowlistHandler(allowlistCallback)
+		fsModel.SetPermissionManager(agentInstance.GetPermissionManager())
+		fsModel.SetPersistentAllowlist(allowlistStore, cwd)
+		fsModel.SetEngine(eng)
+		fsModel.SetNewSessionHandler(newSessionCallback)
+		fsModel.SetAvailableToolNames(toolNames)
 	}
 
 	// Stream bridge: forward agent events to Bubble Tea
@@ -1270,8 +1419,19 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	// For fullscreen model, bind the outbound handler
 	if fullscreenModel, ok := m.(*bubbletea.FullscreenModel); ok {
 		fullscreenModel.BindOutbound(func(out eventsource.Outbound) error {
-			if out.Kind == "user_message" {
+			switch out.Kind {
+			case "user_message", "submit":
+				// Fullscreen historically emits "user_message"; "submit" is
+				// accepted too so shared Bubble Tea controls can reuse one
+				// outbound path across inline and fullscreen modes.
 				startStream(out.Text)
+			case "cancel":
+				cancelCurrent()
+			case "control":
+				if strings.TrimSpace(out.Control) == "/clear" {
+					cancelCurrent()
+					agentInstance.StartNewSession()
+				}
 			}
 			return nil
 		})
@@ -1309,74 +1469,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 
 func forwardBubbleTeaStreamEvent(p *tea.Program, eventStore *daemon.TaskEventStore, se event.StreamEvent) {
 	eventStore.Add(se)
-	switch se.Type {
-	case event.EventTypeCronTaskStarted, event.EventTypeCronTaskFinished, event.EventTypeCronTaskProgress:
-		return
-	case event.EventTypeStreamContent:
-		p.Send(bubbletea.Message{Role: "assistant_stream", Content: se.Content})
-	case event.EventTypeContent:
-		if se.Source != "llm_client" {
-			p.Send(bubbletea.Message{Role: "assistant_stream", Content: se.Content})
-		}
-	case event.EventTypeError:
-		p.Send(bubbletea.Message{Role: "error", Content: se.Error})
-	case event.EventTypeThinking:
-		p.Send(bubbletea.ThinkingMsg{
-			Title:          se.Content,
-			Reasoning:      se.Reasoning,
-			ReasoningDelta: se.ReasoningDelta,
-			Metadata:       se.Metadata,
-		})
-	case event.EventTypeToolUse:
-		if se.ToolUse == nil {
-			return
-		}
-		toolName := se.ToolUse.ToolName
-		params := se.ToolUse.Parameters
-		result := se.ToolUse.Result
-
-		var content string
-		if result == "" {
-			content = fmt.Sprintf("正在调用工具: %s\n参数: %v", toolName, params)
-		} else {
-			runes := []rune(result)
-			if len(runes) > 500 {
-				result = string(runes[:500]) + "..."
-			}
-			content = fmt.Sprintf("工具: %s 调用完成\n结果: %s", toolName, result)
-		}
-
-		p.Send(bubbletea.Message{Role: "tool", Content: content})
-	case event.EventTypeTokenStats:
-		if se.TokenStats != nil {
-			p.Send(buildTokenStatsUpdate(se.TokenStats))
-		}
-	case event.EventTypeDone:
-		p.Send(bubbletea.StatusUpdate("完成"))
-	case event.EventTypeCompression:
-		orig := se.Metadata["original_tokens"]
-		cmp := se.Metadata["compressed_tokens"]
-		ratio := se.Metadata["compression_ratio"]
-		before := se.Metadata["messages_before"]
-		after := se.Metadata["messages_after"]
-		trigger := se.Metadata["triggered_by"]
-		summary := se.Metadata["summary_full"]
-		content := fmt.Sprintf("🗜️ 上下文压缩: %v → %v tokens (减少 %.2f%%)\n消息数: %v → %v，触发: %v\n摘要: %v",
-			orig, cmp, (1.0-float64FromAny(ratio))*100, before, after, trigger, truncatePreview(summary))
-		p.Send(bubbletea.Message{Role: "system", Content: content})
-	}
-}
-
-func buildTokenStatsUpdate(stats *event.TokenStats) bubbletea.TokenStatsUpdate {
-	if stats == nil {
-		return bubbletea.TokenStatsUpdate{}
-	}
-	return bubbletea.TokenStatsUpdate{
-		InputTokens:       stats.InputTokens,
-		OutputTokens:      stats.OutputTokens,
-		TotalTokens:       stats.TotalTokens,
-		Peak:              stats.PeakTokensPerSecond,
-		ContextWindowMax:  stats.ContextWindowMax,
-		ContextUsedTokens: stats.ContextUsedTokens,
-	}
+	// Delegate all standard event translation to the shared forwarder that is
+	// also used by BubbleTeaAdapter so both paths stay in sync automatically.
+	bubbletea.ForwardStreamEvent(p.Send, se)
 }

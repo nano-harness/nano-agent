@@ -292,7 +292,7 @@ func (r *Registry) agentProfileManifests() []Manifest {
 		permissions := []Permission{{
 			Type:        "agent_spawn",
 			Scope:       profile.Kind,
-			Description: "Can be invoked through @agent-name or spawn_teammate",
+			Description: "Can be invoked through /agent-name slash command or spawn_teammate",
 		}}
 		if profile.PermissionMode != "" {
 			permissions = append(permissions, Permission{

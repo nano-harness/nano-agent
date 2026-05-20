@@ -8,7 +8,7 @@ import (
 
 func TestStateManager(t *testing.T) {
 	// Create a new state manager
-	sm := NewStateManager()
+	sm := NewStateManager(nil)
 	defer sm.Stop()
 
 	// Test initial state
@@ -62,7 +62,7 @@ func TestStateManager(t *testing.T) {
 }
 
 func TestStateTransitions(t *testing.T) {
-	sm := NewStateManager()
+	sm := NewStateManager(nil)
 	defer sm.Stop()
 
 	// Test all state transitions
@@ -90,7 +90,7 @@ func TestStateTransitions(t *testing.T) {
 }
 
 func TestFormatStatusText(t *testing.T) {
-	sm := NewStateManager()
+	sm := NewStateManager(nil)
 	defer sm.Stop()
 
 	// Test different states and their formatting
@@ -120,7 +120,7 @@ func TestFormatStatusText(t *testing.T) {
 }
 
 func TestTokenStatsFormatting(t *testing.T) {
-	sm := NewStateManager()
+	sm := NewStateManager(nil)
 	defer sm.Stop()
 
 	// Test with token stats

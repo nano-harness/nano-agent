@@ -9,6 +9,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 )
 
@@ -59,7 +60,7 @@ func (s *InProcess) Inbound() <-chan Inbound { return s.inbound }
 func (s *InProcess) Send(o Outbound) error {
 	switch strings.TrimSpace(o.Kind) {
 	case "submit":
-		return s.submit(o.Text)
+		return s.submit(o.Text, o.Images)
 	case "cancel":
 		s.cancelTurn()
 		return nil
@@ -107,9 +108,18 @@ func (s *InProcess) Describe() string {
 	return "local in-process session:" + s.sessionID
 }
 
-func (s *InProcess) submit(text string) error {
+func (s *InProcess) GoalHandler() func(string) string {
+	return func(args string) string {
+		s.mu.Lock()
+		sessionID := s.sessionID
+		s.mu.Unlock()
+		return s.eng.Agent.HandleGoalCommand(sessionID, args)
+	}
+}
+
+func (s *InProcess) submit(text string, images []llm.MultimodalImage) error {
 	text = strings.TrimSpace(text)
-	if text == "" {
+	if text == "" && len(images) == 0 {
 		return nil
 	}
 	s.mu.Lock()
@@ -128,7 +138,7 @@ func (s *InProcess) submit(text string) error {
 
 	go func() {
 		defer cancel()
-		err := s.eng.Agent.ProcessStreamWithMultimodalAndSession(turnCtx, sessionID, text, nil, func(e event.StreamEvent) {
+		err := s.eng.Agent.ProcessStreamWithMultimodalAndSession(turnCtx, sessionID, text, images, func(e event.StreamEvent) {
 			s.emit(Inbound{Event: &e})
 		})
 		if err != nil && turnCtx.Err() == nil {

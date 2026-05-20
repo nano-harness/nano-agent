@@ -63,6 +63,8 @@ A hook entry can declare one of four execution backends via the `type` field:
 | `prompt`  | Sends a templated prompt to an LLM and parses `{ok,reason}` or `{action,...}`.|
 | `agent`   | Delegates the decision to a named subagent profile.                          |
 
+**Status**: All four hook types are fully wired and functional as of this PR. The `type` field and sub-configurations (`http`, `prompt`, `agent`) are now properly passed through from YAML configuration to the runtime hook engine.
+
 HTTP hooks enforce a host allowlist (`url_allowlist`), reject CR/LF in
 configured headers, never auto-follow redirects, and bound the response body
 (64 KB by default, override with `max_response_kb`).

@@ -6,6 +6,8 @@ import "regexp"
 type Scope string
 
 const (
+	// ScopeBuiltin represents a skill embedded in the nano binary.
+	ScopeBuiltin Scope = "builtin"
 	// ScopePersonal represents a skill from ~/.nano/skills/.
 	ScopePersonal Scope = "personal"
 	// ScopeProject represents a skill from .nano/skills/ in the project.

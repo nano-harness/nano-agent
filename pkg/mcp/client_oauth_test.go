@@ -136,14 +136,14 @@ func TestCreateTransport_StreamableMissingTokenReturnsError(t *testing.T) {
 	}
 }
 
-// TestCreateTransport_LegacyHTTPRejected verifies that legacy transport
-// types (http, sse, websocket) return explicit migration errors.
+// TestCreateTransport_LegacyUnsupportedRejected verifies that unsupported legacy
+// types (sse, websocket) return explicit migration errors.
 func TestCreateTransport_LegacyHTTPRejected(t *testing.T) {
 	client := &MCPClient{
 		config: &MCPConfig{},
 	}
 
-	legacyTransports := []string{"http", "sse", "websocket"}
+	legacyTransports := []string{"sse", "websocket"}
 
 	for _, transport := range legacyTransports {
 		t.Run(transport, func(t *testing.T) {

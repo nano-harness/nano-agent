@@ -28,7 +28,8 @@ type Manager struct {
 
 	activeSkills map[string]bool // currently activated skill names
 
-	stateStore *config.StateStore // optional persistent state store
+	stateStore        *config.StateStore // optional persistent state store
+	builtinSkillNames map[string]bool
 }
 
 // NewManager creates a new skill Manager.
@@ -57,22 +58,32 @@ func NewManager(workingDir string, personalDir, projectDir string, maxSkillSize 
 	}
 
 	return &Manager{
-		personalDir:     personalDir,
-		projectDir:      projectDir,
-		workingDir:      workingDir,
-		maxSkillSize:    maxSkillSize,
-		maxSkills:       maxSkills,
-		maxActiveSkills: maxActiveSkills,
-		autoInvoke:      autoInvoke,
-		skills:          make([]Skill, 0),
-		skillsByName:    make(map[string]int),
-		activeSkills:    make(map[string]bool),
+		personalDir:       personalDir,
+		projectDir:        projectDir,
+		workingDir:        workingDir,
+		maxSkillSize:      maxSkillSize,
+		maxSkills:         maxSkills,
+		maxActiveSkills:   maxActiveSkills,
+		autoInvoke:        autoInvoke,
+		skills:            make([]Skill, 0),
+		skillsByName:      make(map[string]int),
+		activeSkills:      make(map[string]bool),
+		builtinSkillNames: make(map[string]bool),
 	}
 }
 
 // SetStateStore attaches a StateStore for persisting active skill state.
 func (m *Manager) SetStateStore(ss *config.StateStore) {
 	m.stateStore = ss
+}
+
+// EnableBuiltinSkills makes selected embedded skills available during discovery.
+func (m *Manager) EnableBuiltinSkills(names []string) {
+	for _, name := range names {
+		if strings.TrimSpace(name) != "" {
+			m.builtinSkillNames[name] = true
+		}
+	}
 }
 
 // getActiveSkillNames returns a sorted slice of active skill names.
@@ -90,6 +101,8 @@ func (m *Manager) getActiveSkillNames() []string {
 func (m *Manager) Discover() error {
 	m.skills = m.skills[:0]
 	m.skillsByName = make(map[string]int)
+
+	m.loadBuiltinSkills()
 
 	// Load personal skills first
 	if m.personalDir != "" {
@@ -109,6 +122,22 @@ func (m *Manager) Discover() error {
 
 	logger.Infof("Discovered %d skills", len(m.skills))
 	return nil
+}
+
+func (m *Manager) loadBuiltinSkills() {
+	if len(m.builtinSkillNames) == 0 {
+		return
+	}
+	for _, skill := range builtinSkills() {
+		if skill == nil {
+			continue
+		}
+		if !m.builtinSkillNames[skill.Name] {
+			continue
+		}
+		m.skillsByName[skill.Name] = len(m.skills)
+		m.skills = append(m.skills, *skill)
+	}
 }
 
 // scanDirectory scans a skills directory for SKILL.md files.

@@ -215,8 +215,16 @@ release: clean test lint ## Build release versions for all platforms
 	@$(foreach platform,$(PLATFORMS), \
 		echo "Building for $(platform)..."; \
 		GOOS=$(word 1,$(subst /, ,$(platform))) GOARCH=$(word 2,$(subst /, ,$(platform))) \
-		go build $(BUILD_FLAGS) -o $(BUILD_DIR)/release/$(BINARY_NAME)-$(platform) ./$(CMD_DIR); \
+		go build $(BUILD_FLAGS) -o $(BUILD_DIR)/release/$(BINARY_NAME)-$(word 1,$(subst /, ,$(platform)))-$(word 2,$(subst /, ,$(platform))) ./$(CMD_DIR); \
 	)
+	@echo "Creating tar.gz archives..."
+	@cd $(BUILD_DIR)/release && \
+	for platform in darwin-amd64 darwin-arm64 linux-amd64 linux-arm64 windows-amd64; do \
+		if [ -f "$(BINARY_NAME)-$$platform" ]; then \
+			tar -czf "$(BINARY_NAME)-$$platform.tar.gz" "$(BINARY_NAME)-$$platform"; \
+			echo "Created $(BINARY_NAME)-$$platform.tar.gz"; \
+		fi; \
+	done
 	@echo "Release builds completed in $(BUILD_DIR)/release/"
 
 # ==================== Docker ====================

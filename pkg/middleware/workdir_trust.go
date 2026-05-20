@@ -67,7 +67,12 @@ func resolvePathBestEffort(path, base string) string {
 				if !info.IsDir() && len(suffix) == 0 {
 					return filepath.Clean(resolved)
 				}
-				parts := append([]string{resolved}, reverseStrings(suffix)...)
+				// Reverse suffix slice inline
+				reversed := make([]string, len(suffix))
+				for i := range suffix {
+					reversed[len(suffix)-1-i] = suffix[i]
+				}
+				parts := append([]string{resolved}, reversed...)
 				return filepath.Clean(filepath.Join(parts...))
 			}
 			break
@@ -80,14 +85,6 @@ func resolvePathBestEffort(path, base string) string {
 		prefix = parent
 	}
 	return path
-}
-
-func reverseStrings(values []string) []string {
-	out := make([]string, len(values))
-	for i := range values {
-		out[len(values)-1-i] = values[i]
-	}
-	return out
 }
 
 // ExtractShellPathArgs returns the subset of statement arguments that look like

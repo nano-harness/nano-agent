@@ -183,5 +183,56 @@ func validateCron(s string) (string, error) {
 	if _, err := p.Parse(s); err != nil {
 		return "", fmt.Errorf("invalid cron expression: %w", err)
 	}
+
+	// Validate minimum interval to prevent overly frequent executions
+	if err := validateMinimumInterval(s); err != nil {
+		return "", err
+	}
+
 	return s, nil
+}
+
+// validateMinimumInterval checks that a cron expression doesn't run more frequently
+// than once per minute to prevent resource exhaustion and DoS attacks.
+func validateMinimumInterval(cronExpr string) error {
+	fields := strings.Fields(cronExpr)
+	if len(fields) != 6 {
+		return fmt.Errorf("expected 6-field cron expression, got %d fields", len(fields))
+	}
+
+	secondField := fields[0]
+
+	// Check for expressions that run every second or multiple times per minute
+	// Examples: "* * * * * *", "*/5 * * * * *", "0,30 * * * * *"
+
+	// If seconds field is "*" or contains "/" or ",", it runs multiple times per minute
+	if secondField == "*" {
+		return fmt.Errorf("cron expression runs every second (too frequent); minimum interval is 1 minute")
+	}
+
+	// Check for second-level intervals like "*/5" or ranges "0-30"
+	if strings.Contains(secondField, "/") {
+		return fmt.Errorf("cron expression uses second-level intervals (too frequent); minimum interval is 1 minute")
+	}
+
+	// Check for multiple second values like "0,15,30,45"
+	if strings.Contains(secondField, ",") {
+		return fmt.Errorf("cron expression runs multiple times per minute (too frequent); minimum interval is 1 minute")
+	}
+
+	// Check for second ranges like "0-30"
+	if strings.Contains(secondField, "-") {
+		return fmt.Errorf("cron expression uses second ranges (too frequent); minimum interval is 1 minute")
+	}
+
+	// Seconds field must be a single fixed value (0-59)
+	// This ensures the task runs at most once per minute at a specific second
+	if secondField != "0" {
+		// Allow other fixed seconds like "15", "30", etc., but validate it's a single number
+		if _, err := strconv.Atoi(secondField); err != nil {
+			return fmt.Errorf("invalid seconds field %q; must be a single value (0-59)", secondField)
+		}
+	}
+
+	return nil
 }

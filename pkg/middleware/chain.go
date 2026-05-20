@@ -27,15 +27,6 @@ type PrioritizedMiddleware interface {
 	Priority() int
 }
 
-// Common priority levels for middleware execution order
-const (
-	PrioritySecurity   = 100 // Security checks should run first
-	PriorityResilience = 200 // Resilience (retry, circuit breaker) runs after security
-	PriorityAudit      = 300 // Auditing runs after resilience
-	PriorityMonitor    = 400 // Monitoring runs after audit
-	PriorityMetrics    = 500 // Metrics collection runs last before actual execution
-)
-
 // Chain is an ordered list of ToolMiddleware that wraps tool execution.
 type Chain struct {
 	middlewares []ToolMiddleware

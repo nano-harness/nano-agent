@@ -5,6 +5,7 @@ package sandbox
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -43,7 +44,10 @@ func (s *SandboxExecSandbox) BackendDetail() string { return "sandbox-exec" }
 
 // WrapCommand transforms (cmd, args) into a sandbox-exec-wrapped invocation:
 //
-//	sandbox-exec -p <profile> cmd args...
+//	/usr/bin/env -i KEY=val ... sandbox-exec -p <profile> cmd args...
+//
+// The env wrapper is used to sanitize the environment, preventing secrets
+// from leaking into the sandbox.
 func (s *SandboxExecSandbox) WrapCommand(workingDir, cmd string, args []string) (string, []string, error) {
 	dir := workingDir
 	if dir == "" {
@@ -56,11 +60,51 @@ func (s *SandboxExecSandbox) WrapCommand(workingDir, cmd string, args []string) 
 			return "", nil, fmt.Errorf("sandbox: cannot determine working directory: %w", err)
 		}
 	}
+	// Resolve symlinks so HOME and the subpath rule below both use the
+	// canonical path the kernel will compare against.
+	dir = canonicalize(dir)
 
 	profile := s.buildProfile(dir)
-	wrapped := []string{"-p", profile, cmd}
+
+	// Build environment whitelist - only pass through safe variables
+	var envArgs []string
+	for _, e := range os.Environ() {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok {
+			continue
+		}
+		// Only pass through NANO_* prefixed variables and essential runtime vars
+		switch {
+		case strings.HasPrefix(k, "NANO_"),
+			k == "PATH", k == "TERM", k == "LANG", k == "LC_ALL":
+			envArgs = append(envArgs, k+"="+v)
+		}
+	}
+	// Set HOME to the working directory (sandbox doesn't allow access to real home)
+	envArgs = append(envArgs, "HOME="+dir)
+
+	// Build the full command: env -i <env...> sandbox-exec -p <profile> <cmd> <args...>
+	wrapped := []string{"-i"}
+	wrapped = append(wrapped, envArgs...)
+	wrapped = append(wrapped, "sandbox-exec", "-p", profile, cmd)
 	wrapped = append(wrapped, args...)
-	return "sandbox-exec", wrapped, nil
+	return "/usr/bin/env", wrapped, nil
+}
+
+// canonicalize returns the symlink-resolved absolute path so SBPL subpath rules
+// match the kernel's canonical view. macOS resolves /var -> /private/var,
+// /tmp -> /private/tmp, etc. before evaluating sandbox policy, so a rule like
+// (subpath "/var/folders/...") never matches a write to that path because the
+// kernel sees "/private/var/folders/...". On error (path doesn't exist, etc.)
+// the input is returned unchanged so policy generation still proceeds.
+func canonicalize(p string) string {
+	if p == "" {
+		return p
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
 }
 
 // buildProfile generates the SBPL profile string.
@@ -68,6 +112,11 @@ func (s *SandboxExecSandbox) buildProfile(workingDir string) string {
 	var b strings.Builder
 
 	b.WriteString("(version 1)\n")
+	// Import bsd.sb to provide the minimal BSD foundation required by macOS.
+	// Without this, (deny default) blocks file-read-data on /, causing dyld
+	// to abort before main() is reached. This is the critical fix for P0 issue
+	// where all sandbox-exec commands were failing with abort_trap.
+	b.WriteString("(import \"bsd.sb\")\n")
 	b.WriteString("(deny default)\n")
 
 	// ── Read-only system paths ───────────────────────────────────────────────
@@ -77,13 +126,12 @@ func (s *SandboxExecSandbox) buildProfile(workingDir string) string {
 		"/Library/Preferences", "/dev"} {
 		fmt.Fprintf(&b, "  (subpath %q)\n", p)
 	}
-	// Allow reading the macOS dynamic linker cache.
-	b.WriteString("  (subpath \"/private/var/db/dyld\")\n")
+	// /private/var/db already includes the dyld cache subdirectory
 	b.WriteString(")\n")
 
 	// ── Working directory: read + write ─────────────────────────────────────
 	if workingDir != "" {
-		fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %q))\n", workingDir)
+		fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %q))\n", canonicalize(workingDir))
 	}
 
 	// ── /tmp: read + write ───────────────────────────────────────────────────
@@ -92,12 +140,12 @@ func (s *SandboxExecSandbox) buildProfile(workingDir string) string {
 
 	// ── Extra read-only paths ────────────────────────────────────────────────
 	for _, p := range s.cfg.ExtraReadOnlyPaths {
-		fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", p)
+		fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", canonicalize(p))
 	}
 
 	// ── Extra writable paths ─────────────────────────────────────────────────
 	for _, p := range s.cfg.ExtraWritablePaths {
-		fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %q))\n", p)
+		fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %q))\n", canonicalize(p))
 	}
 
 	// ── Network ─────────────────────────────────────────────────────────────

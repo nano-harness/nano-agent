@@ -157,8 +157,18 @@ type Turn struct {
 	hookEngine *middleware.HookEngine
 
 	ralphContext       *RalphContext
+	goalContext        *GoalContext
+	goalEvaluator      *GoalEvaluator
 	transcript         *TranscriptWriter
 	continuationReason string
+
+	// Structured termination tracking (for binary sentinel and orchestrators)
+	terminationCause    string // e.g., "task_done", "error_threshold", "diminishing_returns"
+	blockerFingerprint  string // Normalized blocker ID, e.g., "dr_no_progress:3rounds"
+	terminationReason   string // Human-readable explanation
+
+	// Context usage stream throttling
+	contextUsageStreamCounter int // Count of streaming TokenStats events
 }
 
 // TurnConfig holds configuration for Turn creation
@@ -179,6 +189,8 @@ type TurnConfig struct {
 	Agent                     *Agent                 // optional: agent reference for mailbox injection
 	HookEngine                *middleware.HookEngine // optional: hook engine for lifecycle events
 	RalphContext              *RalphContext
+	GoalContext               *GoalContext
+	GoalEvaluator             *GoalEvaluator
 	Transcript                *TranscriptWriter
 }
 
@@ -267,6 +279,8 @@ func NewTurnWithMultimodal(userInput string, images []llm.MultimodalImage, confi
 		agent:               configInput.Agent,
 		hookEngine:          configInput.HookEngine,
 		ralphContext:        configInput.RalphContext,
+		goalContext:         configInput.GoalContext,
+		goalEvaluator:       configInput.GoalEvaluator,
 		transcript:          configInput.Transcript,
 
 		Goals:       make([]TaskGoal, 0),
@@ -580,6 +594,12 @@ func (t *Turn) MarkTaskCompleted(reason string) {
 		t.CompletionCriteria.ConsecutiveErrors = 0
 	}
 	t.Status.IsComplete = true
+
+	// Set structured termination cause for task_done path
+	t.terminationCause = "task_done"
+	t.terminationReason = reason
+	t.blockerFingerprint = "" // Success path doesn't need fingerprint
+
 	logger.Infof("Task marked as completed: %s", reason)
 
 	// [swarm] Trigger stop hooks before emitting events
@@ -751,12 +771,13 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 			if streamEvent.TokenStats != nil {
 				// Directly use event-provided TokenStats for accuracy
 				t.TokenStats = streamEvent.TokenStats
-				t.populateContextUsage(t.TokenStats)
 				streamEvent.TokenStats = t.TokenStats
+				// Note: populateContextUsage is called by wrappedHandler below
 			}
 		}
 
 		// Forward events to turn's event handler after lifecycle metadata is filled.
+		// wrappedHandler will call populateContextUsage for TokenStats events.
 		wrappedHandler(streamEvent)
 	})
 
@@ -806,9 +827,18 @@ func (t *Turn) populateContextUsage(stats *event.TokenStats) {
 		return
 	}
 	if t.compressionStrategy != nil {
-		ctxStatus := t.compressionStrategy.Status(t.Messages, t.systemPrompt, t.lastCompressionInfo)
-		stats.ContextWindowMax = ctxStatus.MaxTokens
-		stats.ContextUsedTokens = ctxStatus.EstimatedTokens
+		// Throttle: streaming chunks fire many TokenStats per round; we only
+		// need periodic snapshots. Update every 10th streaming event or when
+		// streaming stops (TotalTokens > 0 indicates final stats from provider).
+		t.contextUsageStreamCounter++
+		isLikelyFinal := stats.TotalTokens > 0 || !stats.IsStreaming
+		shouldUpdate := isLikelyFinal || (t.contextUsageStreamCounter%10 == 0)
+
+		if shouldUpdate {
+			ctxStatus := t.compressionStrategy.Status(t.Messages, t.systemPrompt, t.lastCompressionInfo)
+			stats.ContextWindowMax = ctxStatus.MaxTokens
+			stats.ContextUsedTokens = ctxStatus.EstimatedTokens
+		}
 		return
 	}
 	if max := t.deriveContextWindowMaxFallback(); max > 0 {
@@ -1070,4 +1100,28 @@ func (t *Turn) close() {
 			}
 			return 0
 		}())
+}
+
+// ── Termination tracking accessors ──────────────────────────────────────────
+
+// TerminationCause returns the classification enum of why the turn terminated.
+func (t *Turn) TerminationCause() string {
+	return t.terminationCause
+}
+
+// BlockerFingerprint returns a stable, normalized short string identifying the blocker.
+func (t *Turn) BlockerFingerprint() string {
+	return t.blockerFingerprint
+}
+
+// TerminationReason returns a human-readable explanation of termination.
+func (t *Turn) TerminationReason() string {
+	return t.terminationReason
+}
+
+// SetTerminationInfo sets structured termination metadata.
+func (t *Turn) SetTerminationInfo(cause, fingerprint, reason string) {
+	t.terminationCause = cause
+	t.blockerFingerprint = fingerprint
+	t.terminationReason = reason
 }

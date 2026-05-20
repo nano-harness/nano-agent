@@ -91,21 +91,6 @@ func WrapExternalContent(content, source, contentType string) string {
 	return builder.String()
 }
 
-// WrapFileContent wraps file content with isolation tags
-func WrapFileContent(content, filePath string) string {
-	return WrapExternalContent(content, fmt.Sprintf("file:%s", filePath), "file")
-}
-
-// WrapWebContent wraps web page content with isolation tags
-func WrapWebContent(content, url string) string {
-	return WrapExternalContent(content, url, "web")
-}
-
-// WrapSearchResult wraps search result content with isolation tags
-func WrapSearchResult(content, query string) string {
-	return WrapExternalContent(content, fmt.Sprintf("search:%s", query), "search")
-}
-
 // DetectInjectionPatterns analyzes content for potential injection patterns
 func DetectInjectionPatterns(content string) []InjectionIndicator {
 	var indicators []InjectionIndicator
@@ -123,26 +108,4 @@ func DetectInjectionPatterns(content string) []InjectionIndicator {
 	}
 
 	return indicators
-}
-
-// ShouldWrapContent determines if content should be wrapped based on risk assessment
-// This is used to minimize false positives in trusted contexts
-func ShouldWrapContent(source string, hasDetectedPatterns bool) bool {
-	// Always wrap web content (highest risk)
-	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-		return true
-	}
-
-	// Wrap file content if patterns detected
-	if strings.HasPrefix(source, "file:") && hasDetectedPatterns {
-		return true
-	}
-
-	// Wrap search results if patterns detected
-	if strings.HasPrefix(source, "search:") && hasDetectedPatterns {
-		return true
-	}
-
-	// Default: wrap all external content for safety
-	return true
 }

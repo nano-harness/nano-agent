@@ -20,6 +20,7 @@ import (
 
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/bmatcuk/doublestar/v4"
 )
 
 // Backend identifies the execution isolation backend selected for a sandbox.
@@ -225,6 +226,16 @@ var defaultBlockedDirs = []string{
 	"/.ssh", "/.gnupg", "/.aws", "/.kube", "/.docker",
 }
 
+// defaultBlockedPatterns contains glob patterns (doublestar) that are always blocked.
+// These patterns use ** for recursive matching across path segments.
+var defaultBlockedPatterns = []string{
+	"**/.env",
+	"**/.env.*",
+	"**/credentials",
+	"**/*.pem",
+	"**/*.key",
+}
+
 // FileOperation represents a filesystem operation type.
 type FileOperation int
 
@@ -298,54 +309,145 @@ func (p *PathChecker) IsEnabled() bool {
 	return p.cfg != nil && p.cfg.Enabled
 }
 
+// expandHome expands ~ to the user's home directory.
+func expandHome(path string) string {
+	if !strings.HasPrefix(path, "~") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
+// enforceDefaultBlocklist checks the given path against the always-enforced default blacklist.
+// Returns an error if the path matches any default blocked path, dir, or pattern.
+// This function is called unconditionally, even when sandbox is disabled.
+func enforceDefaultBlocklist(absPath, cleanAbs string) error {
+	// Get user home for expansion
+	home, homeErr := os.UserHomeDir()
+
+	// Check against default blocked paths
+	slashPath := filepath.ToSlash(absPath)
+	slashClean := filepath.ToSlash(cleanAbs)
+
+	for _, blocked := range defaultBlockedPaths {
+		if slashPath == blocked || slashClean == blocked {
+			return fmt.Errorf("sandbox: access denied – path %q is a protected system file. Hint: use run_shell_command if you genuinely need access", absPath)
+		}
+	}
+
+	// Check against default blocked directories
+	for _, dir := range defaultBlockedDirs {
+		// Also check home-expanded versions
+		expandedDir := dir
+		if homeErr == nil && strings.HasPrefix(dir, "~/") {
+			expandedDir = filepath.ToSlash(filepath.Join(home, dir[2:]))
+		}
+
+		if slashPath == dir || strings.HasPrefix(slashPath, dir+"/") ||
+			slashClean == dir || strings.HasPrefix(slashClean, dir+"/") {
+			return fmt.Errorf("sandbox: access denied – path %q is in a protected directory. Hint: use run_shell_command if you genuinely need access", absPath)
+		}
+
+		if expandedDir != dir && (slashPath == expandedDir || strings.HasPrefix(slashPath, expandedDir+"/") ||
+			slashClean == expandedDir || strings.HasPrefix(slashClean, expandedDir+"/")) {
+			return fmt.Errorf("sandbox: access denied – path %q is in a protected directory. Hint: use run_shell_command if you genuinely need access", absPath)
+		}
+	}
+
+	// Block ~/.nano config files but explicitly allow ~/.nano/skills/**
+	if homeErr == nil {
+		nanoConfigDir := filepath.ToSlash(filepath.Join(home, ".nano"))
+		configNanoDir := filepath.ToSlash(filepath.Join(home, ".config", "nano"))
+		skillsDir := filepath.ToSlash(filepath.Join(home, ".nano", "skills"))
+
+		// Check if path is under ~/.nano/skills/ - if so, allow it
+		if strings.HasPrefix(slashPath, skillsDir+"/") || slashPath == skillsDir ||
+			strings.HasPrefix(slashClean, skillsDir+"/") || slashClean == skillsDir {
+			// Explicitly allowed: ~/.nano/skills/** paths
+		} else {
+			// Block ~/.nano/*.yaml, ~/.nano/*.yml, ~/.nano/config*
+			if strings.HasPrefix(slashPath, nanoConfigDir+"/") || slashPath == nanoConfigDir ||
+				strings.HasPrefix(slashClean, nanoConfigDir+"/") || slashClean == nanoConfigDir {
+				base := filepath.Base(slashPath)
+				if strings.HasSuffix(base, ".yaml") || strings.HasSuffix(base, ".yml") || strings.HasPrefix(base, "config") {
+					return fmt.Errorf("sandbox: access denied – path %q is a protected system file. Hint: use run_shell_command if you genuinely need access", absPath)
+				}
+			}
+
+			// Block ~/.config/nano/*.yaml, ~/.config/nano/*.yml
+			if strings.HasPrefix(slashPath, configNanoDir+"/") || slashPath == configNanoDir ||
+				strings.HasPrefix(slashClean, configNanoDir+"/") || slashClean == configNanoDir {
+				base := filepath.Base(slashPath)
+				if strings.HasSuffix(base, ".yaml") || strings.HasSuffix(base, ".yml") {
+					return fmt.Errorf("sandbox: access denied – path %q is a protected system file. Hint: use run_shell_command if you genuinely need access", absPath)
+				}
+			}
+		}
+	}
+
+	// Check against default blocked patterns using doublestar
+	for _, pattern := range defaultBlockedPatterns {
+		matched, err := doublestar.PathMatch(pattern, slashPath)
+		if err == nil && matched {
+			return fmt.Errorf("sandbox: access denied – path %q matches protected pattern %q. Hint: use run_shell_command if you genuinely need access", absPath, pattern)
+		}
+
+		matched, err = doublestar.PathMatch(pattern, slashClean)
+		if err == nil && matched {
+			return fmt.Errorf("sandbox: access denied – path %q matches protected pattern %q. Hint: use run_shell_command if you genuinely need access", absPath, pattern)
+		}
+	}
+
+	return nil
+}
+
 // Check validates whether the given path is accessible for the requested
 // operation.  Returns a descriptive error when access is denied.
 func (p *PathChecker) Check(path string, op FileOperation) error {
-	if !p.IsEnabled() {
-		return nil
-	}
-
+	// Always resolve the path first
 	absPath, err := p.resolve(path)
 	if err != nil {
 		return fmt.Errorf("sandbox: invalid path %q: %w", path, err)
 	}
 
-	// Blocked paths take priority.
-	if p.matchesAny(absPath, p.cfg.BlockedPaths) {
-		return fmt.Errorf("sandbox: access denied – path %q is blocked", absPath)
-	}
-
-	// Always enforce the hard-coded sensitive path blacklist.
-	// We check both the symlink-resolved path and the pre-resolution clean path
-	// because on some OSes (e.g. macOS) /etc is a symlink to /private/etc, so
-	// EvalSymlinks would turn /etc/passwd into /private/etc/passwd, bypassing the
-	// pattern "/etc/passwd".  Comparing both paths ensures detection in all cases.
+	// Compute clean absolute path for dual checking (symlink-resolved vs clean)
 	cleanAbs := filepath.Clean(path)
 	if !filepath.IsAbs(cleanAbs) {
 		if wd, wdErr := os.Getwd(); wdErr == nil {
 			cleanAbs = filepath.Join(wd, cleanAbs)
 		}
 	}
-	slashPath := filepath.ToSlash(absPath)
-	slashClean := filepath.ToSlash(cleanAbs)
-	for _, blocked := range defaultBlockedPaths {
-		if slashPath == blocked || slashClean == blocked {
-			return fmt.Errorf("sandbox: access denied – path %q is a protected system file", absPath)
-		}
-	}
-	for _, dir := range defaultBlockedDirs {
-		if slashPath == dir || strings.HasPrefix(slashPath, dir+"/") ||
-			slashClean == dir || strings.HasPrefix(slashClean, dir+"/") {
-			return fmt.Errorf("sandbox: access denied – path %q is in a protected directory", absPath)
-		}
+
+	// Layer 1: ALWAYS enforce default blocklist (even when sandbox is disabled)
+	if err := enforceDefaultBlocklist(absPath, cleanAbs); err != nil {
+		return err
 	}
 
-	// If an allowlist is configured, the path must match it.
+	// Layer 2: User-configured sandbox rules (only when sandbox is enabled)
+	if !p.IsEnabled() {
+		return nil
+	}
+
+	// User-configured blocked paths take priority
+	if p.matchesAny(absPath, p.cfg.BlockedPaths) {
+		return fmt.Errorf("sandbox: access denied – path %q is blocked", absPath)
+	}
+
+	// If an allowlist is configured, the path must match it
 	if len(p.cfg.AllowedPaths) > 0 && !p.matchesAny(absPath, p.cfg.AllowedPaths) {
 		return fmt.Errorf("sandbox: access denied – path %q is not in allowed_paths", absPath)
 	}
 
-	// Write operations are rejected for read-only paths.
+	// Write operations are rejected for read-only paths
 	if op.IsWrite() && p.matchesAny(absPath, p.cfg.ReadOnlyPaths) {
 		return fmt.Errorf("sandbox: access denied – path %q is read-only", absPath)
 	}

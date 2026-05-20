@@ -151,21 +151,24 @@ func NewCompressionStrategyWithConfig(maxTokens int, compressionRatio float64, p
 
 // ShouldCompress determines if compression is needed based on token count
 func (cs *CompressionStrategy) ShouldCompress(messages []llm.Message, currentTokens int) bool {
-	logger.Infof("Checking compression: %d messages, %d tokens", len(messages), currentTokens)
+	logger.Debugf("Checking compression: %d messages, %d tokens", len(messages), currentTokens)
 	if len(messages) <= cs.minMessagesToKeep+1 { // +1 for system message
-		logger.Info("Not compressing: not enough messages")
+		logger.Debug("Not compressing: not enough messages")
 		return false
 	}
 
 	shouldCompress := currentTokens > int(float64(cs.maxTokens)*cs.thresholdRatio)
-	logger.Infof("Should compress: %v (threshold: %d tokens)", shouldCompress, int(float64(cs.maxTokens)*cs.thresholdRatio))
+	logger.Debugf("Should compress: %v (threshold: %d tokens)", shouldCompress, int(float64(cs.maxTokens)*cs.thresholdRatio))
 	return shouldCompress
 }
 
 // Status estimates the current context budget without mutating messages.
+// This is a read-only snapshot that does not trigger logging or nested calls.
 func (cs *CompressionStrategy) Status(messages []llm.Message, systemPrompt string, last *CompressionInfo) ContextStatus {
 	currentTokens := cs.EstimateTokenCountWithSystemPrompt(messages, systemPrompt)
 	thresholdTokens := int(float64(cs.maxTokens) * cs.thresholdRatio)
+	// Inline shouldCompress calculation without calling ShouldCompress to avoid nested logging
+	shouldCompress := len(messages) > cs.minMessagesToKeep+1 && currentTokens > thresholdTokens
 	return ContextStatus{
 		MessageCount:       len(messages),
 		EstimatedTokens:    currentTokens,
@@ -173,7 +176,7 @@ func (cs *CompressionStrategy) Status(messages []llm.Message, systemPrompt strin
 		ThresholdTokens:    thresholdTokens,
 		ThresholdRatio:     cs.thresholdRatio,
 		PreserveRatio:      cs.preserveRatio,
-		ShouldCompress:     cs.ShouldCompress(messages, currentTokens),
+		ShouldCompress:     shouldCompress,
 		CompressionEnabled: true,
 		LastCompression:    last,
 	}

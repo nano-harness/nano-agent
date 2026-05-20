@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,9 +50,10 @@ type Scheduler struct {
 	mu          sync.RWMutex
 	executeTask func(command string) error
 	// executeTaskRich is an optional rich executor that returns metadata
-	executeTaskRich func(command, taskID string) (TaskExecutionMetadata, error)
-	stateStore      *config.StateStore
-	taskLog         *TaskLog
+	executeTaskRich   func(command, taskID string) (TaskExecutionMetadata, error)
+	stateStore        *config.StateStore
+	taskLog           *TaskLog
+	onTaskListChanged func()
 
 	// Cleanup goroutine management
 	stopCleanup     chan struct{}
@@ -81,6 +84,21 @@ func (s *Scheduler) SetTaskLog(tl *TaskLog) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.taskLog = tl
+}
+
+func (s *Scheduler) SetOnTaskListChanged(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onTaskListChanged = fn
+}
+
+func (s *Scheduler) notifyTaskListChanged() {
+	s.mu.RLock()
+	fn := s.onTaskListChanged
+	s.mu.RUnlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // SetLogRetention configures automatic log cleanup behavior.
@@ -239,74 +257,86 @@ func (s *Scheduler) Stop() {
 // LoadPersistedTasks loads tasks from the StateStore and schedules them.
 // Call this after Start().
 func (s *Scheduler) LoadPersistedTasks() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	shouldNotify := false
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	if s.stateStore == nil {
-		return nil
-	}
-
-	tasks := s.stateStore.GetTasks()
-	for _, pt := range tasks {
-		if pt.Paused {
-			logger.Infof("cron: skipped paused persisted task %s (%s)", pt.ID, pt.CronExpr)
-			continue
+		if s.stateStore == nil {
+			return
 		}
-		// Explicitly copy loop-variable fields into locals so the closure
-		// captures fresh values for each iteration.
-		taskID := pt.ID
-		cmd := pt.Command
-		cronExpr := pt.CronExpr
-		maxRuns := pt.MaxRuns
-		var runCount atomic.Int64
+		shouldNotify = true
 
-		entryID, err := s.cron.AddFunc(cronExpr, func() {
-			if maxRuns > 0 {
-				n := runCount.Add(1)
-				if n > int64(maxRuns) {
-					return // already past limit; removal goroutine is pending
+		tasks := s.stateStore.GetTasks()
+		for _, pt := range tasks {
+			if pt.Paused {
+				logger.Infof("cron: skipped paused persisted task %s (%s)", pt.ID, pt.CronExpr)
+				continue
+			}
+			// Explicitly copy loop-variable fields into locals so the closure
+			// captures fresh values for each iteration.
+			taskID := pt.ID
+			cmd := pt.Command
+			cronExpr := pt.CronExpr
+			maxRuns := pt.MaxRuns
+			var runCount atomic.Int64
+
+			entryID, err := s.cron.AddFunc(cronExpr, func() {
+				if maxRuns > 0 {
+					n := runCount.Add(1)
+					if n > int64(maxRuns) {
+						return // already past limit; removal goroutine is pending
+					}
+					if n == int64(maxRuns) {
+						// Last allowed run — remove asynchronously to avoid deadlock.
+						go func() {
+							removed := false
+							s.mu.Lock()
+							if t, ok := s.tasks[taskID]; ok {
+								s.cron.Remove(t.EntryID)
+								delete(s.tasks, taskID)
+								removed = true
+							}
+							s.mu.Unlock()
+							s.removePersistedTask(taskID)
+							if removed {
+								s.notifyTaskListChanged()
+							}
+						}()
+					}
 				}
-				if n == int64(maxRuns) {
-					// Last allowed run — remove asynchronously to avoid deadlock.
-					go func() {
-						s.mu.Lock()
-						if t, ok := s.tasks[taskID]; ok {
-							s.cron.Remove(t.EntryID)
-							delete(s.tasks, taskID)
-						}
-						s.mu.Unlock()
-						s.removePersistedTask(taskID)
-					}()
+				// Get the source under RLock
+				s.mu.RLock()
+				taskSource := pt.Source
+				s.mu.RUnlock()
+
+				// Use shared execution path
+				s.runTaskOnce(taskID, cmd, taskSource, false)
+			})
+			if err != nil {
+				logger.Warnf("cron: could not reload persisted task %s (%q): %v", taskID, cronExpr, err)
+				continue
+			}
+
+			t := &Task{
+				ID:       taskID,
+				CronExpr: cronExpr,
+				Command:  cmd,
+				Source:   pt.Source,
+				MaxRuns:  maxRuns,
+				EntryID:  entryID,
+			}
+			if pt.CreatedAt != "" {
+				if parsed, err := time.Parse(time.RFC3339, pt.CreatedAt); err == nil {
+					t.CreatedAt = parsed
 				}
 			}
-			// Get the source under RLock
-			s.mu.RLock()
-			taskSource := pt.Source
-			s.mu.RUnlock()
-
-			// Use shared execution path
-			s.runTaskOnce(taskID, cmd, taskSource, false)
-		})
-		if err != nil {
-			logger.Warnf("cron: could not reload persisted task %s (%q): %v", taskID, cronExpr, err)
-			continue
+			s.tasks[taskID] = t
+			logger.Infof("cron: reloaded persisted task %s (%s)", taskID, cronExpr)
 		}
-
-		t := &Task{
-			ID:       taskID,
-			CronExpr: cronExpr,
-			Command:  cmd,
-			Source:   pt.Source,
-			MaxRuns:  maxRuns,
-			EntryID:  entryID,
-		}
-		if pt.CreatedAt != "" {
-			if parsed, err := time.Parse(time.RFC3339, pt.CreatedAt); err == nil {
-				t.CreatedAt = parsed
-			}
-		}
-		s.tasks[taskID] = t
-		logger.Infof("cron: reloaded persisted task %s (%s)", taskID, cronExpr)
+	}()
+	if shouldNotify {
+		s.notifyTaskListChanged()
 	}
 	return nil
 }
@@ -356,56 +386,78 @@ func (s *Scheduler) ScheduleTaskWithSource(cronExpr, command, source string, max
 // ScheduleExistingTask registers an existing persisted task without adding a new
 // StateStore entry. It is used when resuming a paused persisted task by ID.
 func (s *Scheduler) ScheduleExistingTask(id, cronExpr, command, source string, maxRuns int, createdAt time.Time) (*Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists := s.tasks[id]; exists {
-		return nil, fmt.Errorf("cron: task already scheduled: %s", id)
+	// Validate minimum interval before attempting to schedule
+	if err := ValidateCronExpression(cronExpr); err != nil {
+		return nil, err
 	}
 
-	var runCount atomic.Int64
-	entryID, err := s.cron.AddFunc(cronExpr, func() {
-		if maxRuns > 0 {
-			n := runCount.Add(1)
-			if n > int64(maxRuns) {
-				return
-			}
-			if n == int64(maxRuns) {
-				go func() {
-					s.mu.Lock()
-					if t, ok := s.tasks[id]; ok {
-						s.cron.Remove(t.EntryID)
-						delete(s.tasks, id)
-					}
-					s.mu.Unlock()
-					s.removePersistedTask(id)
-				}()
-			}
+	t, err := func() (*Task, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if _, exists := s.tasks[id]; exists {
+			return nil, fmt.Errorf("cron: task already scheduled: %s", id)
 		}
-		s.runTaskOnce(id, command, source, false)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cron: invalid expression %q: %w", cronExpr, err)
-	}
 
-	if createdAt.IsZero() {
-		createdAt = time.Now()
+		var runCount atomic.Int64
+		entryID, err := s.cron.AddFunc(cronExpr, func() {
+			if maxRuns > 0 {
+				n := runCount.Add(1)
+				if n > int64(maxRuns) {
+					return
+				}
+				if n == int64(maxRuns) {
+					go func() {
+						removed := false
+						s.mu.Lock()
+						if t, ok := s.tasks[id]; ok {
+							s.cron.Remove(t.EntryID)
+							delete(s.tasks, id)
+							removed = true
+						}
+						s.mu.Unlock()
+						s.removePersistedTask(id)
+						if removed {
+							s.notifyTaskListChanged()
+						}
+					}()
+				}
+			}
+			s.runTaskOnce(id, command, source, false)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cron: invalid expression %q: %w", cronExpr, err)
+		}
+
+		if createdAt.IsZero() {
+			createdAt = time.Now()
+		}
+		t := &Task{
+			ID:        id,
+			CronExpr:  cronExpr,
+			Command:   command,
+			Source:    source,
+			MaxRuns:   maxRuns,
+			CreatedAt: createdAt,
+			EntryID:   entryID,
+		}
+		s.tasks[id] = t
+		logger.Infof("cron: existing task %s scheduled (%s)", id, cronExpr)
+		return t, nil
+	}()
+	if err != nil {
+		return nil, err
 	}
-	t := &Task{
-		ID:        id,
-		CronExpr:  cronExpr,
-		Command:   command,
-		Source:    source,
-		MaxRuns:   maxRuns,
-		CreatedAt: createdAt,
-		EntryID:   entryID,
-	}
-	s.tasks[id] = t
-	logger.Infof("cron: existing task %s scheduled (%s)", id, cronExpr)
+	s.notifyTaskListChanged()
 	return t, nil
 }
 
 func (s *Scheduler) scheduleTask(cronExpr, command, source string, maxRuns int) (*Task, error) {
+	// Validate minimum interval before attempting to schedule
+	if err := ValidateCronExpression(cronExpr); err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 
 	taskID := uuid.New().String()
@@ -420,13 +472,18 @@ func (s *Scheduler) scheduleTask(cronExpr, command, source string, maxRuns int) 
 			if n == int64(maxRuns) {
 				// Last allowed run — remove asynchronously to avoid deadlock.
 				go func() {
+					removed := false
 					s.mu.Lock()
 					if t, ok := s.tasks[taskID]; ok {
 						s.cron.Remove(t.EntryID)
 						delete(s.tasks, taskID)
+						removed = true
 					}
 					s.mu.Unlock()
 					s.removePersistedTask(taskID)
+					if removed {
+						s.notifyTaskListChanged()
+					}
 				}()
 			}
 		}
@@ -452,6 +509,7 @@ func (s *Scheduler) scheduleTask(cronExpr, command, source string, maxRuns int) 
 	s.mu.Unlock()
 
 	s.addPersistedTask(t)
+	s.notifyTaskListChanged()
 	return t, nil
 }
 
@@ -482,6 +540,7 @@ func (s *Scheduler) removeTask(taskID string, persist bool) error {
 	if persist {
 		s.removePersistedTask(taskID)
 	}
+	s.notifyTaskListChanged()
 	return nil
 }
 
@@ -559,4 +618,53 @@ func (s *Scheduler) cleanupOldEventFiles(retentionDays int) error {
 	}
 
 	return err
+}
+
+// ValidateCronExpression validates a cron expression and ensures it doesn't run
+// more frequently than once per minute to prevent resource exhaustion and DoS attacks.
+func ValidateCronExpression(cronExpr string) error {
+	fields := strings.Fields(cronExpr)
+
+	// Normalize 5-field to 6-field
+	if len(fields) == 5 {
+		cronExpr = "0 " + cronExpr
+		fields = strings.Fields(cronExpr)
+	}
+
+	if len(fields) != 6 {
+		return fmt.Errorf("cron: expected 5 or 6 field cron expression, got %d fields", len(fields))
+	}
+
+	secondField := fields[0]
+
+	// Check for expressions that run every second or multiple times per minute
+	// Examples: "* * * * * *", "*/5 * * * * *", "0,30 * * * * *"
+
+	// If seconds field is "*" it runs every second
+	if secondField == "*" {
+		return fmt.Errorf("cron: expression runs every second (too frequent); minimum interval is 1 minute")
+	}
+
+	// Check for second-level intervals like "*/5"
+	if strings.Contains(secondField, "/") {
+		return fmt.Errorf("cron: expression uses second-level intervals (too frequent); minimum interval is 1 minute")
+	}
+
+	// Check for multiple second values like "0,15,30,45"
+	if strings.Contains(secondField, ",") {
+		return fmt.Errorf("cron: expression runs multiple times per minute (too frequent); minimum interval is 1 minute")
+	}
+
+	// Check for second ranges like "0-30"
+	if strings.Contains(secondField, "-") {
+		return fmt.Errorf("cron: expression uses second ranges (too frequent); minimum interval is 1 minute")
+	}
+
+	// Seconds field must be a single fixed value (0-59)
+	// This ensures the task runs at most once per minute at a specific second
+	if _, err := strconv.Atoi(secondField); err != nil {
+		return fmt.Errorf("cron: invalid seconds field %q; must be a single value (0-59)", secondField)
+	}
+
+	return nil
 }

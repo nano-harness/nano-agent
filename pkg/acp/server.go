@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -15,16 +17,17 @@ import (
 
 // Server implements the ACP protocol server
 type Server struct {
-	transport        *Transport
-	registry         *SessionRegistry
-	engine           *engine.Engine
-	config           *config.Config
-	fsMode           FSMode
-	ctx              context.Context
-	cancel           context.CancelFunc
-	permissionBridge *PermissionBridge // Permission bridge for approval requests
-	fsBridge         *FSBridge         // Filesystem bridge for fs/* operations
-	terminalBridge   *TerminalBridge   // Terminal bridge for terminal/* operations
+	transport          *Transport
+	registry           *SessionRegistry
+	engine             *engine.Engine
+	config             *config.Config
+	fsMode             FSMode
+	ctx                context.Context
+	cancel             context.CancelFunc
+	permissionBridge   *PermissionBridge  // Permission bridge for approval requests
+	fsBridge           *FSBridge          // Filesystem bridge for fs/* operations
+	terminalBridge     *TerminalBridge    // Terminal bridge for terminal/* operations
+	clientCapabilities ClientCapabilities // Store client capabilities from initialize
 }
 
 // ServerOptions configures the ACP server
@@ -98,6 +101,11 @@ func (s *Server) Serve() error {
 			continue
 		}
 
+		// If req is nil, it means we received a response (handled by transport)
+		if req == nil {
+			continue
+		}
+
 		// Handle request
 		go s.handleRequest(req)
 	}
@@ -106,30 +114,28 @@ func (s *Server) Serve() error {
 // handleRequest routes and handles a single RPC request
 func (s *Server) handleRequest(req *RPCRequest) {
 	switch req.Method {
+	case "initialize":
+		s.handleInitialize(req)
 	case "session/new":
 		s.handleSessionNew(req)
-	case "session/update":
-		s.handleSessionUpdate(req)
+	case "session/prompt":
+		s.handleSessionPrompt(req)
+	case "session/cancel":
+		s.handleSessionCancel(req)
 	case "session/close":
 		s.handleSessionClose(req)
 	case "session/list":
 		s.handleSessionList(req)
+	case "session/load":
+		s.handleSessionLoad(req)
 	case "session/respond_permission":
 		s.handlePermissionResponse(req)
-	case "fs/read":
+	case "fs/read_text_file":
 		s.handleFSRead(req)
-	case "fs/write":
+	case "fs/write_text_file":
 		s.handleFSWrite(req)
-	case "fs/list":
-		s.handleFSList(req)
-	case "fs/delete":
-		s.handleFSDelete(req)
-	case "terminal/run":
-		s.handleTerminalRun(req)
-	case "terminal/input":
-		s.handleTerminalInput(req)
-	case "terminal/kill":
-		s.handleTerminalKill(req)
+	case "terminal/create":
+		s.handleTerminalCreate(req)
 	default:
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeMethodNotFound, "Method not found", req.Method)
 	}
@@ -137,8 +143,14 @@ func (s *Server) handleRequest(req *RPCRequest) {
 
 // handleSessionNew handles session/new requests
 func (s *Server) handleSessionNew(req *RPCRequest) {
+	// Log raw params for debugging
+	if rawJSON, err := json.Marshal(req.Params); err == nil {
+		logger.Debugf("ACP: session/new raw params: %s", string(rawJSON))
+	}
+
 	var params SessionNewParams
 	if err := unmarshalParams(req.Params, &params); err != nil {
+		logger.Errorf("ACP: Failed to unmarshal session/new params: %v", err)
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
 		return
 	}
@@ -152,8 +164,8 @@ func (s *Server) handleSessionNew(req *RPCRequest) {
 	// Create a new nano session
 	nanoSessionID := s.engine.Agent.StartNewSession()
 
-	// Create ACP session
-	session, err := s.registry.Create(nanoSessionID, cwd, params.Env, params.Capabilities, s.fsMode)
+	// Create ACP session with client capabilities
+	session, err := s.registry.Create(nanoSessionID, cwd, params.Env, params.Capabilities, s.clientCapabilities, s.fsMode)
 	if err != nil {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to create session", err.Error())
 		return
@@ -162,111 +174,30 @@ func (s *Server) handleSessionNew(req *RPCRequest) {
 	// Create permission bridge for this session
 	s.permissionBridge = NewPermissionBridge(session.ACPSessionID, s.transport)
 
+	// Check if client has FS capabilities
+	clientHasFSCaps := s.clientCapabilities.FS != nil &&
+		(s.clientCapabilities.FS.ReadTextFile || s.clientCapabilities.FS.WriteTextFile)
+
+	// Check if client has Terminal capabilities
+	clientHasTermCaps := s.clientCapabilities.Terminal
+
 	// Create filesystem bridge for this session
-	s.fsBridge = NewFSBridge(session.ACPSessionID, s.transport, cwd)
+	s.fsBridge = NewFSBridge(session.ACPSessionID, s.transport, cwd, s.fsMode, clientHasFSCaps)
 
 	// Create terminal bridge for this session
-	s.terminalBridge = NewTerminalBridge(session.ACPSessionID, s.transport)
+	s.terminalBridge = NewTerminalBridge(session.ACPSessionID, s.transport, clientHasTermCaps)
 
 	// Prepare response with server capabilities
 	result := SessionNewResult{
 		SessionID: session.ACPSessionID,
-		Capabilities: SessionCapabilities{
-			FS: &FSCapabilities{
-				Read:   true,
-				Write:  true,
-				List:   true,
-				Delete: true,
-			},
-			Terminal: &TerminalCapabilities{
-				Run:    true,
-				Input:  true,
-				Output: true,
-				Kill:   true,
-			},
-			Tools:  s.getToolList(),
-			Swarm:  false, // TODO: Support swarm mode with flag
-			Resume: true,
-			Close:  true,
-			List:   true,
-		},
 	}
 
 	_ = s.transport.SendSuccessResponse(req.ID, result)
-	logger.Infof("ACP: Session created: %s (nano: %s, cwd: %s)", session.ACPSessionID, nanoSessionID, cwd)
-}
+	logger.Infof("ACP: Session created: %s (nano: %s, cwd: %s, fs mode: %s, client fs caps: %v, client term caps: %v)",
+		session.ACPSessionID, nanoSessionID, cwd, s.fsMode, clientHasFSCaps, clientHasTermCaps)
 
-// handleSessionUpdate handles session/update requests
-func (s *Server) handleSessionUpdate(req *RPCRequest) {
-	var params SessionUpdateParams
-	if err := unmarshalParams(req.Params, &params); err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
-		return
-	}
-
-	// Get session
-	session, ok := s.registry.Get(params.SessionID)
-	if !ok {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
-		return
-	}
-
-	// Create event bridge for this session
-	bridge := NewEventBridge(session.ACPSessionID, s.transport)
-
-	// Create context for this request
-	ctx, cancel := context.WithCancel(s.ctx)
-	s.registry.SetCancel(session.ACPSessionID, cancel)
-	defer cancel()
-
-	// Set the active session
-	s.engine.Agent.SetActiveSessionID(session.NanoSessionID)
-
-	// Set up approval handler using permission bridge if available
-	if s.permissionBridge != nil {
-		s.engine.Agent.SetApprovalHandler(func(info *agent.ToolCallInfo) bool {
-			approved, err := s.permissionBridge.RequestApproval(ctx, info)
-			if err != nil {
-				logger.Errorf("ACP: Permission request error: %v", err)
-				return false
-			}
-			return approved
-		})
-	}
-
-	// Process the message
-	err := s.engine.Agent.ProcessStreamWithMultimodal(
-		ctx,
-		params.Message.Content,
-		nil, // TODO: Convert images if provided
-		bridge.OnStreamEvent,
-	)
-
-	if err != nil {
-		// Send error event
-		_ = s.transport.SendNotification("session/update", map[string]interface{}{
-			"sessionId": session.ACPSessionID,
-			"event": SessionUpdateEvent{
-				Type:  "error",
-				Error: err.Error(),
-			},
-		})
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Session update failed", err.Error())
-		return
-	}
-
-	// Send done event
-	_ = s.transport.SendNotification("session/update", map[string]interface{}{
-		"sessionId": session.ACPSessionID,
-		"event": SessionUpdateEvent{
-			Type: "done",
-		},
-	})
-
-	// Send success response
-	_ = s.transport.SendSuccessResponse(req.ID, map[string]interface{}{
-		"success": true,
-	})
+	// Advertise available slash commands to the client
+	go s.advertiseSlashCommands(session.ACPSessionID, cwd)
 }
 
 // handleSessionClose handles session/close requests
@@ -374,7 +305,7 @@ func (s *Server) handlePermissionResponse(req *RPCRequest) {
 	})
 }
 
-// handleFSRead handles fs/read requests
+// handleFSRead handles fs/read_text_file requests
 func (s *Server) handleFSRead(req *RPCRequest) {
 	var params struct {
 		SessionID string `json:"sessionId"`
@@ -386,19 +317,20 @@ func (s *Server) handleFSRead(req *RPCRequest) {
 		return
 	}
 
-	// Verify session exists
-	if _, ok := s.registry.Get(params.SessionID); !ok {
+	// Get session to verify it exists
+	_, ok := s.registry.Get(params.SessionID)
+	if !ok {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
 		return
 	}
 
+	// Use FSBridge to read file
 	if s.fsBridge == nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Filesystem bridge not initialized", nil)
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "FS bridge not initialized", "")
 		return
 	}
 
-	// Read file
-	content, err := s.fsBridge.ReadFile(context.Background(), params.Path)
+	content, err := s.fsBridge.ReadFile(s.ctx, params.Path)
 	if err != nil {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to read file", err.Error())
 		return
@@ -409,7 +341,7 @@ func (s *Server) handleFSRead(req *RPCRequest) {
 	})
 }
 
-// handleFSWrite handles fs/write requests
+// handleFSWrite handles fs/write_text_file requests
 func (s *Server) handleFSWrite(req *RPCRequest) {
 	var params struct {
 		SessionID string `json:"sessionId"`
@@ -422,19 +354,20 @@ func (s *Server) handleFSWrite(req *RPCRequest) {
 		return
 	}
 
-	// Verify session exists
-	if _, ok := s.registry.Get(params.SessionID); !ok {
+	// Get session to verify it exists
+	_, ok := s.registry.Get(params.SessionID)
+	if !ok {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
 		return
 	}
 
+	// Use FSBridge to write file
 	if s.fsBridge == nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Filesystem bridge not initialized", nil)
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "FS bridge not initialized", "")
 		return
 	}
 
-	// Write file
-	err := s.fsBridge.WriteFile(context.Background(), params.Path, params.Content)
+	err := s.fsBridge.WriteFile(s.ctx, params.Path, params.Content)
 	if err != nil {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to write file", err.Error())
 		return
@@ -445,78 +378,8 @@ func (s *Server) handleFSWrite(req *RPCRequest) {
 	})
 }
 
-// handleFSList handles fs/list requests
-func (s *Server) handleFSList(req *RPCRequest) {
-	var params struct {
-		SessionID string `json:"sessionId"`
-		Path      string `json:"path"`
-	}
-
-	if err := unmarshalParams(req.Params, &params); err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
-		return
-	}
-
-	// Verify session exists
-	if _, ok := s.registry.Get(params.SessionID); !ok {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
-		return
-	}
-
-	if s.fsBridge == nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Filesystem bridge not initialized", nil)
-		return
-	}
-
-	// List files
-	entries, err := s.fsBridge.ListFiles(context.Background(), params.Path)
-	if err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to list files", err.Error())
-		return
-	}
-
-	_ = s.transport.SendSuccessResponse(req.ID, map[string]interface{}{
-		"entries": entries,
-	})
-}
-
-// handleFSDelete handles fs/delete requests
-func (s *Server) handleFSDelete(req *RPCRequest) {
-	var params struct {
-		SessionID string `json:"sessionId"`
-		Path      string `json:"path"`
-	}
-
-	if err := unmarshalParams(req.Params, &params); err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
-		return
-	}
-
-	// Verify session exists
-	if _, ok := s.registry.Get(params.SessionID); !ok {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
-		return
-	}
-
-	if s.fsBridge == nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Filesystem bridge not initialized", nil)
-		return
-	}
-
-	// Delete file
-	err := s.fsBridge.DeleteFile(context.Background(), params.Path)
-	if err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to delete file", err.Error())
-		return
-	}
-
-	_ = s.transport.SendSuccessResponse(req.ID, map[string]interface{}{
-		"success": true,
-	})
-}
-
-// handleTerminalRun handles terminal/run requests
-func (s *Server) handleTerminalRun(req *RPCRequest) {
+// handleTerminalCreate handles terminal/create requests
+func (s *Server) handleTerminalCreate(req *RPCRequest) {
 	var params struct {
 		SessionID string            `json:"sessionId"`
 		Command   string            `json:"command"`
@@ -529,98 +392,218 @@ func (s *Server) handleTerminalRun(req *RPCRequest) {
 		return
 	}
 
-	// Verify session exists
-	if _, ok := s.registry.Get(params.SessionID); !ok {
+	// Get session to verify it exists
+	_, ok := s.registry.Get(params.SessionID)
+	if !ok {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
 		return
 	}
 
+	// Use TerminalBridge to create terminal
 	if s.terminalBridge == nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Terminal bridge not initialized", nil)
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Terminal bridge not initialized", "")
 		return
 	}
 
-	// Run command
-	processID, err := s.terminalBridge.Run(context.Background(), params.Command, params.CWD, params.Env)
-	if err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to run command", err.Error())
-		return
+	// For local mode, we should execute the command locally and return a terminal ID
+	// Generate a unique terminal ID based on the RPC request ID
+	var terminalID string
+	switch v := req.ID.(type) {
+	case float64:
+		terminalID = fmt.Sprintf("term-%d", int(v))
+	case int:
+		terminalID = fmt.Sprintf("term-%d", v)
+	case string:
+		terminalID = fmt.Sprintf("term-%s", v)
+	default:
+		terminalID = fmt.Sprintf("term-%v", v)
 	}
 
+	// For now, just return success with a terminal ID
+	// The actual command execution would need to be implemented with proper process management
 	_ = s.transport.SendSuccessResponse(req.ID, map[string]interface{}{
-		"processId": processID,
+		"terminalId": terminalID,
 	})
+
+	// Simulate command execution and send output/exit notifications
+	go func() {
+		// Execute the command using a shell
+		// Parse the command properly - if it contains shell syntax like '>' redirection,
+		// we need to use sh -c
+		var cmd *exec.Cmd
+		if strings.Contains(params.Command, ">") || strings.Contains(params.Command, "|") {
+			cmd = exec.CommandContext(s.ctx, "sh", "-c", params.Command)
+		} else {
+			cmdParts := strings.Fields(params.Command)
+			if len(cmdParts) == 0 {
+				return
+			}
+			cmd = exec.CommandContext(s.ctx, cmdParts[0], cmdParts[1:]...)
+		}
+		if params.CWD != "" {
+			cmd.Dir = params.CWD
+		}
+
+		output, err := cmd.CombinedOutput()
+
+		// Send output notification
+		if len(output) > 0 {
+			_ = s.transport.SendNotification("terminal/output", map[string]interface{}{
+				"terminalId": terminalID,
+				"data":       string(output),
+			})
+		}
+
+		// Send exit notification
+		exitCode := 0
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = 1
+			}
+		}
+
+		_ = s.transport.SendNotification("terminal/exit", map[string]interface{}{
+			"terminalId": terminalID,
+			"exitCode":   exitCode,
+		})
+	}()
 }
 
-// handleTerminalInput handles terminal/input requests
-func (s *Server) handleTerminalInput(req *RPCRequest) {
-	var params struct {
-		SessionID string `json:"sessionId"`
-		ProcessID string `json:"processId"`
-		Data      string `json:"data"`
+// handleSessionPrompt handles session/prompt requests
+func (s *Server) handleSessionPrompt(req *RPCRequest) {
+	var params SessionPromptParams
+	if err := unmarshalParams(req.Params, &params); err != nil {
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
+		return
 	}
 
+	// Get session
+	session, ok := s.registry.Get(params.SessionID)
+	if !ok {
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
+		return
+	}
+
+	// Process all ContentBlock types
+	textContent, images, err := s.processContentBlocks(params.Prompt, session.CWD)
+	if err != nil {
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Failed to process content blocks", err.Error())
+		return
+	}
+
+	// Create event bridge for this session
+	bridge := NewEventBridge(session.ACPSessionID, s.transport)
+
+	// Check if the input is a slash command
+	if strings.HasPrefix(strings.TrimSpace(textContent), "/") {
+		if handled := s.handleSlashCommand(session, textContent, bridge); handled {
+			result := SessionPromptResult{StopReason: "end_turn"}
+			_ = s.transport.SendSuccessResponse(req.ID, result)
+			return
+		}
+	}
+
+	// Create context for this request
+	ctx, cancel := context.WithCancel(s.ctx)
+	s.registry.SetCancel(session.ACPSessionID, cancel)
+	defer cancel()
+
+	// Set the active session
+	s.engine.Agent.SetActiveSessionID(session.NanoSessionID)
+
+	// Set up approval handler V2 using permission bridge if available
+	if s.permissionBridge != nil {
+		s.engine.Agent.SetApprovalHandlerV2(func(info *agent.ToolCallInfo) agent.ApprovalDecision {
+			decision, err := s.permissionBridge.RequestApprovalV2(ctx, info)
+			if err != nil {
+				logger.Errorf("ACP: Permission request error: %v", err)
+				return agent.ApprovalReject
+			}
+			return decision
+		})
+	}
+
+	// Process the message
+	err = s.engine.Agent.ProcessStreamWithMultimodal(
+		ctx,
+		textContent,
+		images,
+		bridge.OnStreamEvent,
+	)
+
+	if err != nil {
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Session prompt failed", err.Error())
+		return
+	}
+
+	// Send success response with stop reason
+	result := SessionPromptResult{
+		StopReason: "end_turn",
+	}
+	_ = s.transport.SendSuccessResponse(req.ID, result)
+}
+
+// handleSessionCancel handles session/cancel notification
+func (s *Server) handleSessionCancel(req *RPCRequest) {
+	var params SessionCancelParams
+	if err := unmarshalParams(req.Params, &params); err != nil {
+		logger.Errorf("ACP: Invalid session/cancel params: %v", err)
+		return
+	}
+
+	// Get session cancel function
+	cancel := s.registry.GetCancel(params.SessionID)
+	if cancel != nil {
+		logger.Infof("ACP: Cancelling session: %s", params.SessionID)
+		cancel()
+	} else {
+		logger.Warnf("ACP: No active cancel function for session: %s", params.SessionID)
+	}
+
+	// No response for notification
+}
+
+// handleSessionLoad handles session/load requests
+func (s *Server) handleSessionLoad(req *RPCRequest) {
+	var params struct {
+		SessionID string `json:"sessionId"`
+	}
 	if err := unmarshalParams(req.Params, &params); err != nil {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
 		return
 	}
 
 	// Verify session exists
-	if _, ok := s.registry.Get(params.SessionID); !ok {
+	session, ok := s.registry.Get(params.SessionID)
+	if !ok {
 		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
 		return
 	}
 
-	if s.terminalBridge == nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Terminal bridge not initialized", nil)
+	// Load session history from nano session
+	nanoSession, ok := s.engine.Agent.GetSessionManager().GetSession(session.NanoSessionID)
+	if !ok {
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to load session history", nil)
 		return
 	}
 
-	// Send input to process
-	err := s.terminalBridge.Input(context.Background(), params.ProcessID, params.Data)
-	if err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to send input", err.Error())
-		return
+	// Convert nano session history to ACP format
+	messages := make([]map[string]interface{}, 0)
+	for _, msg := range nanoSession.ConversationHistory {
+		messages = append(messages, map[string]interface{}{
+			"role":    msg.Role,
+			"content": msg.Content,
+		})
 	}
 
-	_ = s.transport.SendSuccessResponse(req.ID, map[string]interface{}{
-		"success": true,
-	})
-}
-
-// handleTerminalKill handles terminal/kill requests
-func (s *Server) handleTerminalKill(req *RPCRequest) {
-	var params struct {
-		SessionID string `json:"sessionId"`
-		ProcessID string `json:"processId"`
+	result := map[string]interface{}{
+		"sessionId": session.ACPSessionID,
+		"messages":  messages,
 	}
 
-	if err := unmarshalParams(req.Params, &params); err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
-		return
-	}
-
-	// Verify session exists
-	if _, ok := s.registry.Get(params.SessionID); !ok {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeSessionNotFound, "Session not found", params.SessionID)
-		return
-	}
-
-	if s.terminalBridge == nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Terminal bridge not initialized", nil)
-		return
-	}
-
-	// Kill process
-	err := s.terminalBridge.Kill(context.Background(), params.ProcessID)
-	if err != nil {
-		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInternalError, "Failed to kill process", err.Error())
-		return
-	}
-
-	_ = s.transport.SendSuccessResponse(req.ID, map[string]interface{}{
-		"success": true,
-	})
+	_ = s.transport.SendSuccessResponse(req.ID, result)
 }
 
 // unmarshalParams unmarshals RPC params into a target struct
@@ -640,4 +623,80 @@ func unmarshalParams(params interface{}, target interface{}) error {
 	}
 
 	return nil
+}
+
+// handleInitialize handles the initialize method
+func (s *Server) handleInitialize(req *RPCRequest) {
+	var params InitializeParams
+	if err := unmarshalParams(req.Params, &params); err != nil {
+		_ = s.transport.SendErrorResponse(req.ID, ErrCodeInvalidParams, "Invalid params", err.Error())
+		return
+	}
+
+	// Store client capabilities for later use
+	s.clientCapabilities = params.ClientCapabilities
+
+	// Version negotiation: if client version is higher than server supports, return server version
+	protocolVersion := params.ProtocolVersion
+	if protocolVersion > ProtocolVersion {
+		protocolVersion = ProtocolVersion
+	}
+
+	// Check if client supports the negotiated version
+	if protocolVersion < params.ProtocolVersion && params.ProtocolVersion > ProtocolVersion {
+		logger.Warnf("ACP: Client requested protocol version %d, but server only supports up to %d",
+			params.ProtocolVersion, ProtocolVersion)
+	}
+
+	result := InitializeResult{
+		ProtocolVersion: protocolVersion,
+		AgentCapabilities: AgentCapabilities{
+			LoadSession: true,
+			PromptCapabilities: PromptCapabilities{
+				Image:           true,
+				Audio:           true,
+				EmbeddedContext: true,
+			},
+			MCP: MCPCapabilities{
+				HTTP: true,
+				SSE:  true,
+			},
+			SessionCapabilities: &SessionCapabilities{
+				Resume: emptyObj,
+				Close:  emptyObj,
+				List:   emptyObj,
+			},
+			FS: &FSCapabilities{
+				ReadTextFile:  true,
+				WriteTextFile: true,
+			},
+			Terminal: &TerminalCapabilities{
+				Create:      true,
+				Output:      true,
+				Release:     true,
+				WaitForExit: true,
+				Kill:        true,
+			},
+			Tools: s.getToolList(),
+		},
+		AgentInfo: AgentInfo{
+			Name:    "nano-agent",
+			Title:   "Nano Agent",
+			Version: "1.0.0",
+		},
+		AuthMethods: []AuthMethod{
+			{
+				ID:          "terminal-setup",
+				Name:        "Run setup in terminal",
+				Description: "Configure NANO_API_KEY and provider settings interactively",
+				Type:        "terminal",
+				Args:        []string{"acp", "setup"},
+			},
+		},
+	}
+
+	_ = s.transport.SendSuccessResponse(req.ID, result)
+	logger.Infof("ACP: Initialized with protocol version %d, client: %s %s (fs caps: %v, terminal: %v)",
+		protocolVersion, params.ClientInfo.Name, params.ClientInfo.Version,
+		params.ClientCapabilities.FS != nil, params.ClientCapabilities.Terminal)
 }

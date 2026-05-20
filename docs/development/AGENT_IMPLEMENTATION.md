@@ -168,7 +168,7 @@ PR 12 的配置化 multi-agent 入口使用项目目录下的 `.nano/agents`：
 
 - `pkg/agentprofile` 负责发现 `.nano/agents/*.yaml|*.yml|*.json|*.md`。
 - profile 字段包括 `name`、`description`、`initial_prompt`、`permission_mode`、`allowed_tools`、`model`、`kind`、`color`。
-- `@agent-name <task>` 会在 turn preprocessor 中被改写为一次 `spawn_teammate` 调用指引。
+- `@agent-name <task>` 已弃用：自定义 agent profile 现在通过 `/agent-name <task>` 触发（dispatcher 会改写为 `spawn_teammate` 调用指引）。
 - `spawn_teammate` 会读取同名 profile，缺省填充 `initial_prompt`、`permission_mode`、`kind` 与 `color`。
 - teammate runner 会复制父配置并为子 agent 单独设置 profile 中声明的 permission mode，避免修改父 agent 权限。
 

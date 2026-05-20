@@ -55,15 +55,16 @@ type CompactionMarker struct {
 
 // SessionIndexEntry represents metadata for a single session in sessions-index.json
 type SessionIndexEntry struct {
-	ID                string `json:"id"`
-	Summary           string `json:"summary,omitempty"` // First user message or AI-generated summary
-	MessageCount      int    `json:"message_count"`
-	CreatedAt         int64  `json:"created_at"`  // Unix timestamp
-	ModifiedAt        int64  `json:"modified_at"` // Unix timestamp
-	WorkingDir        string `json:"working_dir"` // Project working directory
-	LastSeq           int64  `json:"last_seq,omitempty"`
-	LastCompactionSeq int64  `json:"last_compaction_seq,omitempty"`
-	State             string `json:"state,omitempty"`
+	ID                string     `json:"id"`
+	Summary           string     `json:"summary,omitempty"` // First user message or AI-generated summary
+	MessageCount      int        `json:"message_count"`
+	CreatedAt         int64      `json:"created_at"`  // Unix timestamp
+	ModifiedAt        int64      `json:"modified_at"` // Unix timestamp
+	WorkingDir        string     `json:"working_dir"` // Project working directory
+	LastSeq           int64      `json:"last_seq,omitempty"`
+	LastCompactionSeq int64      `json:"last_compaction_seq,omitempty"`
+	State             string     `json:"state,omitempty"`
+	Goal              *GoalState `json:"goal,omitempty"`
 }
 
 // SessionEventsToMessages converts a slice of SessionEvent to llm.Message slice

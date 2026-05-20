@@ -142,7 +142,7 @@ color: "#00ff00"
 Migration rule:
 
 - Existing static sub-agent config remains supported.
-- Add `.nano/agents/<name>.yaml` only when a project wants explicit `@agent-name` invocation or reusable teammate defaults.
+- Add `.nano/agents/<name>.yaml` only when a project wants explicit `/agent-name` slash command invocation or reusable teammate defaults.
 - `initial_prompt` is optional for `spawn_teammate` when the matching AgentProfile provides it.
 - `permission_mode`, `allowed_tools`, `model`, and `context_providers` are applied to the spawned teammate independently of the parent agent.
 

@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/nano-harness/nano-agent/pkg/attachment"
+	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
 )
@@ -44,16 +46,31 @@ func (f *Factory) Create(mode Mode) (Adapter, error) {
 // ─── Bubble Tea adapter ──────────────────────────────────────────────────────
 
 func (f *Factory) newBubbleTeaAdapter() *BubbleTeaAdapter {
+	// Initialize attachment manager
+	attachMgr, err := attachment.NewManager(f.cfg.WorkingDir)
+	if err != nil {
+		logger.Warnf("Failed to create attachment manager: %v", err)
+		attachMgr = nil // Continue without attachment support
+	}
+
 	var model tea.Model
 	if f.cfg.UseFullscreen {
-		model = bubbletea.NewFullscreenModel(f.cfg.WorkingDir, f.cfg.APIBaseURL)
+		fm := bubbletea.NewFullscreenModel(f.cfg.WorkingDir, f.cfg.APIBaseURL)
+		if attachMgr != nil {
+			fm.SetAttachmentManager(attachMgr)
+		}
+		model = fm
 	} else {
-		model = bubbletea.New(nil, nil, f.cfg.APIBaseURL, f.cfg.WorkingDir)
+		m := bubbletea.New(nil, nil, f.cfg.APIBaseURL, f.cfg.WorkingDir)
+		if attachMgr != nil {
+			m.SetAttachmentManager(attachMgr)
+		}
+		model = m
 	}
 	return &BubbleTeaAdapter{
 		model:      model,
 		sendCh:     make(chan tea.Msg, 1024),
-		showBanner: f.cfg.ShowBanner && !f.cfg.UseFullscreen, // No banner in fullscreen mode
+		showBanner: f.cfg.ShowBanner,
 	}
 }
 

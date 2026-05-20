@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
@@ -17,6 +18,9 @@ type TViewAdapter struct {
 // Run starts the tview event loop and blocks until exit.
 func (a *TViewAdapter) Run(ctx context.Context, src eventsource.EventSource) error {
 	a.integration.BindOutbound(src.Send)
+	if provider, ok := src.(interface{ GoalHandler() func(string) string }); ok {
+		a.integration.SetGoalHandler(provider.GoalHandler())
+	}
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if err := src.Start(childCtx); err != nil {
@@ -86,6 +90,12 @@ func (a *TViewAdapter) sendEvent(e event.StreamEvent) {
 		}
 	case event.EventTypeMailboxSent:
 		a.integration.UpdateSwarmRoster(e.Content)
+	case event.EventTypeWarning:
+		if strings.HasPrefix(e.Content, "✅ /goal achieved:") ||
+			strings.HasPrefix(e.Content, "/goal max turns reached:") {
+			a.integration.SetGoalActive(false)
+		}
+		a.integration.AddMessage("system", e.Content)
 	}
 }
 

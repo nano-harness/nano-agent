@@ -16,6 +16,7 @@ type Options struct {
 	Colorize    bool            // false degrades to static last frame
 	MaxDuration time.Duration   // safety valve, default 3.5s
 	SkipCh      <-chan struct{} // optional: external skip notification
+	IconMode    IconMode        // "" = default atom, "tea", "milktea"
 }
 
 // Play synchronously plays the banner, until completion / timeout / SkipCh.
@@ -25,6 +26,7 @@ func Play(w io.Writer, opts Options) error {
 	if err != nil {
 		return err
 	}
+	applyIconMode(frames, opts.IconMode)
 	if opts.Theme == nil {
 		opts.Theme = DefaultTheme
 	}
@@ -49,8 +51,7 @@ func Play(w io.Writer, opts Options) error {
 	for i, f := range frames {
 		// After first frame, move cursor up N lines back to banner top, then clear to screen end
 		if i > 0 {
-			lines := countLines(frames[i-1].Content)
-			fmt.Fprintf(w, "\x1b[%dA\x1b[J", lines)
+			clearRenderedFrame(w, frames[i-1].Content)
 		}
 		fmt.Fprintln(w, RenderFrame(f, opts.Theme, true))
 
@@ -61,6 +62,13 @@ func Play(w io.Writer, opts Options) error {
 			return nil
 		case <-time.After(f.Duration):
 		}
+	}
+	// Clear the last frame from the terminal so the Bubble Tea View()
+	// can take over rendering the static banner without duplication.
+	// Keep the guard so an empty frame set exits cleanly if LoadFrames ever
+	// returns one.
+	if len(frames) > 0 {
+		clearRenderedFrame(w, frames[len(frames)-1].Content)
 	}
 	return nil
 }
@@ -81,4 +89,12 @@ func countLines(s string) int {
 		}
 	}
 	return n
+}
+
+func clearRenderedFrame(w io.Writer, content string) {
+	fmt.Fprint(w, clearFrameSequence(content))
+}
+
+func clearFrameSequence(content string) string {
+	return fmt.Sprintf("\x1b[%dA\x1b[J", countLines(content))
 }

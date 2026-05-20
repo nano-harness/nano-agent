@@ -15,18 +15,19 @@ func TestBubbleTeaAdapter_AttachCronTrackerBridgesOnChangeToProgram(t *testing.T
 		sendCh:  make(chan tea.Msg, 4),
 	}
 	tracker := NewCronStatusTracker()
+	tracker.SetScheduledCountFn(func() int { return 1 })
 	adapter.AttachCronTracker(tracker)
 
 	tracker.Handle(cronStarted("task-a"))
 	msg := readTeaMsg(t, adapter.sendCh).(bt.CronStatusMsg)
-	if msg.Indicator != "⏰ 1 running" {
+	if msg.Indicator != "⏰ 1 scheduled, 1 running" {
 		t.Fatalf("Indicator = %q", msg.Indicator)
 	}
 
 	tracker.Handle(cronFinished("task-a"))
 	msg = readTeaMsg(t, adapter.sendCh).(bt.CronStatusMsg)
-	if msg.Indicator != "" {
-		t.Fatalf("Indicator = %q, want empty", msg.Indicator)
+	if msg.Indicator != "⏰ 1 scheduled" {
+		t.Fatalf("Indicator = %q", msg.Indicator)
 	}
 }
 
@@ -58,5 +59,25 @@ func readTeaMsg(t *testing.T, ch <-chan tea.Msg) tea.Msg {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for tea message")
 		return nil
+	}
+}
+
+// TestBubbleTeaAdapter_ForwardsCapabilitiesToFullscreenModel verifies that
+// `SetPermissionManager`, `SetNewSessionHandler` and `SetModelLister` are
+// forwarded to the fullscreen model so milktea (--milktea) gets the same
+// capabilities (Shift+Tab permission cycling, Ctrl+L new session, /models
+// completion) that the inline tea mode already enjoys.
+func TestBubbleTeaAdapter_ForwardsCapabilitiesToFullscreenModel(t *testing.T) {
+	fs := bt.NewFullscreenModel("", "")
+	adapter := &BubbleTeaAdapter{model: fs}
+
+	adapter.SetNewSessionHandler(func() string { return "session-1" })
+	if fs.NewSessionHandler() == nil {
+		t.Fatal("SetNewSessionHandler was not forwarded to FullscreenModel")
+	}
+
+	adapter.SetModelLister(func() string { return "gpt-4 gpt-5" })
+	if fs.ModelLister() == nil {
+		t.Fatal("SetModelLister was not forwarded to FullscreenModel")
 	}
 }

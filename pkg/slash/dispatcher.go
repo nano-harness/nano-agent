@@ -4,13 +4,24 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nano-harness/nano-agent/pkg/agentprofile"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 )
 
 // Result is returned by LocalDispatcher to indicate how a slash command was
-// handled. Handled=false means the dispatcher did not recognize the command
-// and the caller should fall through to its existing slash-command pipeline
-// (backend forwarding, permission handler, etc.).
+// handled.
+//
+// Possible outcomes:
+//
+//   - Handled=true: the command was fully processed locally; the caller
+//     should only render Message to the user.
+//   - ShouldSubmit=true: the dispatcher rewrote a slash command (e.g.
+//     "/reviewer ...") into an instruction that should be submitted to the
+//     LLM via SubmitInput. Callers that cannot submit on the user's behalf
+//     should display an error rather than silently dropping the request.
+//   - Both false: the input is not a locally-handled slash command and the
+//     caller should fall through to its existing pipeline (or send the raw
+//     input as-is).
 type Result struct {
 	Handled bool
 	// Message is a single block of text to display to the user. It may be
@@ -20,6 +31,13 @@ type Result struct {
 	// Level provides a hint to the UI about how to render Message. Allowed
 	// values: "info", "success", "warning", "error".
 	Level string
+	// ShouldSubmit indicates the dispatcher rewrote the input and the caller
+	// should send SubmitInput to the agent/LLM in place of the original
+	// input. Mutually exclusive with Handled.
+	ShouldSubmit bool
+	// SubmitInput is the rewritten input to submit when ShouldSubmit is
+	// true. Empty when ShouldSubmit is false.
+	SubmitInput string
 }
 
 // CheckpointManager abstracts the checkpoint subsystem so the dispatcher can
@@ -68,6 +86,8 @@ type LocalDispatcher struct {
 	routinesRemover      func(string) string
 	routinesPauser       func(string) string
 	routinesResumer      func(string) string
+	routinesRunner       func(string) string
+	goalHandler          func(string) string
 }
 
 // NewLocalDispatcher constructs a LocalDispatcher with the given team name
@@ -173,6 +193,16 @@ func (d *LocalDispatcher) WithRoutinesResumer(f func(string) string) *LocalDispa
 	return d
 }
 
+func (d *LocalDispatcher) WithRoutinesRunner(f func(string) string) *LocalDispatcher {
+	d.routinesRunner = f
+	return d
+}
+
+func (d *LocalDispatcher) WithGoalHandler(f func(string) string) *LocalDispatcher {
+	d.goalHandler = f
+	return d
+}
+
 // Dispatch attempts to handle the given raw slash input locally. It returns
 // Result{Handled:false} when the input is not one of the locally-handled
 // commands, in which case the caller should continue with its existing
@@ -194,6 +224,8 @@ func (d *LocalDispatcher) Dispatch(raw string) Result {
 	lowerHead := strings.ToLower(head)
 
 	switch {
+	case lowerHead == "/help":
+		return d.handleHelp()
 	case lowerHead == "/checkpoint":
 		return d.handleCheckpoint(args)
 	case lowerHead == "/checkpoints":
@@ -212,6 +244,8 @@ func (d *LocalDispatcher) Dispatch(raw string) Result {
 		return d.handleModelDoctor(strings.TrimSpace(strings.TrimPrefix(args, "doctor")))
 	case lowerHead == "/context" && args == "status":
 		return d.handleContextStatus()
+	case lowerHead == "/goal":
+		return d.handleGoal(args)
 	case lowerHead == "/doctor":
 		return d.handleDoctor()
 	case lowerHead == "/events":
@@ -228,7 +262,64 @@ func (d *LocalDispatcher) Dispatch(raw string) Result {
 	case strings.HasPrefix(lowerHead, "/opsx:"):
 		return d.handleOpsx(lowerHead, args)
 	}
+
+	// Agent profile slash commands ("/reviewer prompt"). Only commands the
+	// registry exposes with Source="agent-profile" are rewritten: this
+	// preserves the built-in > custom command > agent profile priority
+	// because conflicting profile names are skipped at registration time.
+	cmdName := strings.TrimPrefix(head, "/")
+	if cmd, ok := d.registry.Find(cmdName); ok && cmd.Source == "agent-profile" {
+		profile, found := agentprofile.NewManager(d.cwd).Find(cmd.Name)
+		if found && isValidAgentSlashName(profile.Name) {
+			return Result{
+				ShouldSubmit: true,
+				SubmitInput:  rewriteAgentFromProfile(profile, args),
+			}
+		}
+	}
 	return Result{}
+}
+
+func (d *LocalDispatcher) handleHelp() Result {
+	msg := "可用快捷键与命令：\n" +
+		"\n" +
+		"键盘快捷键：\n" +
+		"  Enter           发送消息\n" +
+		"  Shift+Enter / Ctrl+J  换行\n" +
+		"  Ctrl+T          切换思考块展开/收起\n" +
+		"  Ctrl+Y          复制最近一次助手回复\n" +
+		"  Ctrl+L          开始新会话\n" +
+		"  Ctrl+Z          取消当前任务\n" +
+		"  Ctrl+P          打开命令面板\n" +
+		"  Ctrl+R          搜索输入历史\n" +
+		"  Ctrl+F          搜索 / 转储历史到 scrollback\n" +
+		"  [               转储历史到 scrollback (输入为空时)\n" +
+		"  PgUp/PgDn       翻页滚动消息\n" +
+		"  Tab             自动补全\n" +
+		"  Shift+Tab       切换权限模式\n" +
+		"  Ctrl+C          退出 (空闲时) / 取消 (任务中)\n" +
+		"\n" +
+		"常用斜杠命令：\n" +
+		"  /help                       显示此帮助\n" +
+		"  /models, /model status      模型列表与当前状态\n" +
+		"  /model use <provider/id>    切换模型 (重启 TUI 生效)\n" +
+		"  /context status             查看上下文窗口占用\n" +
+		"  /doctor                     诊断当前会话\n" +
+		"  /checkpoint [reason]        创建一个会话快照\n" +
+		"  /checkpoints, /restore <id> 列出 / 恢复快照\n" +
+		"  /goal <text>                设置目标 / 工作流入口\n" +
+		"  /events, /audit             查询事件与审计日志\n" +
+		"  /skill:list                 列出已加载的 skill\n" +
+		"  /routines [list|status|...]  管理定时 routine\n" +
+		"  /agents, /teammates         团队/智能体管理"
+	return Result{Handled: true, Level: "info", Message: msg}
+}
+
+func (d *LocalDispatcher) handleGoal(args string) Result {
+	if d.goalHandler == nil {
+		return Result{Handled: true, Level: "warning", Message: "⚠️ /goal is not available in this client."}
+	}
+	return Result{Handled: true, Level: "info", Message: d.goalHandler(args)}
 }
 
 func (d *LocalDispatcher) handleAgents(input string) Result {
@@ -430,6 +521,8 @@ func (d *LocalDispatcher) handleRoutines(args string) Result {
 		return d.handleRoutineMutation("pause", strings.TrimSpace(strings.TrimPrefix(args, parts[0])), d.routinesPauser)
 	case "resume":
 		return d.handleRoutineMutation("resume", strings.TrimSpace(strings.TrimPrefix(args, parts[0])), d.routinesResumer)
+	case "run":
+		return d.handleRoutineMutation("run", strings.TrimSpace(strings.TrimPrefix(args, parts[0])), d.routinesRunner)
 	}
 	return Result{Handled: true, Level: "error",
 		Message: fmt.Sprintf("❌ 未知 routines 子命令：%s", sub)}

@@ -75,6 +75,13 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      - name: Package skill documents
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          chmod +x scripts/package-skills.sh
+          bash scripts/package-skills.sh
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -87,6 +94,8 @@ jobs:
             dist/nano-darwin-amd64.sha256
             dist/nano-darwin-arm64
             dist/nano-darwin-arm64.sha256
+            dist/nano-skills-${{ github.ref_name }}.tar.gz
+            dist/nano-skills-${{ github.ref_name }}.tar.gz.sha256
           generate_release_notes: true
 
       - name: Setup ossutil
@@ -109,6 +118,8 @@ jobs:
           ossutil cp dist/nano-darwin-amd64.sha256 oss://binary-releases/nano/releases/${TAG}/nano-darwin-amd64.sha256 --force --region cn-hangzhou
           ossutil cp dist/nano-darwin-arm64        oss://binary-releases/nano/releases/${TAG}/nano-darwin-arm64        --force --region cn-hangzhou
           ossutil cp dist/nano-darwin-arm64.sha256 oss://binary-releases/nano/releases/${TAG}/nano-darwin-arm64.sha256 --force --region cn-hangzhou
+          ossutil cp dist/nano-skills-${TAG}.tar.gz         oss://binary-releases/nano/releases/${TAG}/nano-skills-${TAG}.tar.gz         --force --region cn-hangzhou
+          ossutil cp dist/nano-skills-${TAG}.tar.gz.sha256  oss://binary-releases/nano/releases/${TAG}/nano-skills-${TAG}.tar.gz.sha256  --force --region cn-hangzhou
 
       - name: Upload binaries to OSS (latest)
         env:
@@ -125,5 +136,7 @@ jobs:
           ossutil cp dist/nano-darwin-amd64.sha256 oss://binary-releases/nano/latest/nano-darwin-amd64.sha256 --force --region cn-hangzhou
           ossutil cp dist/nano-darwin-arm64        oss://binary-releases/nano/latest/nano-darwin-arm64        --force --region cn-hangzhou
           ossutil cp dist/nano-darwin-arm64.sha256 oss://binary-releases/nano/latest/nano-darwin-arm64.sha256 --force --region cn-hangzhou
+          ossutil cp dist/nano-skills.tar.gz       oss://binary-releases/nano/latest/nano-skills.tar.gz       --force --region cn-hangzhou
+          ossutil cp dist/nano-skills.tar.gz.sha256 oss://binary-releases/nano/latest/nano-skills.tar.gz.sha256 --force --region cn-hangzhou
           ossutil cp scripts/install.sh            oss://binary-releases/nano/latest/install.sh               --force --region cn-hangzhou
           ossutil cp version.txt                   oss://binary-releases/nano/latest/version.txt              --force --region cn-hangzhou

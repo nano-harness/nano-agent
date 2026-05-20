@@ -13,28 +13,16 @@ const (
 	HookPreToolUse         HookEvent = hookservice.EventPreToolUse
 	HookPostToolUse        HookEvent = hookservice.EventPostToolUse
 	HookPostToolUseFailure HookEvent = hookservice.EventPostToolUseFailure
-	HookPermissionRequest  HookEvent = hookservice.EventPermissionRequest
-	HookPermissionDenied   HookEvent = hookservice.EventPermissionDenied
 	HookSessionStart       HookEvent = hookservice.EventSessionStart
 	HookSessionEnd         HookEvent = hookservice.EventSessionEnd
 	HookPreCompact         HookEvent = hookservice.EventPreCompact
 	HookPostCompact        HookEvent = hookservice.EventPostCompact
 	HookUserPromptSubmit   HookEvent = hookservice.EventUserPromptSubmit
-	HookNotification       HookEvent = hookservice.EventNotification
 	HookStop               HookEvent = hookservice.EventStop
 	HookStopFailure        HookEvent = hookservice.EventStopFailure
 	HookSubagentStart      HookEvent = hookservice.EventSubagentStart
 	HookSubagentStop       HookEvent = hookservice.EventSubagentStop
 	HookTeammateIdle       HookEvent = hookservice.EventTeammateIdle
-	HookTaskStart          HookEvent = hookservice.EventTaskStart
-	HookTaskComplete       HookEvent = hookservice.EventTaskComplete
-	HookFileRead           HookEvent = hookservice.EventFileRead
-	HookFileWrite          HookEvent = hookservice.EventFileWrite
-	HookFileDelete         HookEvent = hookservice.EventFileDelete
-	HookShellCommand       HookEvent = hookservice.EventShellCommand
-	HookNetworkRequest     HookEvent = hookservice.EventNetworkRequest
-	HookCheckpointCreate   HookEvent = hookservice.EventCheckpointCreate
-	HookCheckpointRestore  HookEvent = hookservice.EventCheckpointRestore
 )
 
 // Hook is a user-defined shell script that fires before or after tool execution.
@@ -71,6 +59,14 @@ func (e *HookEngine) Close() error {
 		return nil
 	}
 	return e.service.Close()
+}
+
+// Hooks returns a snapshot of all registered hooks.
+func (e *HookEngine) Hooks() []Hook {
+	if e == nil || e.service == nil {
+		return nil
+	}
+	return e.service.Hooks()
 }
 
 // RegisterProgrammaticHook registers a Go-implemented hook.

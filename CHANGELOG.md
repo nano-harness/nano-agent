@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **sandbox**: Removed filesystem tools' working directory hard fence; cross-directory read/write no longer falsely rejected
+- **agent**: Satisfaction/goal evaluator JSON parsing failures no longer reset score to 0; previous score preserved
+- **agent**: Binary sentinel now includes `termination_cause` and `blocker_fingerprint` for all forced termination paths
+
+### Changed
+- **sandbox**: Default sensitive file blacklist now enforced even when sandbox is disabled
+- **sandbox**: Expanded default blocklist to include `~/.aws`, `~/.ssh`, `~/.gnupg`, `~/.kube`, `~/.docker`, `**/.env*`, `**/credentials`, `**/*.pem`, `**/*.key`
+- **sandbox**: Explicitly allow `~/.nano/skills/**` while blocking nano config files
+- **agent**: Satisfaction threshold now configurable via `turn.satisfaction_threshold` (default 0.7, was hard-coded 0.95)
+- **cli**: Binary mode `allowed_paths` defaults now include `TempDir` and `UserCacheDir` in addition to project path
+- **cli**: Sandbox auto-enable now logs effective configuration to stderr
+
+### Performance
+- **agent**: Context compression hot-path logs downgraded to DEBUG (reduces nano.log INFO volume by ~60%)
+- **agent**: Eliminated redundant token estimation: `Status()` no longer calls `ShouldCompress`; streaming TokenStats throttled to every 10th chunk
+- **agent**: Token estimation calls per LLM round reduced from O(N chunks) to O(1)
+
+### Security
+- **sandbox**: Sensitive file blacklist enforcement improved with home-expanded paths and doublestar pattern matching
+- **sandbox**: Added hint in rejection messages: "use run_shell_command if you genuinely need access"
+
 ### Breaking / UI Daemon Refactor
 - BREAKING ui: `Adapter` now uses `Run(ctx, EventSource) error`; `SendEvent`, `SubmitChannel`, and `CancelChannel` were removed.
 - BREAKING cli: removed `lead-chat` readline/plain rendering and daemon streaming `fmt.Print` path; use `nano daemon execute --json` for scripts.

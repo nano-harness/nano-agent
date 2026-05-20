@@ -78,6 +78,7 @@ type Integration struct {
 	localDispatcher     *slash.LocalDispatcher
 	routinesLister      func() string
 	runningStatusLister func() string
+	goalHandler         func(string) string
 }
 
 type cronStatusTracker interface {
@@ -115,6 +116,9 @@ func (i *Integration) forwardOutboundInput(input string) {
 		switch strings.ToLower(trimmed) {
 		case "/clear", "/reset", "/sessions", "/cancel":
 			_ = i.SendOutbound(eventsource.Outbound{Kind: "control", Control: trimmed})
+			return
+		}
+		if handled := i.handleLocalSlashCommand(trimmed); handled {
 			return
 		}
 	}
@@ -463,6 +467,32 @@ func (i *Integration) SetRunningStatusLister(fn func() string) {
 	i.localDispatcher = nil
 }
 
+func (i *Integration) SetGoalHandler(fn func(string) string) {
+	if fn == nil {
+		i.goalHandler = nil
+		i.model.SetGoalIndicator(false)
+		i.localDispatcher = nil
+		return
+	}
+	i.goalHandler = func(args string) string {
+		result := fn(args)
+		lower := strings.ToLower(strings.TrimSpace(args))
+		switch {
+		case args == "":
+		case lower == "clear" || lower == "stop" || lower == "off" || lower == "reset" || lower == "none" || lower == "cancel":
+			i.model.SetGoalIndicator(false)
+		default:
+			i.model.SetGoalIndicator(true)
+		}
+		return result
+	}
+	i.localDispatcher = nil
+}
+
+func (i *Integration) SetGoalActive(active bool) {
+	i.model.SetGoalIndicator(active)
+}
+
 // SetNewSessionCallback wires the callback used by Ctrl+L / /clear to create
 // a new agent session.
 func (i *Integration) SetNewSessionCallback(cb func() string) {
@@ -656,10 +686,21 @@ func (i *Integration) handleLocalSlashCommand(input string) bool {
 		if i.runningStatusLister != nil {
 			d = d.WithRunningStatusLister(i.runningStatusLister)
 		}
+		if i.goalHandler != nil {
+			d = d.WithGoalHandler(i.goalHandler)
+		}
 		i.localDispatcher = d
 	}
-	if r := i.localDispatcher.Dispatch(input); r.Handled {
+	r := i.localDispatcher.Dispatch(input)
+	if r.Handled {
 		i.model.AddMessage("system", r.Message)
+		return true
+	}
+	if r.ShouldSubmit {
+		// tview integration does not currently have a single agent submit
+		// path; surface a clear error rather than silently dropping the
+		// rewritten command.
+		i.model.AddMessage("error", "⚠️ Agent profile slash commands are not supported in this client; use --tea or --milktea.")
 		return true
 	}
 

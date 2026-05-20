@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/spf13/cobra"
 )
@@ -30,6 +33,123 @@ func runCmdCapture(t *testing.T, root *cobra.Command, args ...string) string {
 	var buf bytes.Buffer
 	_, _ = buf.ReadFrom(r)
 	return buf.String()
+}
+
+func TestPromptFromArgsOrStdinPrefersArgs(t *testing.T) {
+	prompt, err := promptFromArgsOrStdin([]string{"arg", "prompt"}, strings.NewReader("stdin prompt"))
+	if err != nil {
+		t.Fatalf("promptFromArgsOrStdin returned error: %v", err)
+	}
+	if prompt != "arg prompt" {
+		t.Fatalf("prompt = %q, want args", prompt)
+	}
+}
+
+func TestPromptFromArgsOrStdinReadsPipe(t *testing.T) {
+	prompt, err := promptFromArgsOrStdin(nil, strings.NewReader("stdin prompt\n"))
+	if err != nil {
+		t.Fatalf("promptFromArgsOrStdin returned error: %v", err)
+	}
+	if prompt != "stdin prompt\n" {
+		t.Fatalf("prompt = %q", prompt)
+	}
+}
+
+func TestBinaryExecCommandIsCanonical(t *testing.T) {
+	cmd := NewBinaryCommand()
+	execCmd, _, err := cmd.Find([]string{"exec"})
+	if err != nil {
+		t.Fatalf("find exec: %v", err)
+	}
+	if execCmd == nil || execCmd.Use != "exec [prompt...]" {
+		t.Fatalf("unexpected exec command: %#v", execCmd)
+	}
+	if execCmd.Deprecated != "" {
+		t.Fatalf("exec should not be deprecated: %q", execCmd.Deprecated)
+	}
+	if execCmd.Flags().Lookup("goal") == nil {
+		t.Fatal("exec command missing --goal flag")
+	}
+	if execCmd.Flags().Lookup("goal-max-turns") == nil {
+		t.Fatal("exec command missing --goal-max-turns flag")
+	}
+}
+
+func TestBinaryResultSentinelAndExitCodes(t *testing.T) {
+	t.Setenv("NANO_BINARY_RESULT_FORMAT", "both")
+	var out bytes.Buffer
+	summary := binaryResultSummary{Status: "needs_retry", Reason: "temporary provider error", ToolCalls: 2}
+	if err := writeBinaryResultTo(&out, summary); err != nil {
+		t.Fatalf("writeBinaryResultTo: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, binaryResultSentinel) {
+		t.Fatalf("missing sentinel in %q", text)
+	}
+	if got := binaryExitCode(summary.Status); got != binaryExitRetry {
+		t.Fatalf("exit code = %d, want %d", got, binaryExitRetry)
+	}
+	if got := classifyBinaryError(errors.New("deadline exceeded")); got != "timeout" {
+		t.Fatalf("classify timeout = %q", got)
+	}
+}
+
+func TestPrepareBinaryGoalFromPromptFirstLine(t *testing.T) {
+	prompt, goal, fromPrompt := prepareBinaryGoal("/goal file done.txt exists\ncreate the file", binaryOptions{})
+	if goal != "file done.txt exists" {
+		t.Fatalf("goal = %q", goal)
+	}
+	if !fromPrompt {
+		t.Fatal("expected goal to come from prompt")
+	}
+	if prompt != "create the file" {
+		t.Fatalf("prompt = %q", prompt)
+	}
+}
+
+func TestPrepareBinaryGoalFlagOverridesPrompt(t *testing.T) {
+	prompt, goal, fromPrompt := prepareBinaryGoal("/goal stale condition\nreal prompt", binaryOptions{Goal: "flag condition"})
+	if goal != "flag condition" {
+		t.Fatalf("goal = %q", goal)
+	}
+	if fromPrompt {
+		t.Fatal("expected flag goal to take precedence")
+	}
+	if prompt != "real prompt" {
+		t.Fatalf("prompt = %q", prompt)
+	}
+}
+
+func TestSummarizeBinaryResultIncludesGoalState(t *testing.T) {
+	achievedAt := time.Now()
+	summary := summarizeBinaryResult(nil, time.Now(), "done", nil, &agent.GoalState{
+		Condition:      "tests pass",
+		TurnsEvaluated: 2,
+		MaxTurns:       3,
+		AchievedAt:     &achievedAt,
+	})
+	if summary.Status != "success" {
+		t.Fatalf("status = %q", summary.Status)
+	}
+	if summary.GoalState == nil || summary.GoalState.Condition != "tests pass" {
+		t.Fatalf("goal state missing: %#v", summary.GoalState)
+	}
+}
+
+func TestSummarizeBinaryResultGoalMaxTurnsNeedsRetry(t *testing.T) {
+	summary := summarizeBinaryResult(nil, time.Now(), "not done", nil, &agent.GoalState{
+		Condition:      "tests pass",
+		Active:         false,
+		TurnsEvaluated: 3,
+		MaxTurns:       3,
+		LastReason:     "tests still fail",
+	})
+	if summary.Status != "needs_retry" {
+		t.Fatalf("status = %q", summary.Status)
+	}
+	if summary.Reason != "tests still fail" {
+		t.Fatalf("reason = %q", summary.Reason)
+	}
 }
 
 func TestBinaryListSlash_TextAndJSON(t *testing.T) {

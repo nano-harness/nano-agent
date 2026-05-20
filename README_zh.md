@@ -172,32 +172,40 @@ make run-debug
 nano --tui "your command"
 ```
 
-#### 4. Bubble Tea TUI（实验性，非 Alt Screen）
-一个基于 Bubble Tea 和 lipgloss 的交互式界面，样式贴近 Claude Code。在普通屏幕缓冲区运行（非 Alt Screen），适合不希望切换全屏的终端环境。
+#### 4. Bubble Tea TUI（实验性）
+两种基于 Bubble Tea 和 lipgloss 的交互式界面，样式贴近 Claude Code。
+
+**内联模式（`--tea`）**：非 Alt Screen 模式，消息自然滚动于终端历史中。
+
+**全屏模式（`--milktea`）**：Alt Screen 全屏虚拟滚动，适合长会话。启动动画在全屏模式下跳过，仅展示静态横幅。
 
 ```bash
-# 启动 Bubble Tea TUI（非 Alt Screen）
+# 启动内联 Bubble Tea TUI
 nano --tea "快速任务"
 
-# 以交互方式启动 Bubble Tea TUI
-nano --tea
+# 启动全屏 Bubble Tea TUI
+nano --milktea "快速任务"
 ```
 
 核心特性：
-- 顶部欢迎盒子：展示欢迎语、帮助、`cwd`、Overrides 信息
-- API Base 显示：从 `NANO_API_BASE_URL` 或 `API_BASE_URL` 读取（未设置则显示“未设置”）
-- 消息着色：assistant（绿色）、user（青色加粗）、error（红色）
-- 流式输出：节流刷新与最终内容整合
+- 消息着色：assistant（鼠尾草绿）、user（柔和蓝）、error（珊瑚红）——两种模式使用同一调色板
+- 流式输出，100 ms 节流刷新（`--tea` 与 `--milktea` 均已节流）
+- 20 帧启动动画横幅（仅 `--tea` 播放；`--milktea` 仅展示静态尾帧）
+- 工具调用自动执行，状态与结果内联展示
+- 快捷键：Ctrl+P 命令面板 · Ctrl+L 新会话 · Ctrl+T 思考块 · Ctrl+Y 复制 · Shift+Tab 切换权限模式
+- `?`：切换完整快捷键速查表（状态栏默认显示简短提示）
+- 状态栏显示工作目录缩写及 API Base URL（如已设置）
+
+模式差异：
+- 仅 `--tea`：`@文件名:行范围` 文件引用、Ctrl+R 反向历史搜索、Ctrl+F 全屏历史浏览
+- 仅 `--milktea`：PgUp/PgDn/Home/End 虚拟滚动、响应式布局、`[` 导出历史到 scrollback、终端能力检测（ASCII 降级）
+- Slash 命令（`/models`、`/routines`、`/cron`、`/skills` 等）**两种模式均支持**
 
 快捷键：
 - Enter：发送输入
 - `Ctrl+Z`：取消当前任务
-- `Ctrl+C`：退出
-- `?`：显示快捷提示
-
-说明：
-- 默认非 Alt Screen。如果偏好全屏仪表盘，请使用经典 `--tui` 模式。
-- 工具调用自动执行，无需逐次确认；状态与结果会在消息区内联展示。
+- `Ctrl+C`：退出（空闲时）或取消（`--tea` 执行中）；`--milktea` 下直接退出
+- `?`：切换快捷键速查表
 
 #### 2. Daemon模式(后台服务)
 作为后台服务运行，适用于生产环境:

@@ -30,6 +30,15 @@ func NewPermissionBridge(acpSessionID string, transport *Transport) *PermissionB
 
 // RequestApproval sends a permission request to the ACP client and waits for response
 func (b *PermissionBridge) RequestApproval(ctx context.Context, info *agent.ToolCallInfo) (bool, error) {
+	decision, err := b.RequestApprovalV2(ctx, info)
+	if err != nil {
+		return false, err
+	}
+	return decision != agent.ApprovalReject, nil
+}
+
+// K2.3: RequestApprovalV2 sends a permission request to the ACP client and returns V2 approval decision
+func (b *PermissionBridge) RequestApprovalV2(ctx context.Context, info *agent.ToolCallInfo) (agent.ApprovalDecision, error) {
 	b.mu.Lock()
 	requestID := fmt.Sprintf("perm-%s-%d", b.acpSessionID, b.nextID)
 	b.nextID++
@@ -43,23 +52,54 @@ func (b *PermissionBridge) RequestApproval(ctx context.Context, info *agent.Tool
 		b.mu.Unlock()
 	}()
 
-	// Build permission request
-	request := PermissionRequest{
-		Type:   "tool_execution",
-		Tool:   info.Name,
-		Args:   info.Parameters,
-		Reason: buildPermissionReason(info),
+	// Build ToolCallUpdate for permission request (new ACP format)
+	toolCallUpdate := &ToolCallUpdate{
+		ToolCallID: info.ID,
+		Title:      info.Name,
+		Kind:       inferToolKindForPermission(info.Name),
+		Status:     "pending",
+		Content:    nil,
+		Locations:  nil,
+		Metadata: map[string]interface{}{
+			"parameters": info.Parameters,
+			"reason":     buildPermissionReason(info),
+		},
 	}
 
-	// Send session/request_permission notification
+	// Build permission options (new ACP format)
+	options := []map[string]interface{}{
+		{
+			"optionId": "allow_once",
+			"name":     "Allow once",
+			"kind":     "allow_once",
+		},
+		{
+			"optionId": "allow_always",
+			"name":     "Always allow",
+			"kind":     "allow_always",
+		},
+		{
+			"optionId": "reject_once",
+			"name":     "Reject once",
+			"kind":     "reject_once",
+		},
+		{
+			"optionId": "reject_always",
+			"name":     "Always reject",
+			"kind":     "reject_always",
+		},
+	}
+
+	// Send session/request_permission notification (new ACP format)
 	params := map[string]interface{}{
 		"sessionId": b.acpSessionID,
 		"requestId": requestID,
-		"request":   request,
+		"toolCall":  toolCallUpdate,
+		"options":   options,
 	}
 
 	if err := b.transport.SendNotification("session/request_permission", params); err != nil {
-		return false, fmt.Errorf("send permission request: %w", err)
+		return agent.ApprovalReject, fmt.Errorf("send permission request: %w", err)
 	}
 
 	logger.Infof("ACP: Sent permission request %s for tool %s", requestID, info.Name)
@@ -69,15 +109,42 @@ func (b *PermissionBridge) RequestApproval(ctx context.Context, info *agent.Tool
 	select {
 	case result := <-responseChan:
 		if result.Approved {
-			logger.Infof("ACP: Permission request %s approved", requestID)
-		} else {
-			logger.Infof("ACP: Permission request %s denied", requestID)
+			logger.Infof("ACP: Permission request %s approved (always=%v)", requestID, result.ApproveAlways)
+			if result.ApproveAlways {
+				return agent.ApprovalApproveAlways, nil
+			}
+			return agent.ApprovalApproveOnce, nil
 		}
-		return result.Approved, nil
+		logger.Infof("ACP: Permission request %s denied", requestID)
+		return agent.ApprovalReject, nil
 	case <-ctx.Done():
-		return false, fmt.Errorf("permission request cancelled: %w", ctx.Err())
+		return agent.ApprovalReject, fmt.Errorf("permission request cancelled: %w", ctx.Err())
 	case <-time.After(timeout):
-		return false, fmt.Errorf("permission request timeout after %v", timeout)
+		return agent.ApprovalReject, fmt.Errorf("permission request timeout after %v", timeout)
+	}
+}
+
+// inferToolKindForPermission infers the tool kind for permission requests
+func inferToolKindForPermission(toolName string) string {
+	switch toolName {
+	case "read_file", "view_file", "list_dir", "glob", "grep":
+		return "read"
+	case "edit_file", "write_file", "create_file":
+		return "edit"
+	case "delete_file", "remove_file":
+		return "delete"
+	case "move_file", "rename_file":
+		return "move"
+	case "search", "find":
+		return "search"
+	case "bash", "shell", "run_command":
+		return "execute"
+	case "think", "reasoning":
+		return "think"
+	case "fetch", "http_request", "api_call":
+		return "fetch"
+	default:
+		return "other"
 	}
 }
 

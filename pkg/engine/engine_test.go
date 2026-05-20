@@ -30,12 +30,31 @@ func TestNew_minimalConfig(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, e)
 	assert.NotNil(t, e.Agent, "Agent should be initialised")
-	assert.NotNil(t, e.Scheduler, "Scheduler should be initialised")
+	assert.Nil(t, e.Scheduler, "Scheduler should not be initialised by default")
+}
+
+func TestNew_WithScheduler(t *testing.T) {
+	cfg := minimalTestConfig()
+	e, err := engine.New(cfg, nil, engine.WithScheduler())
+	require.NoError(t, err)
+	assert.NotNil(t, e)
+	assert.NotNil(t, e.Agent, "Agent should be initialised")
+	assert.NotNil(t, e.Scheduler, "Scheduler should be initialised when requested")
+}
+
+func TestStartShutdown_WithoutScheduler(t *testing.T) {
+	cfg := minimalTestConfig()
+	e, err := engine.New(cfg, nil)
+	require.NoError(t, err)
+	require.Nil(t, e.Scheduler)
+
+	require.NoError(t, e.Start())
+	require.NoError(t, e.Shutdown())
 }
 
 func TestStartShutdown(t *testing.T) {
 	cfg := minimalTestConfig()
-	e, err := engine.New(cfg, nil)
+	e, err := engine.New(cfg, nil, engine.WithScheduler())
 	require.NoError(t, err)
 
 	require.NoError(t, e.Start())

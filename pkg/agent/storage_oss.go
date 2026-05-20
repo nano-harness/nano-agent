@@ -122,6 +122,7 @@ func (s *OSSSessionStorage) LoadSession(id string) (*Session, error) {
 	if session.StateChangedAt.IsZero() {
 		session.StateChangedAt = session.LastActiveAt
 	}
+	session.initRuntimeState()
 	session.SanitizeMessageSequence()
 
 	return &session, nil
@@ -260,6 +261,7 @@ func (s *LocalSessionStorage) LoadSession(id string) (*Session, error) { //nolin
 	if session.StateChangedAt.IsZero() {
 		session.StateChangedAt = session.LastActiveAt
 	}
+	session.initRuntimeState()
 	session.SanitizeMessageSequence()
 	return &session, nil
 }

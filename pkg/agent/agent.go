@@ -316,6 +316,11 @@ func (a *Agent) SetApprovalHandler(handler func(*ToolCallInfo) bool) {
 	a.toolScheduler.SetApprovalHandler(handler)
 }
 
+// K2.3: SetApprovalHandlerV2 sets the V2 approval handler for the agent.
+func (a *Agent) SetApprovalHandlerV2(handler func(*ToolCallInfo) ApprovalDecision) {
+	a.toolScheduler.SetApprovalHandlerV2(handler)
+}
+
 // GetMemoryManager returns the memory manager for advanced usage
 func (a *Agent) GetMemoryManager() *memory.Manager {
 	return a.memoryManager
@@ -546,6 +551,8 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 	sessionHistory = a.cleanupMessageSequence(sessionHistory)
 	ralphCtx := session.RalphContext()
 	ralphCtx.Configure(a.config)
+	goalCtx := session.GoalContext()
+	goalCtx.Configure(a.config)
 
 	// Sanitize all outgoing events centrally
 	validator := event.NewEventValidator()
@@ -605,6 +612,8 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 		Agent:                     a,          // Pass agent reference for mailbox injection
 		HookEngine:                a.hookEngine,
 		RalphContext:              ralphCtx,
+		GoalContext:               goalCtx,
+		GoalEvaluator:             NewGoalEvaluator(a.llmClient),
 		Transcript:                session.Transcript(),
 	}
 
@@ -645,6 +654,15 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 			}
 		}
 		session.UpdateStats(totalTokens, time.Since(turn.StartTime).Seconds())
+
+		if errors.Is(err, ErrContinueRequested) && goalCtx.IsActive() {
+			sanitizedOnEvent(event.NewStreamEvent(event.EventTypeWarning, "agent_turn").
+				WithContent(fmt.Sprintf("[Goal continuation %d/%d] %s", goalCtx.Snapshot().TurnsEvaluated, goalCtx.MaxTurns(), turn.ContinuationReason())))
+			nextInput = turn.ContinuationReason()
+			nextImages = nil
+			sessionHistory = filteredMessages
+			continue
+		}
 
 		if errors.Is(err, ErrContinueRequested) && ralphCtx.IsEnabled() {
 			iter, exceeded := ralphCtx.NextIteration()
@@ -823,6 +841,38 @@ func (a *Agent) StartNewSession() string {
 // GetSessionManager returns the session manager for external access.
 func (a *Agent) GetSessionManager() *SessionManager {
 	return a.sessionManager
+}
+
+func (a *Agent) HandleGoalCommand(sessionID, args string) string {
+	if a == nil || a.sessionManager == nil {
+		return "❌ Agent 未初始化。"
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = a.GetActiveSessionID()
+	}
+	session := a.sessionManager.GetOrCreateSession(sessionID)
+	ctx := session.GoalContext()
+	ctx.Configure(a.config)
+	args = strings.TrimSpace(args)
+	lower := strings.ToLower(args)
+	switch {
+	case args == "":
+		return ctx.Status()
+	case lower == "clear" || lower == "stop" || lower == "off" || lower == "reset" || lower == "none" || lower == "cancel":
+		ctx.Clear()
+		if err := a.sessionManager.SaveSession(session.ID); err != nil {
+			logger.Warnf("Failed to save cleared goal for session %s: %v", session.ID, err)
+		}
+		return "✅ /goal 已清除。"
+	default:
+		if err := ctx.SetGoal(args); err != nil {
+			return fmt.Sprintf("❌ 设置 /goal 失败：%v", err)
+		}
+		if err := a.sessionManager.SaveSession(session.ID); err != nil {
+			logger.Warnf("Failed to save goal for session %s: %v", session.ID, err)
+		}
+		return "✅ /goal 已设置：" + args
+	}
 }
 
 // GetSkillManager returns the loaded skill manager for TUI command wiring.
@@ -1013,6 +1063,8 @@ func (a *Agent) registerBuiltinManagementTools(tb *tools.Toolbox, cfg *config.Co
 	if setter, ok := a.llmClient.(interface{ SetToolGate(interfaces.ToolGate) }); ok {
 		setter.SetToolGate(a.progressiveDisclosure)
 	}
+	// Connect ProgressiveDisclosure to ToolScheduler for schema auto-injection
+	a.toolScheduler.SetProgressiveDisclosure(a.progressiveDisclosure)
 
 	logger.Info("Conversational management tools registered")
 }

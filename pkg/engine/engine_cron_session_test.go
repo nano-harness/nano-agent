@@ -30,7 +30,7 @@ func cronTestConfig(t *testing.T) *config.Config {
 func TestExecuteTaskWithMeta_FixedSessionID(t *testing.T) {
 	cfg := cronTestConfig(t)
 	mock := llm.NewMockClient()
-	eng, err := engine.New(cfg, nil, agent.WithLLMClient(mock))
+	eng, err := engine.New(cfg, nil, engine.WithScheduler(), engine.WithAgentOpts(agent.WithLLMClient(mock)))
 	require.NoError(t, err)
 	eng.Agent.GetSessionManager().SetStorage(nil)
 	defer eng.Shutdown()
@@ -50,7 +50,7 @@ func TestExecuteTaskWithMeta_FixedSessionID(t *testing.T) {
 func TestExecuteTaskWithMeta_DoesNotPolluteActiveSession(t *testing.T) {
 	cfg := cronTestConfig(t)
 	mock := llm.NewMockClient()
-	eng, err := engine.New(cfg, nil, agent.WithLLMClient(mock))
+	eng, err := engine.New(cfg, nil, engine.WithScheduler(), engine.WithAgentOpts(agent.WithLLMClient(mock)))
 	require.NoError(t, err)
 	eng.Agent.GetSessionManager().SetStorage(nil)
 	defer eng.Shutdown()
@@ -72,7 +72,7 @@ func TestExecuteTaskWithMeta_DoesNotPolluteActiveSession(t *testing.T) {
 func TestExecuteTaskWithMeta_NotifierCalledStartedFinished(t *testing.T) {
 	cfg := cronTestConfig(t)
 	mock := llm.NewMockClient()
-	eng, err := engine.New(cfg, nil, agent.WithLLMClient(mock))
+	eng, err := engine.New(cfg, nil, engine.WithScheduler(), engine.WithAgentOpts(agent.WithLLMClient(mock)))
 	require.NoError(t, err)
 	eng.Agent.GetSessionManager().SetStorage(nil)
 	defer eng.Shutdown()
@@ -101,7 +101,7 @@ func TestExecuteTaskWithMeta_FinishedHasError(t *testing.T) {
 	cfg := cronTestConfig(t)
 	mock := llm.NewMockClient()
 	mock.Responses = []llm.MockResponse{{Error: errors.New("boom")}}
-	eng, err := engine.New(cfg, nil, agent.WithLLMClient(mock))
+	eng, err := engine.New(cfg, nil, engine.WithScheduler(), engine.WithAgentOpts(agent.WithLLMClient(mock)))
 	require.NoError(t, err)
 	eng.Agent.GetSessionManager().SetStorage(nil)
 	defer eng.Shutdown()

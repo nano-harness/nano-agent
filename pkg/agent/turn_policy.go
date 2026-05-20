@@ -74,20 +74,39 @@ func (t *Turn) turnPolicyDecision() turnpolicy.Decision {
 		return decision
 	}
 
-	switch decision.Metadata["reason"] {
+	// Set structured termination metadata based on the decision reason
+	reason := decision.Metadata["reason"]
+	switch reason {
 	case "context_done":
 		logger.Infof("Turn context cancelled/timed out: %v", state.ContextErr)
+		fingerprint := "context_canceled"
+		if state.ContextErr == context.DeadlineExceeded {
+			fingerprint = "context_timeout"
+		}
+		t.SetTerminationInfo("context_done", fingerprint, fmt.Sprintf("context: %v", state.ContextErr))
 	case "error_threshold":
 		logger.Infof("Too many consecutive errors (%d >= %d): terminating turn",
 			state.ConsecutiveErrors, state.ErrorThreshold)
+		t.SetTerminationInfo("error_threshold",
+			fmt.Sprintf("errors:%d_consecutive", state.ConsecutiveErrors),
+			fmt.Sprintf("too many consecutive errors (%d >= %d)", state.ConsecutiveErrors, state.ErrorThreshold))
 	case "diminishing_returns":
 		logger.Infof("Diminishing-returns detected: stopping turn after %d consecutive low-gain iterations",
 			state.DiminishingReturnsWindow)
+		t.SetTerminationInfo("diminishing_returns",
+			fmt.Sprintf("dr_no_progress:%drounds", state.DiminishingReturnsWindow),
+			fmt.Sprintf("diminishing returns after %d low-gain iterations", state.DiminishingReturnsWindow))
 	case "similar_content_loop":
 		logger.Infof("Loop detected: %d consecutive similar LLM responses (threshold %d)",
 			len(t.CompletionCriteria.ContentSimilarityHistory), t.CompletionCriteria.MaxSimilarContent)
+		t.SetTerminationInfo("similar_content_loop",
+			"loop:similar_content",
+			fmt.Sprintf("LLM output repeated %d times without meaningful change", t.CompletionCriteria.MaxSimilarContent))
 		t.emitLoopDetectedEvent("similar_content",
 			fmt.Sprintf("LLM output repeated %d times without meaningful change", t.CompletionCriteria.MaxSimilarContent))
+	default:
+		// Fallback for unknown termination reasons
+		t.SetTerminationInfo("unknown", "unknown_termination", fmt.Sprintf("reason: %v", reason))
 	}
 
 	return decision

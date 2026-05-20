@@ -15,8 +15,9 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/managedsettings"
 	"github.com/joho/godotenv"
-	"gopkg.in/yaml.v2"
 )
+
+var configEnvRefRegexp = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // LoopDetectionConfig defines loop detection behavior
 type LoopDetectionConfig struct {
@@ -191,17 +192,45 @@ type SandboxConfig struct {
 
 // HookConfig is a user-defined shell hook fired before/after tool execution.
 type HookConfig struct {
-	Name          string   `mapstructure:"name" yaml:"name"`
-	Event         string   `mapstructure:"event" yaml:"event"`     // "pre_tool_use" | "post_tool_use"
-	Pattern       string   `mapstructure:"pattern" yaml:"pattern"` // e.g. "bash:*"
-	Command       string   `mapstructure:"command" yaml:"command"` // Shell script body
-	Enabled       bool     `mapstructure:"enabled" yaml:"enabled"`
-	FailurePolicy string   `mapstructure:"failure_policy" yaml:"failure_policy"` // confirm | block | allow | ignore_but_audit
-	EnvWhitelist  []string `mapstructure:"env_whitelist" yaml:"env_whitelist"`
-	Async         bool     `mapstructure:"async" yaml:"async"`
-	AsyncRewake   bool     `mapstructure:"async_rewake" yaml:"async_rewake"`
-	Once          bool     `mapstructure:"once" yaml:"once"`
-	StatusMessage string   `mapstructure:"status_message" yaml:"status_message"`
+	Name          string            `mapstructure:"name" yaml:"name"`
+	Event         string            `mapstructure:"event" yaml:"event"`     // "pre_tool_use" | "post_tool_use"
+	Pattern       string            `mapstructure:"pattern" yaml:"pattern"` // e.g. "bash:*"
+	Type          string            `mapstructure:"type" yaml:"type"`       // "command" | "http" | "prompt" | "agent"
+	Command       string            `mapstructure:"command" yaml:"command"` // Shell script body
+	HTTP          *HookHTTPConfig   `mapstructure:"http" yaml:"http"`       // HTTP hook configuration
+	Prompt        *HookPromptConfig `mapstructure:"prompt" yaml:"prompt"`   // Prompt hook configuration
+	Agent         *HookAgentConfig  `mapstructure:"agent" yaml:"agent"`     // Agent hook configuration
+	Enabled       bool              `mapstructure:"enabled" yaml:"enabled"`
+	FailurePolicy string            `mapstructure:"failure_policy" yaml:"failure_policy"` // confirm | block | allow | ignore_but_audit
+	EnvWhitelist  []string          `mapstructure:"env_whitelist" yaml:"env_whitelist"`
+	Async         bool              `mapstructure:"async" yaml:"async"`
+	AsyncRewake   bool              `mapstructure:"async_rewake" yaml:"async_rewake"`
+	Once          bool              `mapstructure:"once" yaml:"once"`
+	StatusMessage string            `mapstructure:"status_message" yaml:"status_message"`
+}
+
+// HookHTTPConfig configures an HTTP-based hook.
+type HookHTTPConfig struct {
+	URL            string            `mapstructure:"url" yaml:"url"`
+	Method         string            `mapstructure:"method" yaml:"method"`
+	Headers        map[string]string `mapstructure:"headers" yaml:"headers"`
+	URLAllowlist   []string          `mapstructure:"url_allowlist" yaml:"url_allowlist"`
+	AllowedEnvVars []string          `mapstructure:"allowed_env_vars" yaml:"allowed_env_vars"`
+	TimeoutSeconds int               `mapstructure:"timeout_seconds" yaml:"timeout_seconds"`
+	MaxResponseKB  int               `mapstructure:"max_response_kb" yaml:"max_response_kb"`
+}
+
+// HookPromptConfig configures an LLM-driven decision hook.
+type HookPromptConfig struct {
+	Prompt    string `mapstructure:"prompt" yaml:"prompt"`
+	Model     string `mapstructure:"model" yaml:"model"`
+	MaxTokens int    `mapstructure:"max_tokens" yaml:"max_tokens"`
+}
+
+// HookAgentConfig configures a sub-agent based hook.
+type HookAgentConfig struct {
+	Agent string `mapstructure:"agent" yaml:"agent"`
+	Task  string `mapstructure:"task" yaml:"task"`
 }
 
 // HooksConfig configures agent lifecycle hook features.
@@ -259,6 +288,13 @@ type CriticConfig struct {
 	HighRiskTools []string `mapstructure:"high_risk_tools" yaml:"high_risk_tools"` // Tools requiring Critic evaluation
 	MaxLatencyMs  int      `mapstructure:"max_latency_ms" yaml:"max_latency_ms"`   // Timeout for evaluation
 	CacheEnabled  bool     `mapstructure:"cache_enabled" yaml:"cache_enabled"`     // Enable caching of evaluation results
+}
+
+// GoalConfig configures /goal continuation behavior.
+type GoalConfig struct {
+	MaxConditionLength int    `mapstructure:"max_condition_length" yaml:"max_condition_length"`
+	MaxTurns           int    `mapstructure:"max_turns" yaml:"max_turns"`
+	EvaluatorModel     string `mapstructure:"evaluator_model" yaml:"evaluator_model"`
 }
 
 // FirewallConfig configures the built-in dangerous command firewall.
@@ -684,6 +720,9 @@ type Config struct {
 	// Cron configuration for cron-specific behavior.
 	Cron *CronConfig `mapstructure:"cron" yaml:"cron"`
 
+	// SpinnerVerbs configuration for customizing spinner animation verbs.
+	SpinnerVerbs *SpinnerVerbsConfig `mapstructure:"spinner_verbs" yaml:"spinner_verbs"`
+
 	// PermissionMode controls how tool-execution confirmations are handled.
 	// Valid values: "default" (confirm all), "acceptEdits" (auto-approve file
 	// edits), "yolo" (skip all confirmations).
@@ -711,6 +750,9 @@ type Config struct {
 
 	// Critic configures the Critic security evaluator (Prompt Injection Protection Layer 3.5)
 	Critic *CriticConfig `mapstructure:"critic" yaml:"critic"`
+
+	// Goal configures /goal continuation behavior.
+	Goal *GoalConfig `mapstructure:"goal" yaml:"goal"`
 
 	// Middleware configures the tool execution middleware chain.
 	Middleware *MiddlewareConfig `mapstructure:"middleware" yaml:"middleware"`
@@ -786,10 +828,23 @@ type CronConfig struct {
 	EventsDir string `mapstructure:"events_dir" yaml:"events_dir"`
 }
 
+// SpinnerVerbsConfig configures custom spinner animation verbs for UI status indicators.
+type SpinnerVerbsConfig struct {
+	// Enabled controls whether spinner verbs are shown (default: true).
+	Enabled *bool `mapstructure:"enabled" yaml:"enabled"`
+	// Mode controls how custom verbs are combined with default verbs.
+	// Valid values: "append" (default + custom), "replace" (custom only).
+	// Default: "append"
+	Mode string `mapstructure:"mode" yaml:"mode"`
+	// Verbs is the list of custom verb strings to display alongside the spinner.
+	Verbs []string `mapstructure:"verbs" yaml:"verbs"`
+}
+
 type TurnExecutionConfig struct { //nolint:revive
 	// Removed: StrictTaskDone and AutoCompleteOnNoTaskDone
 	// Task completion is now implicit based on OpenAI SDK finish_reason
-	MaxDuration time.Duration `mapstructure:"max_duration" yaml:"max_duration"` // Maximum duration for a single turn (default: 30m)
+	MaxDuration           time.Duration `mapstructure:"max_duration" yaml:"max_duration"`                     // Maximum duration for a single turn (default: 30m)
+	SatisfactionThreshold float64       `mapstructure:"satisfaction_threshold" yaml:"satisfaction_threshold"` // LLM satisfaction score threshold (0.0-1.0, default: 0.7)
 }
 
 // ContextConfig configures conversation context management
@@ -819,13 +874,14 @@ type OpenSpecConfig struct {
 // Skills are loaded from SKILL.md files in personal (~/.nano/skills/) and
 // project (.nano/skills/) directories.
 type SkillsConfig struct {
-	Enabled         bool   `mapstructure:"enabled" yaml:"enabled"`                     // Enable skills support
-	PersonalDir     string `mapstructure:"personal_dir" yaml:"personal_dir"`           // Personal skills directory (default: ~/.nano/skills)
-	ProjectDir      string `mapstructure:"project_dir" yaml:"project_dir"`             // Project skills directory (default: .nano/skills)
-	MaxSkillSize    int64  `mapstructure:"max_skill_size" yaml:"max_skill_size"`       // Max SKILL.md file size (default: 65536)
-	MaxSkills       int    `mapstructure:"max_skills" yaml:"max_skills"`               // Max total number of skills (default: 50)
-	AutoInvoke      bool   `mapstructure:"auto_invoke" yaml:"auto_invoke"`             // Global auto-invoke switch (default: true)
-	MaxActiveSkills int    `mapstructure:"max_active_skills" yaml:"max_active_skills"` // Max simultaneously active skills (default: 5)
+	Enabled         bool     `mapstructure:"enabled" yaml:"enabled"`                     // Enable skills support
+	PersonalDir     string   `mapstructure:"personal_dir" yaml:"personal_dir"`           // Personal skills directory (default: ~/.nano/skills)
+	ProjectDir      string   `mapstructure:"project_dir" yaml:"project_dir"`             // Project skills directory (default: .nano/skills)
+	MaxSkillSize    int64    `mapstructure:"max_skill_size" yaml:"max_skill_size"`       // Max SKILL.md file size (default: 65536)
+	MaxSkills       int      `mapstructure:"max_skills" yaml:"max_skills"`               // Max total number of skills (default: 50)
+	AutoInvoke      bool     `mapstructure:"auto_invoke" yaml:"auto_invoke"`             // Global auto-invoke switch (default: true)
+	MaxActiveSkills int      `mapstructure:"max_active_skills" yaml:"max_active_skills"` // Max simultaneously active skills (default: 5)
+	AutoActivate    []string `mapstructure:"auto_activate" yaml:"auto_activate"`         // Skills activated automatically at startup
 }
 
 // MemoryConfig defines memory management settings for Mem0 integration
@@ -1047,7 +1103,8 @@ func DefaultConfig() *Config {
 
 		// Turn execution defaults (empty - using implicit completion)
 		Turn: &TurnExecutionConfig{
-			MaxDuration: 30 * time.Minute, // Default 30 minutes
+			MaxDuration:           30 * time.Minute, // Default 30 minutes
+			SatisfactionThreshold: 0.7,              // Default 70% satisfaction
 		},
 
 		ToolRecovery: &ToolRecoveryConfig{
@@ -1166,6 +1223,12 @@ func DefaultConfig() *Config {
 			CacheEnabled:  true,
 		},
 
+		Goal: &GoalConfig{
+			MaxConditionLength: 4000,
+			MaxTurns:           50,
+			EvaluatorModel:     "",
+		},
+
 		Firewall: &FirewallConfig{
 			Enabled:           true,
 			SeverityThreshold: "medium",
@@ -1204,7 +1267,12 @@ func LoadConfig(configPath string) (*Config, error) {
 		}
 	}
 
-	cfg = DefaultConfig()
+	// Load config with deep merge (or legacy mode if flag is set)
+	var err error
+	cfg, err = loadConfigWithMerge(configPath)
+	if err != nil {
+		return nil, err
+	}
 
 	// Override with API keys from environment
 	if apiKey := os.Getenv("API_KEY"); apiKey != "" {
@@ -1254,37 +1322,6 @@ func LoadConfig(configPath string) (*Config, error) {
 		// Update first provider with base URL
 		if len(cfg.ImageGenerator.Providers) > 0 {
 			cfg.ImageGenerator.Providers[0].BaseURL = imageBaseURL
-		}
-	}
-
-	// If configPath is empty, use default search paths with priority order
-	if configPath == "" {
-		// Priority order: project .nano.yaml > global ~/.config/nano/config.yaml
-		if _, err := os.Stat(".nano.yaml"); err == nil {
-			configPath = ".nano.yaml"
-		} else {
-			// Check global config
-			homeDir, err := os.UserHomeDir()
-			if err == nil {
-				globalPath := filepath.Join(homeDir, ".config", "nano", "config.yaml")
-				if _, err := os.Stat(globalPath); err == nil {
-					configPath = globalPath
-				}
-			}
-		}
-	}
-
-	// If a config file is found, read and unmarshal it
-	if configPath != "" {
-		data, err := os.ReadFile(configPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
-		}
-
-		expanded := os.ExpandEnv(string(data))
-		err = yaml.Unmarshal([]byte(expanded), cfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 		}
 	}
 
@@ -1409,6 +1446,10 @@ func LoadConfig(configPath string) (*Config, error) {
 		overrideBoolFromEnv(&cfg.Reasoning.Exclude, "NANO_REASONING_EXCLUDE")
 	}
 
+	if cfg.Goal == nil {
+		cfg.Goal = &GoalConfig{MaxConditionLength: 4000, MaxTurns: 50}
+	}
+
 	// Override memory configuration from environment
 	if cfg.Memory != nil {
 		overrideStringFromEnv(&cfg.Memory.APIKey, "NANO_MEMORY_API_KEY")
@@ -1475,6 +1516,8 @@ func LoadConfig(configPath string) (*Config, error) {
 		}
 	}
 
+	applyOrchestratorProfiles(cfg)
+
 	// Override sandbox configuration from environment
 	if cfg.Sandbox == nil {
 		cfg.Sandbox = &SandboxConfig{}
@@ -1505,6 +1548,26 @@ func LoadConfig(configPath string) (*Config, error) {
 	applyManagedSettingsOverrides(cfg)
 
 	return cfg, nil
+}
+
+func expandConfigEnvRefs(in string) (string, error) {
+	var missing []string
+	out := configEnvRefRegexp.ReplaceAllStringFunc(in, func(match string) string {
+		parts := configEnvRefRegexp.FindStringSubmatch(match)
+		if len(parts) != 2 {
+			return match
+		}
+		value, ok := os.LookupEnv(parts[1])
+		if !ok {
+			missing = append(missing, parts[1])
+			return match
+		}
+		return value
+	})
+	if len(missing) > 0 {
+		return "", fmt.Errorf("missing environment variable(s): %s", strings.Join(missing, ", "))
+	}
+	return out, nil
 }
 
 // applyManagedSettingsOverrides reads the OS-specific managed-settings file
@@ -1981,6 +2044,7 @@ func (c *Config) DeepCopy() *Config {
 			MaxSkills:       c.Skills.MaxSkills,
 			AutoInvoke:      c.Skills.AutoInvoke,
 			MaxActiveSkills: c.Skills.MaxActiveSkills,
+			AutoActivate:    append([]string(nil), c.Skills.AutoActivate...),
 		}
 	}
 
@@ -2052,6 +2116,14 @@ func (c *Config) DeepCopy() *Config {
 			CacheEnabled: c.Critic.CacheEnabled,
 		}
 		copied.Critic.HighRiskTools = append([]string(nil), c.Critic.HighRiskTools...)
+	}
+
+	if c.Goal != nil {
+		copied.Goal = &GoalConfig{
+			MaxConditionLength: c.Goal.MaxConditionLength,
+			MaxTurns:           c.Goal.MaxTurns,
+			EvaluatorModel:     c.Goal.EvaluatorModel,
+		}
 	}
 
 	// Deep copy Middleware

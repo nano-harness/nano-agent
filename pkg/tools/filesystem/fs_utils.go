@@ -13,8 +13,9 @@ import (
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// validatePathCommon validates a given path is within the working directory and
-// returns its absolute, cleaned, symlink-resolved path.
+// validatePathCommon validates a given path and returns its absolute, cleaned,
+// symlink-resolved path. Path access control is delegated to sandbox.PathChecker;
+// this function only normalizes the path.
 func validatePathCommon(workingDir, path string) (string, error) {
 	// Clean the path
 	cleaned := filepath.Clean(path)
@@ -36,27 +37,6 @@ func validatePathCommon(workingDir, path string) (string, error) {
 		} else {
 			return "", fmt.Errorf("symlink resolution failed: %v", err)
 		}
-	}
-
-	// Check if path is within working directory (security check)
-	workingDirAbs, err := filepath.Abs(workingDir)
-	if err != nil {
-		return "", fmt.Errorf("failed to get working directory absolute path: %v", err)
-	}
-	// Resolve working dir symlinks too for a fair comparison.
-	realWorkingDir, err := filepath.EvalSymlinks(workingDirAbs)
-	if err != nil {
-		realWorkingDir = workingDirAbs
-	}
-
-	// When working directory is the filesystem root, allow all paths.
-	if realWorkingDir == string(filepath.Separator) {
-		return realPath, nil
-	}
-
-	relPath, err := filepath.Rel(realWorkingDir, realPath)
-	if err != nil || strings.HasPrefix(relPath, "..") {
-		return "", fmt.Errorf("path outside working directory not allowed: %s", path)
 	}
 
 	return realPath, nil
