@@ -72,7 +72,18 @@ func NewEventValidator() *EventValidator {
 		{re: regexp.MustCompile(`xox[baprs]-[0-9A-Za-z\-]{10,48}`), replacement: "[REDACTED:SLACK_TOKEN]"},
 		{re: regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`), replacement: "[REDACTED:PRIVATE_KEY]"},
 		{re: regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9\-\._~\+\/]+=*`), replacement: "Bearer [REDACTED]"},
-		{re: regexp.MustCompile(`(?i)(password|passwd|secret|api[_-]?key|token|authorization)\s*[:=]\s*["']?([^\s"']{4,})["']?`), replacement: "$1: [REDACTED]"},
+		{re: regexp.MustCompile(`(?i)(password|passwd|secret|api[_-]?key|token|authorization)\s*[:=]\s*["']?([^\s"']{4,})["']?`), replaceFn: func(match string) string {
+			// Skip env-ref syntax like ${env:VAR_NAME} - these are not real secret values
+			if strings.Contains(match, "${env:") {
+				return match
+			}
+			// Find the key part (before := separator) and redact the value
+			idx := strings.IndexAny(match, ":=")
+			if idx >= 0 {
+				return match[:idx+1] + " [REDACTED]"
+			}
+			return "[REDACTED]"
+		}},
 		{re: regexp.MustCompile(`(?i)\bset-cookie\s*:\s*[^;\,\n]+`), replacement: "Set-Cookie: [REDACTED]"},
 		{re: regexp.MustCompile(`(?i)\bcookie\s*:\s*[^\n]+`), replacement: "Cookie: [REDACTED]"},
 	}
@@ -372,6 +383,7 @@ func (v *EventValidator) SanitizeEvent(event StreamEvent) StreamEvent {
 type redactPattern struct {
 	re          *regexp.Regexp
 	replacement string
+	replaceFn   func(string) string // optional custom replacer; when set, replacement is ignored
 }
 
 func (v *EventValidator) sanitizeString(s string) string {
@@ -380,7 +392,11 @@ func (v *EventValidator) sanitizeString(s string) string {
 	}
 	redacted := s
 	for _, p := range v.redactionPatterns {
-		redacted = p.re.ReplaceAllString(redacted, p.replacement)
+		if p.replaceFn != nil {
+			redacted = p.re.ReplaceAllStringFunc(redacted, p.replaceFn)
+		} else {
+			redacted = p.re.ReplaceAllString(redacted, p.replacement)
+		}
 	}
 	return strings.TrimSpace(redacted)
 }
@@ -392,7 +408,11 @@ func (v *EventValidator) sanitizeStringNoTrim(s string) string {
 	}
 	redacted := s
 	for _, p := range v.redactionPatterns {
-		redacted = p.re.ReplaceAllString(redacted, p.replacement)
+		if p.replaceFn != nil {
+			redacted = p.re.ReplaceAllStringFunc(redacted, p.replaceFn)
+		} else {
+			redacted = p.re.ReplaceAllString(redacted, p.replacement)
+		}
 	}
 	return redacted
 }

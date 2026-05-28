@@ -86,15 +86,19 @@ func TestModeAutoFallsBackOnClassifierError(t *testing.T) {
 }
 
 func TestNanoAutoAcceptEnvBypasses(t *testing.T) {
+	// NANO_AUTO_ACCEPT is deprecated: it no longer bypasses the permission
+	// system. Operators should use --permission-mode=yolo instead.
 	tool := &stubTool{name: "write_file", requiresConfirm: true}
 	m := NewManager(ModeDefault, nil)
 	t.Setenv("NANO_AUTO_ACCEPT", "1")
-	if m.ShouldConfirm(tool.name, nil, tool) {
-		t.Fatal("expected NANO_AUTO_ACCEPT=1 to skip confirmation")
+	// In ModeDefault, write_file.RequiresConfirmation() == true → ShouldConfirm
+	// must still return true regardless of NANO_AUTO_ACCEPT.
+	if !m.ShouldConfirm(tool.name, nil, tool) {
+		t.Fatal("NANO_AUTO_ACCEPT=1 must no longer skip confirmation; use --permission-mode=yolo")
 	}
 	t.Setenv("NANO_AUTO_ACCEPT", "true")
-	if m.ShouldConfirm(tool.name, nil, tool) {
-		t.Fatal("expected NANO_AUTO_ACCEPT=true to skip confirmation")
+	if !m.ShouldConfirm(tool.name, nil, tool) {
+		t.Fatal("NANO_AUTO_ACCEPT=true must no longer skip confirmation; use --permission-mode=yolo")
 	}
 	t.Setenv("NANO_AUTO_ACCEPT", "false")
 	if !m.ShouldConfirm(tool.name, nil, tool) {

@@ -15,6 +15,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/managedsettings"
 	"github.com/joho/godotenv"
+	"gopkg.in/yaml.v2"
 )
 
 var configEnvRefRegexp = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
@@ -176,6 +177,12 @@ type SandboxConfig struct {
 	// the bwrap/sandbox-exec container (beyond the working directory and /tmp).
 	ExtraWritablePaths []string `mapstructure:"extra_writable_paths" yaml:"extra_writable_paths"`
 
+	// ExtraDeniedPaths are absolute paths to deny read+write inside the sandbox.
+	// Applied after all allow rules (including the blanket $HOME read-allow and
+	// the built-in critical-path blacklist) so they always win. Use this to extend
+	// the built-in blacklist with site-specific sensitive paths.
+	ExtraDeniedPaths []string `mapstructure:"extra_denied_paths" yaml:"extra_denied_paths"`
+
 	// BwrapPath is the absolute path to the bwrap binary on Linux.
 	// When empty, bwrap is located via $PATH.
 	BwrapPath string `mapstructure:"bwrap_path" yaml:"bwrap_path"`
@@ -190,52 +197,28 @@ type SandboxConfig struct {
 	DockerLifecycle string `mapstructure:"docker_lifecycle" yaml:"docker_lifecycle"`
 }
 
-// HookConfig is a user-defined shell hook fired before/after tool execution.
-type HookConfig struct {
-	Name          string            `mapstructure:"name" yaml:"name"`
-	Event         string            `mapstructure:"event" yaml:"event"`     // "pre_tool_use" | "post_tool_use"
-	Pattern       string            `mapstructure:"pattern" yaml:"pattern"` // e.g. "bash:*"
-	Type          string            `mapstructure:"type" yaml:"type"`       // "command" | "http" | "prompt" | "agent"
-	Command       string            `mapstructure:"command" yaml:"command"` // Shell script body
-	HTTP          *HookHTTPConfig   `mapstructure:"http" yaml:"http"`       // HTTP hook configuration
-	Prompt        *HookPromptConfig `mapstructure:"prompt" yaml:"prompt"`   // Prompt hook configuration
-	Agent         *HookAgentConfig  `mapstructure:"agent" yaml:"agent"`     // Agent hook configuration
-	Enabled       bool              `mapstructure:"enabled" yaml:"enabled"`
-	FailurePolicy string            `mapstructure:"failure_policy" yaml:"failure_policy"` // confirm | block | allow | ignore_but_audit
-	EnvWhitelist  []string          `mapstructure:"env_whitelist" yaml:"env_whitelist"`
-	Async         bool              `mapstructure:"async" yaml:"async"`
-	AsyncRewake   bool              `mapstructure:"async_rewake" yaml:"async_rewake"`
-	Once          bool              `mapstructure:"once" yaml:"once"`
-	StatusMessage string            `mapstructure:"status_message" yaml:"status_message"`
+// HookCommand is a single command hook definition.
+// Hooks are keyed by event name under the top-level `hooks:` mapping.
+//
+// Example:
+// hooks:
+//
+//	Stop:
+//	  - matcher: "*"
+//	    command: ./result-hook.sh
+//	    timeout: 30
+type HookCommand struct {
+	Matcher string `mapstructure:"matcher" yaml:"matcher"`
+	Command string `mapstructure:"command" yaml:"command"`
+	Timeout int    `mapstructure:"timeout" yaml:"timeout"` // seconds
+	Id      string `mapstructure:"id" yaml:"id,omitempty"` // opaque integrator identity
 }
 
-// HookHTTPConfig configures an HTTP-based hook.
-type HookHTTPConfig struct {
-	URL            string            `mapstructure:"url" yaml:"url"`
-	Method         string            `mapstructure:"method" yaml:"method"`
-	Headers        map[string]string `mapstructure:"headers" yaml:"headers"`
-	URLAllowlist   []string          `mapstructure:"url_allowlist" yaml:"url_allowlist"`
-	AllowedEnvVars []string          `mapstructure:"allowed_env_vars" yaml:"allowed_env_vars"`
-	TimeoutSeconds int               `mapstructure:"timeout_seconds" yaml:"timeout_seconds"`
-	MaxResponseKB  int               `mapstructure:"max_response_kb" yaml:"max_response_kb"`
-}
-
-// HookPromptConfig configures an LLM-driven decision hook.
-type HookPromptConfig struct {
-	Prompt    string `mapstructure:"prompt" yaml:"prompt"`
-	Model     string `mapstructure:"model" yaml:"model"`
-	MaxTokens int    `mapstructure:"max_tokens" yaml:"max_tokens"`
-}
-
-// HookAgentConfig configures a sub-agent based hook.
-type HookAgentConfig struct {
-	Agent string `mapstructure:"agent" yaml:"agent"`
-	Task  string `mapstructure:"task" yaml:"task"`
-}
-
-// HooksConfig configures agent lifecycle hook features.
+// HooksConfig configures lifecycle hooks as a mapping from event name to a list
+// of command hooks. It also preserves the existing `hooks.ralph` config.
 type HooksConfig struct {
-	Ralph RalphLoopConfig `mapstructure:"ralph" yaml:"ralph"`
+	Ralph  RalphLoopConfig
+	Events map[string][]HookCommand
 }
 
 // RalphLoopConfig controls Stop-hook based continuation turns.
@@ -246,6 +229,44 @@ type RalphLoopConfig struct {
 	HardMaxIterations int `mapstructure:"hard_max_iterations" yaml:"hard_max_iterations"`
 }
 
+func (h *HooksConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var raw map[interface{}]interface{}
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+	if h.Events == nil {
+		h.Events = make(map[string][]HookCommand)
+	}
+	for k, v := range raw {
+		key, ok := k.(string)
+		if !ok {
+			return fmt.Errorf("hooks: non-string key %v (%T)", k, k)
+		}
+		if key == "ralph" {
+			b, err := yaml.Marshal(v)
+			if err != nil {
+				return err
+			}
+			var rc RalphLoopConfig
+			if err := yaml.UnmarshalStrict(b, &rc); err != nil {
+				return err
+			}
+			h.Ralph = rc
+			continue
+		}
+		b, err := yaml.Marshal(v)
+		if err != nil {
+			return err
+		}
+		var cmds []HookCommand
+		if err := yaml.UnmarshalStrict(b, &cmds); err != nil {
+			return err
+		}
+		h.Events[key] = cmds
+	}
+	return nil
+}
+
 // SecurityConfig configures the CommandGuard four-layer security system.
 type SecurityConfig struct {
 	// AllowRules are Layer 1 config rules that auto-approve matching commands.
@@ -253,8 +274,6 @@ type SecurityConfig struct {
 	AllowRules []string `mapstructure:"allow_rules" yaml:"allow_rules"`
 	// DenyRules are Layer 1 config rules that hard-block matching commands.
 	DenyRules []string `mapstructure:"deny_rules" yaml:"deny_rules"`
-	// Hooks are Layer 2 user-defined shell scripts.
-	Hooks []HookConfig `mapstructure:"hooks" yaml:"hooks"`
 	// MaxFileSizeBytes is the maximum allowed file write size (default 100MB).
 	MaxFileSizeBytes int64 `mapstructure:"max_file_size_bytes" yaml:"max_file_size_bytes"`
 }
@@ -292,9 +311,12 @@ type CriticConfig struct {
 
 // GoalConfig configures /goal continuation behavior.
 type GoalConfig struct {
-	MaxConditionLength int    `mapstructure:"max_condition_length" yaml:"max_condition_length"`
-	MaxTurns           int    `mapstructure:"max_turns" yaml:"max_turns"`
-	EvaluatorModel     string `mapstructure:"evaluator_model" yaml:"evaluator_model"`
+	MaxConditionLength          int    `mapstructure:"max_condition_length" yaml:"max_condition_length"`
+	MaxTurns                    int    `mapstructure:"max_turns" yaml:"max_turns"`
+	EvaluatorModel              string `mapstructure:"evaluator_model" yaml:"evaluator_model"`
+	EvaluatorTranscriptMaxBytes int    `mapstructure:"evaluator_transcript_max_bytes" yaml:"evaluator_transcript_max_bytes"`
+	EvaluatorRecentMessages     int    `mapstructure:"evaluator_recent_messages" yaml:"evaluator_recent_messages"`
+	EvaluatorToolArgsMaxBytes   int    `mapstructure:"evaluator_tool_args_max_bytes" yaml:"evaluator_tool_args_max_bytes"`
 }
 
 // FirewallConfig configures the built-in dangerous command firewall.
@@ -594,6 +616,41 @@ func (r *ReasoningConfig) GetRuntimeSource() string {
 	return "config"
 }
 
+// PermissionAutoConfig configures the AI classifier for ModeAuto permission mode.
+type PermissionAutoConfig struct {
+	// Backend selects the classifier backend: "llm" (default) or "fail_closed"
+	Backend string `mapstructure:"backend" yaml:"backend"`
+
+	// Model specifies the LLM model to use for classification.
+	// If empty, falls back to the main cfg.Model.
+	Model string `mapstructure:"model" yaml:"model"`
+
+	// ConfidenceThreshold is the minimum confidence level for auto-approval (0.0-1.0).
+	// Default: 0.8 (auto-approve high-confidence decisions only).
+	ConfidenceThreshold float64 `mapstructure:"confidence_threshold" yaml:"confidence_threshold"`
+
+	// TimeoutSeconds is the per-call timeout for classifier in seconds.
+	// Default: 5
+	TimeoutSeconds int `mapstructure:"timeout_seconds" yaml:"timeout_seconds"`
+
+	// CacheTTLMinutes is the TTL for caching classifier decisions in minutes.
+	// Default: 30
+	CacheTTLMinutes int `mapstructure:"cache_ttl_minutes" yaml:"cache_ttl_minutes"`
+
+	// AllowRules is a list of session allowlist rules applied at startup when
+	// permission_mode=auto. Each entry follows the "ToolName" or
+	// "ToolName(specifier)" format (e.g. "Bash(git *)", "write_file(*.go)").
+	AllowRules []string `mapstructure:"allow_rules" yaml:"allow_rules"`
+
+	// DenialMaxConsecutive is the maximum number of consecutive policy denials
+	// before the run terminates (headless/binary guardrail). Default: 3.
+	DenialMaxConsecutive int `mapstructure:"denial_max_consecutive" yaml:"denial_max_consecutive"`
+
+	// DenialMaxTotal is the maximum total number of policy denials before the
+	// run terminates (headless/binary guardrail). Default: 20.
+	DenialMaxTotal int `mapstructure:"denial_max_total" yaml:"denial_max_total"`
+}
+
 // Config represents the configuration structure
 type Config struct {
 	// Basic LLM configuration
@@ -725,8 +782,12 @@ type Config struct {
 
 	// PermissionMode controls how tool-execution confirmations are handled.
 	// Valid values: "default" (confirm all), "acceptEdits" (auto-approve file
-	// edits), "yolo" (skip all confirmations).
+	// edits), "plan" (read-only), "auto" (AI-based risk classification), "yolo" (skip all confirmations).
 	PermissionMode string `mapstructure:"permission_mode" yaml:"permission_mode"`
+
+	// PermissionAuto configures the AI classifier for ModeAuto permission mode.
+	// When nil, ModeAuto falls back to ModeDefault behavior.
+	PermissionAuto *PermissionAutoConfig `mapstructure:"permission_auto" yaml:"permission_auto,omitempty"`
 
 	// AllowedRules is a list of pre-defined session allowlist rules applied at
 	// startup.  Each entry follows the "ToolName" or "ToolName(specifier)"
@@ -979,8 +1040,9 @@ type DaemonConfig struct {
 	// Optional daemon-level override for secret redaction
 	SecretRedaction *SecretRedactionConfig `mapstructure:"secret_redaction" yaml:"secret_redaction"`
 
-	// Policy for handling ActionConfirm decisions when no approval handler is present
-	// Default is "allow" for backward compatibility
+	// Policy for handling ActionConfirm decisions when no approval handler is present.
+	// Default is "allow" for fail-open compatibility with non-daemon callers.
+	// Daemon entries override this via ResolvePermission when permission_mode=auto (fail-closed).
 	ConfirmPolicy ConfirmPolicy `mapstructure:"confirm_policy" yaml:"confirm_policy"`
 
 	// List of tool names to auto-approve when ConfirmPolicy is "allowlist"
@@ -1210,9 +1272,14 @@ func DefaultConfig() *Config {
 			ReadOnlyPaths:      []string{},
 			ExtraReadOnlyPaths: []string{},
 			ExtraWritablePaths: []string{},
+			ExtraDeniedPaths:   []string{},
 			DockerImage:        "ubuntu:24.04",
 			DockerLifecycle:    "command",
 		},
+
+		// Default permission mode (corresponds to permission.ModeDefault)
+		// See pkg/agent/permission/permission_mode.go for available modes
+		PermissionMode: "default",
 
 		// Default Critic configuration (prompt injection protection)
 		Critic: &CriticConfig{
@@ -1224,9 +1291,12 @@ func DefaultConfig() *Config {
 		},
 
 		Goal: &GoalConfig{
-			MaxConditionLength: 4000,
-			MaxTurns:           50,
-			EvaluatorModel:     "",
+			MaxConditionLength:          4000,
+			MaxTurns:                    50,
+			EvaluatorModel:              "",
+			EvaluatorTranscriptMaxBytes: 32 * 1024, // 32 KiB
+			EvaluatorRecentMessages:     12,
+			EvaluatorToolArgsMaxBytes:   512,
 		},
 
 		Firewall: &FirewallConfig{
@@ -1447,7 +1517,13 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 
 	if cfg.Goal == nil {
-		cfg.Goal = &GoalConfig{MaxConditionLength: 4000, MaxTurns: 50}
+		cfg.Goal = &GoalConfig{
+			MaxConditionLength:          4000,
+			MaxTurns:                    50,
+			EvaluatorTranscriptMaxBytes: 32 * 1024, // 32 KiB
+			EvaluatorRecentMessages:     12,
+			EvaluatorToolArgsMaxBytes:   512,
+		}
 	}
 
 	// Override memory configuration from environment
@@ -1533,6 +1609,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	overrideStringSliceFromEnv(&cfg.Sandbox.ReadOnlyPaths, "NANO_SANDBOX_READ_ONLY_PATHS")
 	overrideStringSliceFromEnv(&cfg.Sandbox.ExtraReadOnlyPaths, "NANO_SANDBOX_EXTRA_READ_ONLY_PATHS")
 	overrideStringSliceFromEnv(&cfg.Sandbox.ExtraWritablePaths, "NANO_SANDBOX_EXTRA_WRITABLE_PATHS")
+	overrideStringSliceFromEnv(&cfg.Sandbox.ExtraDeniedPaths, "NANO_SANDBOX_EXTRA_DENIED_PATHS")
 
 	// Validate and normalize reasoning configuration
 	if cfg.Reasoning != nil {
@@ -1635,6 +1712,9 @@ func applyManagedSettingsOverrides(cfg *Config) {
 }
 
 // Get returns the loaded configuration
+// Get returns the global configuration singleton.
+// Deprecated: Prefer passing *Config explicitly from the CLI startup layer.
+// This accessor remains for backward compatibility but new code should avoid it.
 func Get() *Config {
 	return cfg
 }
@@ -2085,6 +2165,7 @@ func (c *Config) DeepCopy() *Config {
 		copied.Sandbox.ReadOnlyPaths = append([]string(nil), c.Sandbox.ReadOnlyPaths...)
 		copied.Sandbox.ExtraReadOnlyPaths = append([]string(nil), c.Sandbox.ExtraReadOnlyPaths...)
 		copied.Sandbox.ExtraWritablePaths = append([]string(nil), c.Sandbox.ExtraWritablePaths...)
+		copied.Sandbox.ExtraDeniedPaths = append([]string(nil), c.Sandbox.ExtraDeniedPaths...)
 	}
 
 	// Deep copy Security
@@ -2094,17 +2175,21 @@ func (c *Config) DeepCopy() *Config {
 		}
 		copied.Security.AllowRules = append([]string(nil), c.Security.AllowRules...)
 		copied.Security.DenyRules = append([]string(nil), c.Security.DenyRules...)
-		if c.Security.Hooks != nil {
-			copied.Security.Hooks = make([]HookConfig, len(c.Security.Hooks))
-			copy(copied.Security.Hooks, c.Security.Hooks)
-			for i := range copied.Security.Hooks {
-				copied.Security.Hooks[i].EnvWhitelist = append([]string(nil), c.Security.Hooks[i].EnvWhitelist...)
-			}
-		}
 	}
 
 	if c.Hooks != nil {
 		copied.Hooks = &HooksConfig{Ralph: c.Hooks.Ralph}
+		if len(c.Hooks.Events) > 0 {
+			copied.Hooks.Events = make(map[string][]HookCommand, len(c.Hooks.Events))
+			for k, v := range c.Hooks.Events {
+				if len(v) == 0 {
+					continue
+				}
+				cp := make([]HookCommand, len(v))
+				copy(cp, v)
+				copied.Hooks.Events[k] = cp
+			}
+		}
 	}
 
 	// Deep copy Critic
@@ -2120,9 +2205,12 @@ func (c *Config) DeepCopy() *Config {
 
 	if c.Goal != nil {
 		copied.Goal = &GoalConfig{
-			MaxConditionLength: c.Goal.MaxConditionLength,
-			MaxTurns:           c.Goal.MaxTurns,
-			EvaluatorModel:     c.Goal.EvaluatorModel,
+			MaxConditionLength:          c.Goal.MaxConditionLength,
+			MaxTurns:                    c.Goal.MaxTurns,
+			EvaluatorModel:              c.Goal.EvaluatorModel,
+			EvaluatorTranscriptMaxBytes: c.Goal.EvaluatorTranscriptMaxBytes,
+			EvaluatorRecentMessages:     c.Goal.EvaluatorRecentMessages,
+			EvaluatorToolArgsMaxBytes:   c.Goal.EvaluatorToolArgsMaxBytes,
 		}
 	}
 
@@ -2261,7 +2349,7 @@ func GetConfigLocations(configFile string) []ConfigLocation {
 	// 2. Current directory
 	currentDir, err := os.Getwd()
 	if err == nil {
-		p := filepath.Join(currentDir, ".nano.yaml")
+		p := filepath.Join(currentDir, ".nano", "nano.yaml")
 		_, err := os.Stat(p)
 		locations = append(locations, ConfigLocation{
 			Type:   "Project",

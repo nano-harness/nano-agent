@@ -34,8 +34,9 @@ func createTestAgent() *agent.Agent {
 	config.LoadConfig("") // This will load default config //nolint:errcheck
 
 	// Create agent with approval handler that always approves
-	agentInstance, _ := agent.New(cfg, func(*agent.ToolCallInfo) bool {
-		return true
+	agentInstance, _ := agent.New(cfg)
+	agentInstance.SetApprovalHandlerV2(func(*agent.ToolCallInfo) agent.ApprovalDecision {
+		return agent.ApprovalApproveOnce
 	})
 
 	return agentInstance
@@ -332,7 +333,7 @@ Do it
 	cfg.Model = "gpt-3.5-turbo"
 	cfg.BaseURL = "http://localhost:9999"
 	cfg.WorkingDir = cwd
-	agentInstance, err := agent.New(cfg, nil)
+	agentInstance, err := agent.New(cfg)
 	assert.NoError(t, err)
 	server := NewServer(agentInstance, &config.DaemonConfig{Port: 8080, Host: "127.0.0.1"})
 

@@ -173,6 +173,7 @@ Usage:
 	cmd.AddCommand(NewLeadChatCommand())
 	cmd.AddCommand(NewTeammateCommand())
 	cmd.AddCommand(NewBinaryCommand())
+	cmd.AddCommand(NewSandboxCommand())
 
 	// Flags for mode selection
 	cmd.PersistentFlags().BoolP("version", "v", false, "version for nano")
@@ -195,13 +196,11 @@ Usage:
 	cmd.Flags().String("session", "", "use a specific session id (TUI mode); creates if not exists")
 	cmd.Flags().String("team", "", "start TUI in team-lead mode with mailbox support (TUI mode)")
 
-	// SWE-bench compatibility flags
-	cmd.Flags().Bool("binary-mode", false, "Enable binary mode for SWE-bench evaluation")
-	cmd.Flags().String("output-dir", "", "Output directory for generated files (binary mode)")
+	// SWE-bench compatibility flags (use `nano binary exec` or `nano binary swebench` subcommands)
 
-	// Permission mode flags
-	cmd.Flags().String("permission-mode", "", "permission mode: default, acceptEdits, yolo")
-	cmd.Flags().Bool("dangerously-skip-permissions", false, "skip all permission checks (equivalent to --permission-mode=yolo)")
+	// Permission mode flags (persistent so subcommands like `binary exec` inherit them)
+	cmd.PersistentFlags().String("permission-mode", "", "permission mode: default, acceptEdits, plan, auto, yolo")
+	cmd.PersistentFlags().Bool("dangerously-skip-permissions", false, "skip all permission checks (equivalent to --permission-mode=yolo)")
 
 	return cmd
 }
@@ -299,7 +298,7 @@ func NewConfigCommand() *cobra.Command {
 	// nano config init
 	configCmd.AddCommand(&cobra.Command{
 		Use:   "init",
-		Short: "Initialize a new .nano.yaml config file",
+		Short: "Initialize a new .nano/nano.yaml config file",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			fmt.Print("Enter your API key: ")
 			scanner := bufio.NewScanner(os.Stdin)
@@ -317,10 +316,13 @@ func NewConfigCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("failed to marshal config: %w", err)
 			}
-			if err := os.WriteFile(".nano.yaml", out, 0o600); err != nil {
-				return fmt.Errorf("failed to write .nano.yaml: %w", err)
+			if err := os.MkdirAll(".nano", 0o755); err != nil {
+				return fmt.Errorf("failed to create .nano directory: %w", err)
 			}
-			fmt.Println("Created .nano.yaml")
+			if err := os.WriteFile(filepath.Join(".nano", "nano.yaml"), out, 0o600); err != nil {
+				return fmt.Errorf("failed to write .nano/nano.yaml: %w", err)
+			}
+			fmt.Println("Created .nano/nano.yaml")
 			return nil
 		},
 	})
@@ -354,14 +356,15 @@ func NewConfigCommand() *cobra.Command {
 			key, value := args[0], args[1]
 
 			// Read existing config into a map (or start with an empty map)
-			data, err := os.ReadFile(".nano.yaml")
+			cfgPath := filepath.Join(".nano", "nano.yaml")
+			data, err := os.ReadFile(cfgPath)
 			if err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("failed to read .nano.yaml: %w", err)
+				return fmt.Errorf("failed to read %s: %w", cfgPath, err)
 			}
 			cfgMap := make(map[string]interface{})
 			if len(data) > 0 {
 				if err := yaml.Unmarshal(data, &cfgMap); err != nil {
-					return fmt.Errorf("failed to parse .nano.yaml: %w", err)
+					return fmt.Errorf("failed to parse %s: %w", cfgPath, err)
 				}
 			}
 
@@ -372,8 +375,11 @@ func NewConfigCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("failed to marshal config: %w", err)
 			}
-			if err := os.WriteFile(".nano.yaml", out, 0o600); err != nil {
-				return fmt.Errorf("failed to write .nano.yaml: %w", err)
+			if err := os.MkdirAll(".nano", 0o755); err != nil {
+				return fmt.Errorf("failed to create .nano directory: %w", err)
+			}
+			if err := os.WriteFile(cfgPath, out, 0o600); err != nil {
+				return fmt.Errorf("failed to write %s: %w", cfgPath, err)
 			}
 			fmt.Printf("Set %s = %s\n", key, value)
 			return nil
@@ -419,21 +425,6 @@ func runAgent(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Check for binary mode flag
-	binaryMode, _ := cmd.Flags().GetBool("binary-mode")
-	outputDir, _ := cmd.Flags().GetString("output-dir")
-
-	if binaryMode {
-		fmt.Fprintln(os.Stderr,
-			"⚠️  --binary-mode is deprecated; use `nano binary swebench [prompt...]` (or `nano binary exec`) instead. "+
-				"This flag will be removed in a future release.")
-		if err := runBinaryMode(args, outputDir); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(ExitCode(err))
-		}
-		return
-	}
-
 	// Check for force TUI mode flag
 	forceTUI, _ := cmd.Flags().GetBool("tui")
 
@@ -476,12 +467,12 @@ func runAgent(cmd *cobra.Command, args []string) {
 			}
 			// Execute in binary mode
 			opts := binaryOptions{}
-			result, _, _, err := executeBinaryModeWithOptions(string(prompt), wd, opts)
+			execRes, err := executeBinaryModeWithOptions(string(prompt), wd, opts)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(ExitGeneralError)
 			}
-			fmt.Print(result)
+			fmt.Print(execRes.Result)
 			return
 		}
 	}
@@ -498,24 +489,23 @@ func runAgent(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Apply permission-mode CLI overrides (flags take priority over config file).
+	// Resolve permission mode using unified resolver
 	skipPerms, _ := cmd.Flags().GetBool("dangerously-skip-permissions")
 	permMode, _ := cmd.Flags().GetString("permission-mode")
-	if skipPerms {
-		cfg.PermissionMode = string(permission.ModeYOLO)
-	} else if permMode != "" {
-		cfg.PermissionMode = permMode
+	res, warns := ResolvePermission(cfg, PermissionResolveOpts{
+		SkipPerms:      skipPerms,
+		FlagMode:       permMode,
+		EnvHintEnabled: true,
+	})
+
+	// Determine entry point for audit logging
+	var entryPoint string
+	if useTea || useMilkTea {
+		entryPoint = "tui.bubbletea"
+	} else {
+		entryPoint = "tui.tview"
 	}
-	if permission.PermissionMode(cfg.PermissionMode) == permission.ModeYOLO {
-		if cfg.Sandbox == nil {
-			cfg.Sandbox = &config.SandboxConfig{}
-		}
-		if cfg.Sandbox.Backend == "" {
-			cfg.Sandbox.Enabled = true
-			cfg.Sandbox.Backend = "docker"
-			logger.Infof("YOLO permission mode selected; defaulting sandbox backend to docker")
-		}
-	}
+	LogPermissionResolution(entryPoint, res, warns)
 
 	// CLI overrides removed - loop detection configuration is now handled entirely through config files
 
@@ -546,6 +536,9 @@ func isDaemonRunning() bool {
 
 // runDaemonClientMode executes commands via daemon client
 func runDaemonClientMode(cmd *cobra.Command, args []string) error {
+	// Log permission audit for client mode (server-side policy applies)
+	logger.Info("Permission resolved [entry=daemon.client mode=server-controlled source=daemon-server-config]")
+
 	// Default timeout if cmd is nil or flag is not set
 	timeout := daemon.DefaultTaskTimeoutSeconds
 	sessionID := ""
@@ -701,8 +694,9 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 	var err error
 
 	// Create approval handler that connects TUI to tool scheduler
-	approvalHandler := func(toolInfo *agent.ToolCallInfo) bool {
-		// Use simple confirmation UI without parameter editing
+	approvalHandler := func(toolInfo *agent.ToolCallInfo) agent.ApprovalDecision {
+		// Use simple confirmation UI without parameter editing.
+		// The handler blocks until the user approves/rejects.
 		msg := fmt.Sprintf("确认执行工具：%s (ID: %s)？", toolInfo.Name, toolInfo.ID)
 		toolMap := map[string]interface{}{
 			"ID":         toolInfo.ID,
@@ -710,12 +704,14 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 			"Parameters": toolInfo.Parameters,
 		}
 
+		ch := make(chan bool, 1)
 		integration.ShowConfirmation(msg, toolMap, func(approved bool) {
-			// Return decision to tool scheduler
-			_ = agentInstance.GetToolScheduler().HandleConfirmationResponse(toolInfo.ID, approved)
+			ch <- approved
 		})
-		// Return false to keep the call in awaiting_approval; the actual decision will come via HandleConfirmationResponse
-		return false
+		if <-ch {
+			return agent.ApprovalApproveOnce
+		}
+		return agent.ApprovalReject
 	}
 
 	// Load persistent allowlist for current workdir and merge into cfg.
@@ -730,21 +726,22 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 		cfg.AllowedRules = append(cfg.AllowedRules, raw)
 	}
 
-	// Build the engine (agent + scheduler + watcher) using the approval handler
+	// Build the engine (agent + scheduler + watcher)
 	// Check if team-lead mode is requested
 	var eng *engine.Engine
 	teamName, _ := cmd.Flags().GetString("team")
 	if teamName != "" {
 		logger.Infof("Starting TUI in team-lead mode for team '%s'", teamName)
-		eng, err = engine.NewLeadEngine(cfg, approvalHandler, teamName)
+		eng, err = engine.NewLeadEngine(cfg, teamName)
 	} else {
-		eng, err = engine.New(cfg, approvalHandler, engine.WithScheduler())
+		eng, err = engine.New(cfg, engine.WithScheduler())
 	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
 		return fmt.Errorf("error initializing engine: %w", err)
 	}
 	agentInstance = eng.Agent
+	agentInstance.SetApprovalHandlerV2(approvalHandler)
 	defer func() {
 		if err := eng.Shutdown(); err != nil {
 			logger.Errorf("Engine shutdown error: %v", err)
@@ -823,75 +820,7 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 	// Set up handlers for agent integration
 	integration.SetInputHandler(func(ctx context.Context, input string) error {
 		return agentInstance.ProcessStream(ctx, input, func(streamEvent event.StreamEvent) {
-			// Handle different event types for TUI output
-			switch streamEvent.Type {
-			case event.EventTypeStreamContent:
-				integration.AddMessage("assistant", streamEvent.Content)
-			case event.EventTypeContent:
-				if streamEvent.Source != "llm_client" {
-					integration.AddMessage("assistant", streamEvent.Content)
-				}
-			case event.EventTypeError:
-				integration.AddMessage("system", fmt.Sprintf("Error: %s", streamEvent.Error))
-			case event.EventTypeDone:
-				integration.GetModel().GetStateManager().SetIdle()
-			case event.EventTypeToolUse:
-				if streamEvent.ToolUse != nil {
-					integration.GetModel().GetStateManager().SetToolExecution(streamEvent.ToolUse.ToolName, "")
-				}
-				integration.GetModel().AddToolUse(streamEvent.ToolUse)
-			case event.EventTypeTokenStats:
-				integration.GetModel().GetStateManager().UpdateTokenStats(streamEvent.TokenStats)
-			case event.EventTypeThinking:
-				activity := streamEvent.Content
-				if activity == "" {
-					activity = "思考中"
-				}
-				integration.AddThinking(streamEvent.Content, streamEvent.Reasoning, streamEvent.Metadata)
-				integration.GetModel().GetStateManager().SetThinking(activity)
-			case event.EventTypeCompression:
-				// Show compression marker with key stats and truncated full summary
-				orig := streamEvent.Metadata["original_tokens"]
-				cmp := streamEvent.Metadata["compressed_tokens"]
-				ratio := streamEvent.Metadata["compression_ratio"]
-				before := streamEvent.Metadata["messages_before"]
-				after := streamEvent.Metadata["messages_after"]
-				trigger := streamEvent.Metadata["triggered_by"]
-				summary := streamEvent.Metadata["summary_full"]
-				msg := fmt.Sprintf("🗜️ 上下文压缩: %v → %v tokens (减少 %.2f%%)\n消息数: %v → %v，触发: %v\n摘要: %v",
-					orig, cmp, (1.0-float64FromAny(ratio))*100, before, after, trigger, truncatePreview(summary))
-				integration.AddMessage("system", msg)
-			case event.EventTypeTaskStart:
-				// Mark thinking/processing when a task starts
-				activity := streamEvent.Content
-				if activity == "" {
-					activity = "开始任务"
-				}
-				integration.GetModel().GetStateManager().SetThinking(activity)
-				// Add a chat marker for task start
-				integration.AddMessage("system", fmt.Sprintf("🟡 任务开始: %s", activity))
-			case event.EventTypeTaskProgress:
-				// Show progress in current activity
-				pct := int(streamEvent.Progress * 100)
-				activity := fmt.Sprintf("任务进度: %d%%", pct)
-				if streamEvent.Content != "" {
-					activity = fmt.Sprintf("%s（%d%%）", streamEvent.Content, pct)
-				}
-				integration.GetModel().GetStateManager().SetProcessing(activity)
-			case event.EventTypeTaskCompletion:
-				activity := streamEvent.Content
-				if activity == "" {
-					activity = "任务完成"
-				}
-				integration.GetModel().GetStateManager().SetCompleted(activity)
-				integration.GetModel().PlaySound("cough")
-				// Add a chat marker for task completion (initial command)
-				integration.AddMessage("system", fmt.Sprintf("✅ 任务完成: %s", activity))
-			case event.EventTypeSatisfactionEval:
-				integration.GetModel().PlaySound("cough")
-			case event.EventTypeTerminationSignal:
-				integration.GetModel().PlaySound("cough")
-			}
+			dispatchStreamEvent(integration, streamEvent)
 		})
 	})
 
@@ -910,72 +839,7 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 
 			ctx := context.Background()
 			err := agentInstance.ProcessStream(ctx, initialCommand, func(streamEvent event.StreamEvent) {
-				// Handle different event types for TUI output
-				switch streamEvent.Type {
-				case event.EventTypeStreamContent:
-					integration.AddMessage("assistant", streamEvent.Content)
-				case event.EventTypeContent:
-					if streamEvent.Source != "llm_client" {
-						integration.AddMessage("assistant", streamEvent.Content)
-					}
-				case event.EventTypeError:
-					integration.AddMessage("system", fmt.Sprintf("Error: %s", streamEvent.Error))
-				case event.EventTypeDone:
-					integration.GetModel().GetStateManager().SetIdle()
-				case event.EventTypeToolUse:
-					if streamEvent.ToolUse != nil {
-						integration.GetModel().GetStateManager().SetToolExecution(streamEvent.ToolUse.ToolName, "")
-					}
-					integration.GetModel().AddToolUse(streamEvent.ToolUse)
-				case event.EventTypeTokenStats:
-					integration.GetModel().GetStateManager().UpdateTokenStats(streamEvent.TokenStats)
-				case event.EventTypeThinking:
-					activity := streamEvent.Content
-					if activity == "" {
-						activity = "思考中"
-					}
-					integration.AddThinking(streamEvent.Content, streamEvent.Reasoning, streamEvent.Metadata)
-					integration.GetModel().GetStateManager().SetThinking(activity)
-				case event.EventTypeCompression:
-					orig := streamEvent.Metadata["original_tokens"]
-					cmp := streamEvent.Metadata["compressed_tokens"]
-					ratio := streamEvent.Metadata["compression_ratio"]
-					before := streamEvent.Metadata["messages_before"]
-					after := streamEvent.Metadata["messages_after"]
-					trigger := streamEvent.Metadata["triggered_by"]
-					summary := streamEvent.Metadata["summary_full"]
-					msg := fmt.Sprintf("🗜️ 上下文压缩: %v → %v tokens (减少 %.2f%%)\n消息数: %v → %v，触发: %v\n摘要: %v",
-						orig, cmp, (1.0-float64FromAny(ratio))*100, before, after, trigger, truncatePreview(summary))
-					integration.AddMessage("system", msg)
-				case event.EventTypeTaskStart:
-					activity := streamEvent.Content
-					if activity == "" {
-						activity = "开始任务"
-					}
-					integration.GetModel().GetStateManager().SetThinking(activity)
-					// Add a chat marker for task start (initial command)
-					integration.AddMessage("system", fmt.Sprintf("🟡 任务开始: %s", activity))
-				case event.EventTypeTaskProgress:
-					pct := int(streamEvent.Progress * 100)
-					activity := fmt.Sprintf("任务进度: %d%%", pct)
-					if streamEvent.Content != "" {
-						activity = fmt.Sprintf("%s（%d%%）", streamEvent.Content, pct)
-					}
-					integration.GetModel().GetStateManager().SetProcessing(activity)
-				case event.EventTypeTaskCompletion:
-					activity := streamEvent.Content
-					if activity == "" {
-						activity = "任务完成"
-					}
-					integration.GetModel().GetStateManager().SetCompleted(activity)
-					integration.GetModel().PlaySound("cough")
-					// Add a chat marker for task completion (initial command)
-					integration.AddMessage("system", fmt.Sprintf("✅ 任务完成: %s", activity))
-				case event.EventTypeSatisfactionEval:
-					integration.GetModel().PlaySound("cough")
-				case event.EventTypeTerminationSignal:
-					integration.GetModel().PlaySound("cough")
-				}
+				dispatchStreamEvent(integration, streamEvent)
 			})
 			if err != nil {
 				integration.AddMessage("system", fmt.Sprintf("Initial command failed: %v", err))
@@ -1095,9 +959,10 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	var agentInstance *agent.Agent
 	var err error
 
-	// Create approval handler that connects Bubble Tea TUI to tool scheduler
-	approvalHandler := func(toolInfo *agent.ToolCallInfo) bool {
-		// Use Bubble Tea confirmation UI
+	// Create V2 approval handler that connects Bubble Tea TUI to tool scheduler
+	approvalHandler := func(toolInfo *agent.ToolCallInfo) agent.ApprovalDecision {
+		// Use Bubble Tea confirmation UI.
+		// The handler blocks until the user approves/rejects via the UI.
 		msg := fmt.Sprintf("确认执行工具：%s (ID: %s)？", toolInfo.Name, toolInfo.ID)
 		toolMap := map[string]interface{}{
 			"ID":         toolInfo.ID,
@@ -1105,18 +970,20 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 			"Parameters": toolInfo.Parameters,
 		}
 
+		ch := make(chan bool, 1)
 		// Show confirmation dialog in Bubble Tea model via p.Send() to
 		// ensure thread-safe delivery through the Bubble Tea event loop.
 		p.Send(bubbletea.ShowConfirmationMsg{
 			Message:  msg,
 			ToolInfo: toolMap,
 			Callback: func(approved bool) {
-				// Return decision to tool scheduler
-				_ = agentInstance.GetToolScheduler().HandleConfirmationResponse(toolInfo.ID, approved)
+				ch <- approved
 			},
 		})
-		// Return false to keep the call in awaiting_approval; the actual decision will come via HandleConfirmationResponse
-		return false
+		if <-ch {
+			return agent.ApprovalApproveOnce
+		}
+		return agent.ApprovalReject
 	}
 
 	// Play banner animation BEFORE redirecting stdout (so banner is visible to user)
@@ -1179,22 +1046,23 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 		cfg.AllowedRules = append(cfg.AllowedRules, raw)
 	}
 
-	// Build the engine (agent + scheduler + watcher) using the approval handler
-	// defined above. agentInstance is assigned here so the closure can resolve it.
+	// Build the engine (agent + scheduler + watcher).
+	// agentInstance is assigned here so related closures can resolve it.
 	// Check if team-lead mode is requested
 	var eng *engine.Engine
 	teamName, _ := cmd.Flags().GetString("team")
 	if teamName != "" {
 		logger.Infof("Starting Bubble Tea TUI in team-lead mode for team '%s'", teamName)
-		eng, err = engine.NewLeadEngine(cfg, approvalHandler, teamName)
+		eng, err = engine.NewLeadEngine(cfg, teamName)
 	} else {
-		eng, err = engine.New(cfg, approvalHandler, engine.WithScheduler())
+		eng, err = engine.New(cfg, engine.WithScheduler())
 	}
 	if err != nil {
 		color.Red("Error initializing engine: %v", err)
 		return fmt.Errorf("error initializing engine: %w", err)
 	}
 	agentInstance = eng.Agent
+	agentInstance.SetApprovalHandlerV2(approvalHandler)
 	defer func() {
 		if err := eng.Shutdown(); err != nil {
 			logger.Errorf("Engine shutdown error: %v", err)
@@ -1232,7 +1100,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	// in sync without duplicating callback construction.
 	modelLister := slash.BuildModelLister(cfg)
 	modelStatusGetter := slash.BuildModelStatusGetter(cfg)
-	modelSwitcher := slash.BuildModelSwitcher(filepath.Join(cwd, ".nano.yaml"))
+	modelSwitcher := slash.BuildModelSwitcher(filepath.Join(cwd, ".nano", "nano.yaml"))
 	modelFallbackHandler := slash.BuildModelFallbackHandler(cfg)
 	modelDoctor := slash.BuildModelDoctor(cfg)
 	contextStatusGetter := slash.BuildContextStatusGetter(agentInstance)

@@ -118,7 +118,11 @@ func (c *Client) maybeSetReasoningMessagesOverride(extraFields map[string]interf
 		if role, ok := msgMap["role"].(string); ok && role == "assistant" {
 			reasoning := ""
 			if idx < len(messages) && messages[idx].Role == "assistant" {
-				reasoning = messages[idx].Reasoning
+				if len(messages[idx].ReasoningBlocks) > 0 {
+					reasoning = BlocksToText(messages[idx].ReasoningBlocks)
+				} else {
+					reasoning = messages[idx].Reasoning
+				}
 			}
 			msgMap["reasoning_content"] = reasoning
 		}

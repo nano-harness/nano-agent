@@ -9,22 +9,11 @@ import (
 
 type policySecurityTool struct {
 	*testTool
-	action int
-	reason string
-	err    error
-}
-
-func (t *policySecurityTool) AnalyzeSecurity(context.Context, map[string]interface{}) (int, string, error) {
-	return t.action, t.reason, t.err
-}
-
-type policySecurityDecisionTool struct {
-	*testTool
 	decision *middleware.Decision
 	err      error
 }
 
-func (t *policySecurityDecisionTool) AnalyzeSecurityDecision(context.Context, map[string]interface{}) (*middleware.Decision, error) {
+func (t *policySecurityTool) AnalyzeSecurityDecision(context.Context, map[string]interface{}) (*middleware.Decision, error) {
 	return t.decision, t.err
 }
 
@@ -49,8 +38,10 @@ func TestToolPolicyPreflightCollectsApprovalAndSecurity(t *testing.T) {
 	scheduler.SetAllowedTools([]string{"run_shell_command"})
 	tool := &policySecurityTool{
 		testTool: &testTool{name: "run_shell_command"},
-		action:   int(middleware.ActionConfirm),
-		reason:   "compound command",
+		decision: &middleware.Decision{
+			Action: middleware.ActionConfirm,
+			Reason: "compound command",
+		},
 	}
 
 	preflight := scheduler.policyEngine().PreflightTool(context.Background(), "run_shell_command", map[string]interface{}{"command": "a && b"}, tool)
@@ -70,7 +61,7 @@ func TestToolPolicyPreflightCollectsApprovalAndSecurity(t *testing.T) {
 
 func TestToolPolicyPreflightPreservesFullSecurityDecision(t *testing.T) {
 	scheduler := NewToolSchedulerWithOptions(ToolSchedulerOptions{})
-	tool := &policySecurityDecisionTool{
+	tool := &policySecurityTool{
 		testTool: &testTool{name: "run_shell_command"},
 		decision: &middleware.Decision{
 			Action:         middleware.ActionAllow,

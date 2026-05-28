@@ -18,6 +18,21 @@ type configLayer struct {
 	Exists bool
 }
 
+// userConfigPath returns the path of the user-global config file.
+// Empty string disables the user layer entirely (useful for tests).
+// Set NANO_USER_CONFIG="" to explicitly skip the user layer,
+// or NANO_USER_CONFIG="/path/to/file" to override it.
+func userConfigPath() string {
+	if v, ok := os.LookupEnv("NANO_USER_CONFIG"); ok {
+		return v // empty string = explicitly skip; non-empty = use that path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "nano", "config.yaml")
+}
+
 // loadConfigLayers loads all configuration layers in priority order
 func loadConfigLayers(explicitPath string) ([]configLayer, error) {
 	layers := []configLayer{}
@@ -26,9 +41,8 @@ func loadConfigLayers(explicitPath string) ([]configLayer, error) {
 	// We'll handle this by loading DefaultConfig first and converting it to map
 
 	// Layer 2: User config (~/.config/nano/config.yaml)
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		userPath := filepath.Join(homeDir, ".config", "nano", "config.yaml")
+	userPath := userConfigPath()
+	if userPath != "" {
 		data, err := loadConfigFile(userPath)
 		if err != nil {
 			// Only ignore if file doesn't exist
@@ -45,8 +59,8 @@ func loadConfigLayers(explicitPath string) ([]configLayer, error) {
 		}
 	}
 
-	// Layer 3: Project config (.nano.yaml)
-	projectPath := ".nano.yaml"
+	// Layer 3: Project config (.nano/nano.yaml)
+	projectPath := filepath.Join(".nano", "nano.yaml")
 	data, err := loadConfigFile(projectPath)
 	if err != nil {
 		// Only ignore if file doesn't exist
@@ -240,6 +254,25 @@ func loadConfigWithMerge(configPath string) (*Config, error) {
 			return nil, fmt.Errorf("failed to merge config layers: %w", err)
 		}
 
+		// Backward compatibility: migrate security.hooks → top-level hooks
+		if sec, ok := merged["security"].(map[interface{}]interface{}); ok {
+			if h, ok := sec["hooks"]; ok {
+				if _, exists := merged["hooks"]; !exists {
+					merged["hooks"] = h
+				}
+				delete(sec, "hooks")
+				logger.Warnf("deprecated: security.hooks moved to top-level hooks; please update %s", userConfigPath())
+			}
+		} else if sec, ok := merged["security"].(map[string]interface{}); ok {
+			if h, ok := sec["hooks"]; ok {
+				if _, exists := merged["hooks"]; !exists {
+					merged["hooks"] = h
+				}
+				delete(sec, "hooks")
+				logger.Warnf("deprecated: security.hooks moved to top-level hooks; please update %s", userConfigPath())
+			}
+		}
+
 		// Unmarshal merged result into cfg
 		// We need to convert the merged map back to YAML and then unmarshal
 		mergedYAML, err := yaml.Marshal(merged)
@@ -247,7 +280,7 @@ func loadConfigWithMerge(configPath string) (*Config, error) {
 			return nil, fmt.Errorf("failed to marshal merged config: %w", err)
 		}
 
-		if err := yaml.Unmarshal(mergedYAML, cfg); err != nil {
+		if err := yaml.UnmarshalStrict(mergedYAML, cfg); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal merged config: %w", err)
 		}
 	}
@@ -261,14 +294,13 @@ func loadConfigLegacy(configPath string) (*Config, error) {
 
 	// If configPath is empty, use default search paths with priority order
 	if configPath == "" {
-		// Priority order: project .nano.yaml > global ~/.config/nano/config.yaml
-		if _, err := os.Stat(".nano.yaml"); err == nil {
-			configPath = ".nano.yaml"
+		// Priority order: project .nano/nano.yaml > global ~/.config/nano/config.yaml
+		if _, err := os.Stat(filepath.Join(".nano", "nano.yaml")); err == nil {
+			configPath = filepath.Join(".nano", "nano.yaml")
 		} else {
 			// Check global config
-			homeDir, err := os.UserHomeDir()
-			if err == nil {
-				globalPath := filepath.Join(homeDir, ".config", "nano", "config.yaml")
+			globalPath := userConfigPath()
+			if globalPath != "" {
 				if _, err := os.Stat(globalPath); err == nil {
 					configPath = globalPath
 				}
@@ -288,7 +320,7 @@ func loadConfigLegacy(configPath string) (*Config, error) {
 			return nil, fmt.Errorf("failed to expand config environment variables: %w", err)
 		}
 		expanded = os.ExpandEnv(expanded)
-		err = yaml.Unmarshal([]byte(expanded), cfg)
+		err = yaml.UnmarshalStrict([]byte(expanded), cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 		}

@@ -21,45 +21,31 @@ func TestLoadConfig_DeepMerge_UserAndProject(t *testing.T) {
 	defer func() { _ = os.Chdir(originalDir) }()
 	require.NoError(t, os.Chdir(projectDir))
 
-	// Override home dir for test
-	originalHome := os.Getenv("HOME")
-	defer func() { os.Setenv("HOME", originalHome) }()
-	os.Setenv("HOME", homeDir)
-
-	// Create user config with security hooks
+	// Create user config with security allow/deny rules
 	userConfig := `
 api_key: "user-api-key"
 security:
-  hooks:
-    - name: "user-hook-1"
-      enabled: true
-      command: "echo user-hook-1"
-    - name: "user-hook-2"
-      enabled: true
-      command: "echo user-hook-2"
   allow_rules:
     - "Bash(git *)"
   deny_rules:
     - "Bash(rm -rf /)"
 `
-	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(userConfig), 0644))
+	userConfigPath := filepath.Join(configDir, "config.yaml")
+	require.NoError(t, os.WriteFile(userConfigPath, []byte(userConfig), 0644))
 
-	// Create project config with MCP and one hook override
+	// Point NANO_USER_CONFIG to our temp user config
+	t.Setenv("NANO_USER_CONFIG", userConfigPath)
+
+	// Create project config with MCP
 	projectConfig := `
 mcp:
   enable_client: true
   servers:
     - name: "project-server"
       command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-security:
-  hooks:
-    - name: "user-hook-1"
-      enabled: false
-    - name: "project-hook"
-      enabled: true
-      command: "echo project-hook"
 `
-	require.NoError(t, os.WriteFile(".nano.yaml", []byte(projectConfig), 0644))
+	require.NoError(t, os.MkdirAll(".nano", 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(projectConfig), 0644))
 
 	// Load config
 	cfg, err := LoadConfig("")
@@ -75,24 +61,8 @@ security:
 	assert.Len(t, cfg.MCP.Servers, 1)
 	assert.Equal(t, "project-server", cfg.MCP.Servers[0].Name)
 
-	// Verify security hooks were merged (merge_by_key on "name")
-	assert.NotNil(t, cfg.Security)
-	assert.Len(t, cfg.Security.Hooks, 3)
-
-	// Find hooks by name
-	hooksByName := make(map[string]HookConfig)
-	for _, hook := range cfg.Security.Hooks {
-		hooksByName[hook.Name] = hook
-	}
-
-	// user-hook-1 should be disabled (overridden by project)
-	assert.False(t, hooksByName["user-hook-1"].Enabled)
-	// user-hook-2 should still be enabled (from user)
-	assert.True(t, hooksByName["user-hook-2"].Enabled)
-	// project-hook should exist
-	assert.True(t, hooksByName["project-hook"].Enabled)
-
 	// Verify security rules were appended
+	assert.NotNil(t, cfg.Security)
 	assert.Contains(t, cfg.Security.AllowRules, "Bash(git *)")
 	assert.Contains(t, cfg.Security.DenyRules, "Bash(rm -rf /)")
 }
@@ -109,21 +79,15 @@ func TestLoadConfig_DeepMerge_OnlyUserConfig(t *testing.T) {
 	defer func() { _ = os.Chdir(originalDir) }()
 	require.NoError(t, os.Chdir(projectDir))
 
-	// Override home dir for test
-	originalHome := os.Getenv("HOME")
-	defer func() { os.Setenv("HOME", originalHome) }()
-	os.Setenv("HOME", homeDir)
-
 	// Create user config only
 	userConfig := `
 api_key: "user-only-key"
-security:
-  hooks:
-    - name: "user-hook"
-      enabled: true
-      command: "echo user-hook"
 `
-	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(userConfig), 0644))
+	userConfigPath := filepath.Join(configDir, "config.yaml")
+	require.NoError(t, os.WriteFile(userConfigPath, []byte(userConfig), 0644))
+
+	// Point NANO_USER_CONFIG to our temp user config
+	t.Setenv("NANO_USER_CONFIG", userConfigPath)
 
 	// No project config
 	// Load config
@@ -133,9 +97,6 @@ security:
 
 	// Verify user config was loaded
 	assert.Equal(t, "user-only-key", cfg.APIKey)
-	assert.NotNil(t, cfg.Security)
-	assert.Len(t, cfg.Security.Hooks, 1)
-	assert.Equal(t, "user-hook", cfg.Security.Hooks[0].Name)
 }
 
 func TestLoadConfig_DeepMerge_OnlyProjectConfig(t *testing.T) {
@@ -151,7 +112,8 @@ api_key: "project-only-key"
 mcp:
   enable_client: true
 `
-	require.NoError(t, os.WriteFile(".nano.yaml", []byte(projectConfig), 0644))
+	require.NoError(t, os.MkdirAll(".nano", 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(projectConfig), 0644))
 
 	// Load config
 	cfg, err := LoadConfig("")
@@ -176,24 +138,18 @@ func TestLoadConfig_DeepMerge_ExplicitEmptyArrayClearsField(t *testing.T) {
 	defer func() { _ = os.Chdir(originalDir) }()
 	require.NoError(t, os.Chdir(projectDir))
 
-	// Override home dir for test
-	originalHome := os.Getenv("HOME")
-	defer func() { os.Setenv("HOME", originalHome) }()
-	os.Setenv("HOME", homeDir)
-
-	// Create user config with hooks
+	// Create user config with MCP servers
 	userConfig := `
-security:
-  hooks:
-    - name: "hook1"
-      enabled: true
-      command: "echo hook1"
 mcp:
   servers:
     - name: "server1"
       command: ["npx"]
 `
-	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(userConfig), 0644))
+	userConfigPath := filepath.Join(configDir, "config.yaml")
+	require.NoError(t, os.WriteFile(userConfigPath, []byte(userConfig), 0644))
+
+	// Point NANO_USER_CONFIG to our temp user config
+	t.Setenv("NANO_USER_CONFIG", userConfigPath)
 
 	// Create project config that explicitly clears servers
 	projectConfig := `
@@ -201,16 +157,13 @@ mcp:
   servers: []
   enable_client: true
 `
-	require.NoError(t, os.WriteFile(".nano.yaml", []byte(projectConfig), 0644))
+	require.NoError(t, os.MkdirAll(".nano", 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(projectConfig), 0644))
 
 	// Load config
 	cfg, err := LoadConfig("")
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
-
-	// Verify hooks still exist (not touched by project config)
-	assert.NotNil(t, cfg.Security)
-	assert.Len(t, cfg.Security.Hooks, 1)
 
 	// Verify MCP servers were explicitly cleared
 	assert.NotNil(t, cfg.MCP)
@@ -230,11 +183,6 @@ func TestLoadConfig_DeepMerge_AppendRules(t *testing.T) {
 	defer func() { _ = os.Chdir(originalDir) }()
 	require.NoError(t, os.Chdir(projectDir))
 
-	// Override home dir for test
-	originalHome := os.Getenv("HOME")
-	defer func() { os.Setenv("HOME", originalHome) }()
-	os.Setenv("HOME", homeDir)
-
 	// Create user config with some rules
 	userConfig := `
 security:
@@ -244,7 +192,11 @@ security:
   deny_rules:
     - "Bash(rm -rf /)"
 `
-	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(userConfig), 0644))
+	userConfigPath := filepath.Join(configDir, "config.yaml")
+	require.NoError(t, os.WriteFile(userConfigPath, []byte(userConfig), 0644))
+
+	// Point NANO_USER_CONFIG to our temp user config
+	t.Setenv("NANO_USER_CONFIG", userConfigPath)
 
 	// Create project config with additional rules (including duplicates)
 	projectConfig := `
@@ -255,7 +207,8 @@ security:
   deny_rules:
     - "Bash(sudo *)"
 `
-	require.NoError(t, os.WriteFile(".nano.yaml", []byte(projectConfig), 0644))
+	require.NoError(t, os.MkdirAll(".nano", 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(projectConfig), 0644))
 
 	// Load config
 	cfg, err := LoadConfig("")
@@ -286,24 +239,19 @@ func TestLoadConfig_LegacyMode(t *testing.T) {
 	defer func() { _ = os.Chdir(originalDir) }()
 	require.NoError(t, os.Chdir(projectDir))
 
-	// Override home dir for test
-	originalHome := os.Getenv("HOME")
-	defer func() { os.Setenv("HOME", originalHome) }()
-	os.Setenv("HOME", homeDir)
+	// Point NANO_USER_CONFIG to our temp user config
+	userConfigPath := filepath.Join(configDir, "config.yaml")
+	t.Setenv("NANO_USER_CONFIG", userConfigPath)
 
 	// Enable legacy mode
-	originalLegacy := os.Getenv("NANO_CONFIG_LEGACY_SHADOW")
-	defer func() { os.Setenv("NANO_CONFIG_LEGACY_SHADOW", originalLegacy) }()
-	os.Setenv("NANO_CONFIG_LEGACY_SHADOW", "1")
+	t.Setenv("NANO_CONFIG_LEGACY_SHADOW", "1")
 
 	// Create user config with hooks
 	userConfig := `
 api_key: "user-key"
 security:
-  hooks:
-    - name: "user-hook"
-      enabled: true
-      command: "echo user-hook"
+  allow_rules:
+    - "Bash(git *)"
 `
 	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(userConfig), 0644))
 
@@ -313,7 +261,8 @@ api_key: "project-key"
 mcp:
   enable_client: true
 `
-	require.NoError(t, os.WriteFile(".nano.yaml", []byte(projectConfig), 0644))
+	require.NoError(t, os.MkdirAll(".nano", 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(projectConfig), 0644))
 
 	// Load config
 	cfg, err := LoadConfig("")
@@ -325,9 +274,9 @@ mcp:
 	assert.NotNil(t, cfg.MCP)
 	assert.True(t, cfg.MCP.EnableClient)
 
-	// User hooks should NOT be present (legacy single-file behavior)
+	// User security rules should NOT be present (legacy single-file behavior)
 	if cfg.Security != nil {
-		assert.Len(t, cfg.Security.Hooks, 0)
+		assert.NotContains(t, cfg.Security.AllowRules, "Bash(git *)")
 	}
 }
 
@@ -343,11 +292,6 @@ func TestLoadConfig_DeepMerge_MCPServers(t *testing.T) {
 	defer func() { _ = os.Chdir(originalDir) }()
 	require.NoError(t, os.Chdir(projectDir))
 
-	// Override home dir for test
-	originalHome := os.Getenv("HOME")
-	defer func() { os.Setenv("HOME", originalHome) }()
-	os.Setenv("HOME", homeDir)
-
 	// Create user config with MCP servers
 	userConfig := `
 mcp:
@@ -358,7 +302,11 @@ mcp:
     - name: "github"
       command: ["npx", "-y", "@modelcontextprotocol/server-github"]
 `
-	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(userConfig), 0644))
+	userConfigPath := filepath.Join(configDir, "config.yaml")
+	require.NoError(t, os.WriteFile(userConfigPath, []byte(userConfig), 0644))
+
+	// Point NANO_USER_CONFIG to our temp user config
+	t.Setenv("NANO_USER_CONFIG", userConfigPath)
 
 	// Create project config that updates filesystem and adds another server
 	projectConfig := `
@@ -369,7 +317,8 @@ mcp:
     - name: "project-specific"
       command: ["node", "./mcp-server.js"]
 `
-	require.NoError(t, os.WriteFile(".nano.yaml", []byte(projectConfig), 0644))
+	require.NoError(t, os.MkdirAll(".nano", 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(projectConfig), 0644))
 
 	// Load config
 	cfg, err := LoadConfig("")

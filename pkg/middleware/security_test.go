@@ -123,13 +123,14 @@ func TestCommandGuard_BlockDestructive(t *testing.T) {
 
 func TestCommandGuard_ConfirmUnclassified(t *testing.T) {
 	guard := NewCommandGuard(nil, nil, nil)
-	// Simple unclassified commands are now auto-allowed with low confidence
+	// Simple unclassified commands now require confirmation (not auto-allowed)
+	// to prevent tools like kubectl, curl, nc from being silently approved.
 	d, err := guard.Analyze(context.Background(), "curl http://example.com")
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
-	if d.Action != ActionAllow {
-		t.Errorf("curl: expected ActionAllow (simple command), got %s", d.Action)
+	if d.Action != ActionConfirm {
+		t.Errorf("curl: expected ActionConfirm (simple unclassified command), got %s", d.Action)
 	}
 	if d.Confidence != 0.6 {
 		t.Errorf("curl: expected confidence 0.6, got %f", d.Confidence)
@@ -437,8 +438,9 @@ func TestCommandGuard_HookModifyParamsAnalyzesRewrittenCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyze returned error: %v", err)
 	}
+	// Hook rewrites the command to "git status" which is a known read-only command.
 	if decision.Action != ActionAllow {
-		t.Fatalf("expected rewritten command to be allowed, got %+v", decision)
+		t.Fatalf("expected rewritten read-only command to be allowed, got %+v", decision)
 	}
 	if decision.ModifiedParams["command"] != "git status" {
 		t.Fatalf("expected modified command in decision, got %+v", decision.ModifiedParams)
@@ -726,13 +728,14 @@ func TestSafeWriteAutoApprover_UnsafeNotApproved(t *testing.T) {
 
 func TestSimpleCommandAutoAllow(t *testing.T) {
 	analyzer := DefaultSemanticAnalyzer()
-	// A simple unclassified command (not in any checker) should be auto-allowed
+	// A simple unclassified command now requires confirmation instead of being
+	// auto-allowed, to prevent tools like kubectl/curl/nc from running silently.
 	decision, err := analyzer.Analyze("mycustomcommand --flag")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if decision.Action != ActionAllow {
-		t.Errorf("expected ActionAllow for simple unclassified command, got %v", decision.Action)
+	if decision.Action != ActionConfirm {
+		t.Errorf("expected ActionConfirm for simple unclassified command, got %v", decision.Action)
 	}
 	if decision.Rule != "SimpleCommandAutoAllow" {
 		t.Errorf("expected rule SimpleCommandAutoAllow, got %s", decision.Rule)

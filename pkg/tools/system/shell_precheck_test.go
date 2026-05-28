@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/nano-harness/nano-agent/pkg/policy"
 )
 
 // TestShellTool_RequiresConfirmation_BlockedReturnsFalse verifies that a
@@ -92,9 +93,9 @@ func TestShellTool_AnalyzeCommand(t *testing.T) {
 	}
 }
 
-// TestShellTool_AnalyzeSecurity verifies that AnalyzeSecurity returns the int
-// representation of the middleware.Action constants.
-func TestShellTool_AnalyzeSecurity(t *testing.T) {
+// TestShellTool_AnalyzeSecurityDecision verifies that AnalyzeSecurityDecision returns the correct
+// policy.PermissionAction constants.
+func TestShellTool_AnalyzeSecurityDecision(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "shell_precheck_test")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
@@ -105,28 +106,28 @@ func TestShellTool_AnalyzeSecurity(t *testing.T) {
 
 	tests := []struct {
 		cmd        string
-		wantAction int
+		wantAction policy.PermissionAction
 	}{
-		{"echo hello", int(middleware.ActionAllow)},
-		{"curl http://example.com", int(middleware.ActionAllow)}, // Simple unclassified command
-		{"mkfs /dev/sda", int(middleware.ActionBlock)},
-		{"cmd1 && cmd2", int(middleware.ActionConfirm)}, // Compound command
+		{"echo hello", middleware.ActionAllow},
+		{"curl http://example.com", middleware.ActionAllow}, // Simple unclassified command
+		{"mkfs /dev/sda", middleware.ActionBlock},
+		{"cmd1 && cmd2", middleware.ActionConfirm}, // Compound command
 	}
 	for _, tt := range tests {
-		action, _, err := tool.AnalyzeSecurity(context.Background(), map[string]interface{}{"command": tt.cmd})
+		decision, err := tool.AnalyzeSecurityDecision(context.Background(), map[string]interface{}{"command": tt.cmd})
 		if err != nil {
-			t.Errorf("%q: AnalyzeSecurity error: %v", tt.cmd, err)
+			t.Errorf("%q: AnalyzeSecurityDecision error: %v", tt.cmd, err)
 			continue
 		}
-		if action != tt.wantAction {
-			t.Errorf("%q: expected action %d, got %d", tt.cmd, tt.wantAction, action)
+		if decision.Action != tt.wantAction {
+			t.Errorf("%q: expected action %d, got %d", tt.cmd, tt.wantAction, decision.Action)
 		}
 	}
 }
 
-// TestShellTool_AnalyzeSecurity_MissingCommand verifies that a missing command
+// TestShellTool_AnalyzeSecurityDecision_MissingCommand verifies that a missing command
 // parameter returns ActionConfirm (conservative default).
-func TestShellTool_AnalyzeSecurity_MissingCommand(t *testing.T) {
+func TestShellTool_AnalyzeSecurityDecision_MissingCommand(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "shell_precheck_test")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
@@ -135,12 +136,12 @@ func TestShellTool_AnalyzeSecurity_MissingCommand(t *testing.T) {
 
 	tool := NewShellTool(tempDir, nil, nil)
 
-	action, _, err := tool.AnalyzeSecurity(context.Background(), map[string]interface{}{})
+	decision, err := tool.AnalyzeSecurityDecision(context.Background(), map[string]interface{}{})
 	if err != nil {
-		t.Fatalf("AnalyzeSecurity: unexpected error: %v", err)
+		t.Fatalf("AnalyzeSecurityDecision: unexpected error: %v", err)
 	}
-	if action != int(middleware.ActionConfirm) {
-		t.Errorf("expected ActionConfirm for missing command, got %d", action)
+	if decision.Action != middleware.ActionConfirm {
+		t.Errorf("expected ActionConfirm for missing command, got %d", decision.Action)
 	}
 }
 

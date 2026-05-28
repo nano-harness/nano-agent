@@ -111,15 +111,14 @@ func (s *AgentTestSuite) SetupTest() {
 	config.SetGlobalConfig(cfg)
 
 	// 4. 初始化 Agent，默认允许所有工具执行（无确认）
-	approvalHandler := func(info *agent.ToolCallInfo) bool {
-		return true
-	}
-
-	agentInstance, err := agent.New(cfg, approvalHandler)
+	agentInstance, err := agent.New(cfg)
 	require.NoError(t, err, "failed to initialize agent")
+	agentInstance.SetApprovalHandlerV2(func(_ *agent.ToolCallInfo) agent.ApprovalDecision {
+		return agent.ApprovalApproveOnce
+	})
 
 	// E2E 测试不走 Engine，必须手动注册 agent tools (task 等)
-	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg, agentInstance)
+	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg)
 
 	s.Agent = agentInstance
 	s.Config = cfg

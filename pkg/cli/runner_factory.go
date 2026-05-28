@@ -21,15 +21,23 @@ func runDefaultTeammate(ctx context.Context, identity *swarm.TeammateIdentity, i
 		return err
 	}
 	cfg = configForTeammate(cfg, identity)
+
+	// Resolve permission mode using unified resolver
+	res, warns := ResolvePermission(cfg, PermissionResolveOpts{
+		EnvHintEnabled: true,
+	})
+	LogPermissionResolution("swarm.teammate", res, warns)
+
 	// Match the hidden teammate CLI path: the lead-authorized spawn controls when
 	// this runner starts, while teammate mode withholds lead-only swarm tools.
-	approvalHandler := func(info *agent.ToolCallInfo) bool {
-		return true
-	}
-	eng, err := engine.NewTeammateEngine(cfg, approvalHandler, identity)
+	eng, err := engine.NewTeammateEngine(cfg, identity)
 	if err != nil {
 		return err
 	}
+	// Auto-approve all tools for teammate autonomy.
+	eng.Agent.SetApprovalHandlerV2(func(*agent.ToolCallInfo) agent.ApprovalDecision {
+		return agent.ApprovalApproveOnce
+	})
 	defer eng.Shutdown()
 
 	ctx = swarm.WithTeammate(ctx, identity)

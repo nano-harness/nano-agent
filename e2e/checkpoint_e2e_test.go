@@ -91,7 +91,7 @@ func TestCheckpoint_ResumeFromCheckpoint(t *testing.T) {
 	cp, err := mgr.Snapshot("resume test", "e2e")
 	require.NoError(t, err)
 
-	ag, err := agent.New(newE2EAgentConfig(workDir, mock.URL()), func(*agent.ToolCallInfo) bool { return true })
+	ag, err := agent.New(newE2EAgentConfig(workDir, mock.URL()))
 	require.NoError(t, err)
 	defer func() { _ = ag.Shutdown() }()
 
@@ -129,7 +129,7 @@ func TestCheckpoint_AutomaticCheckpointing(t *testing.T) {
 	before, err := mgr.Snapshot("before agent turn", "agent")
 	require.NoError(t, err)
 
-	ag, err := agent.New(newE2EAgentConfig(workDir, mock.URL()), func(*agent.ToolCallInfo) bool { return true })
+	ag, err := agent.New(newE2EAgentConfig(workDir, mock.URL()))
 	require.NoError(t, err)
 	defer func() { _ = ag.Shutdown() }()
 

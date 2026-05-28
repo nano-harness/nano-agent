@@ -11,6 +11,7 @@ import (
 
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/mcp"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
@@ -1118,6 +1119,10 @@ Examples:
 			}
 			fmt.Printf("Authorization successful! Token stored (expires: %s)\n", exp)
 
+			// Fire HookNotification subtype "auth_success" so user-registered hooks
+			// can react to OAuth completion (e.g. desktop notification, audit log).
+			emitAuthSuccessNotification(cfg, serverName, scopes, entry.ExpiresAt)
+
 			// Persist OAuth config back to server settings if it wasn't already there
 			if cfg != nil && cfg.MCP != nil {
 				updated := false
@@ -1172,4 +1177,71 @@ func persistConfig(cfg *config.Config, configFile string) error {
 		return err
 	}
 	return os.WriteFile(configFile, data, 0o644)
+}
+
+// emitAuthSuccessNotification fires the HookNotification with subtype "auth_success"
+// so user-registered hooks can react to OAuth completion. Runs synchronously with
+// a 5s timeout since this is a short-lived CLI subcommand (not a long-running agent).
+func emitAuthSuccessNotification(cfg *config.Config, serverName, scopes string, expiresAt time.Time) {
+	if cfg == nil || cfg.Hooks == nil || len(cfg.Hooks.Events) == 0 {
+		return
+	}
+	hooks := buildHooksFromConfig(cfg.Hooks)
+	if len(hooks) == 0 {
+		return
+	}
+	engine := middleware.NewHookEngine(hooks)
+	params := map[string]interface{}{
+		"subtype":     "auth_success",
+		"server_name": serverName,
+		"scopes":      scopes,
+	}
+	if !expiresAt.IsZero() {
+		params["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = engine.Execute(ctx, middleware.HookNotification, "auth_success", params)
+}
+
+// buildHooksFromConfig converts HooksConfig events into middleware-compatible hooks.
+func buildHooksFromConfig(hc *config.HooksConfig) []middleware.Hook {
+	if hc == nil || len(hc.Events) == 0 {
+		return nil
+	}
+	var hooks []middleware.Hook
+	for eventKey, cmds := range hc.Events {
+		ev := normalizeMCPHookEventName(eventKey)
+		for i, cmd := range cmds {
+			pattern := cmd.Matcher
+			if pattern == "" {
+				pattern = "*"
+			}
+			hooks = append(hooks, middleware.Hook{
+				Name:    fmt.Sprintf("%s-%d", eventKey, i),
+				Event:   ev,
+				Pattern: pattern,
+				Command: cmd.Command,
+				Enabled: true,
+				Timeout: time.Duration(cmd.Timeout) * time.Second,
+			})
+		}
+	}
+	return hooks
+}
+
+// normalizeMCPHookEventName maps config event name strings to hookservice events.
+func normalizeMCPHookEventName(key string) middleware.HookEvent {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "notification":
+		return middleware.HookNotification
+	case "session_start", "sessionstart":
+		return middleware.HookSessionStart
+	case "session_end", "sessionend":
+		return middleware.HookSessionEnd
+	case "stop":
+		return middleware.HookStop
+	default:
+		return middleware.HookNotification
+	}
 }

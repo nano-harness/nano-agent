@@ -51,17 +51,17 @@ type CompressionStrategy struct {
 	maxTokens         int               // Maximum tokens before compression
 	minMessagesToKeep int               // Minimum messages to always preserve
 	tokenCounter      *llm.TokenCounter // Accurate token counting
+	cfg               *config.Config    // retained for prompt builder access
 }
 
 // NewCompressionStrategy creates a new compression strategy, dynamically
 // calibrated to the configured model's context window via the model registry.
-func NewCompressionStrategy() *CompressionStrategy {
+func NewCompressionStrategy(cfg *config.Config) *CompressionStrategy {
 	// Create token counter with a default model
 	tokenCounter, _ := llm.NewTokenCounter("moonshot-v1") // Use moonshot for more accurate counting
 
 	// Infer profile from configured model name; pass empty string when model is
 	// not configured so that InferModelProfile applies its conservative default.
-	cfg := config.Get()
 	modelName := ""
 	if cfg != nil {
 		modelName = cfg.Model
@@ -109,6 +109,7 @@ func NewCompressionStrategy() *CompressionStrategy {
 		maxTokens:         maxTokens,
 		minMessagesToKeep: minMessagesToKeep,
 		tokenCounter:      tokenCounter,
+		cfg:               cfg,
 	}
 }
 
@@ -606,7 +607,7 @@ func (cs *CompressionStrategy) GenerateSummary(ctx context.Context, client llm.S
 		return "No previous context", nil
 	}
 
-	spb := NewSystemPromptBuilder("", nil, nil, config.Get())
+	spb := NewSystemPromptBuilder("", nil, nil, cs.cfg)
 	summaryPrompt := spb.BuildCompressionPrompt()
 
 	// Format messages for summarization

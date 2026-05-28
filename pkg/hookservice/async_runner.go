@@ -2,7 +2,7 @@ package hookservice
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"os/exec"
 	"strings"
 	"sync"
@@ -29,29 +29,35 @@ func (r *AsyncRunner) Run(ctx context.Context, svc *Service, h *Hook, event Even
 	}
 	hook := *h
 	copiedParams := copyParams(params)
+	var decodedParams map[string]interface{}
+	_ = json.Unmarshal([]byte(inputJSON), &decodedParams)
+
+	input := Input{
+		Event:          event,
+		HookEventName:  hookEventName(event),
+		SessionID:      stringFromParams(copiedParams, "session_id"),
+		TranscriptPath: stringFromParams(copiedParams, "transcript_path"),
+		Cwd:            stringFromParams(copiedParams, "cwd"),
+		ToolName:       toolName,
+		Params:         decodedParams,
+		WorkingDir:     svc.options.WorkingDir,
+	}
 	r.pending.Add(1)
 	go func() {
 		defer r.pending.Done()
-		decision, err := svc.runCommandHook(context.Background(), &hook, event, inputJSON, toolName, copiedParams)
-		if !hook.AsyncRewake || r.wakeupCb == nil {
+		decision, err := svc.runCommandHook(context.Background(), &hook, input)
+		if r.wakeupCb == nil {
 			return
 		}
-		reason := ""
-		if decision != nil {
-			reason = decision.Reason
-			if decision.Action == ActionBlock {
-				if err := r.wakeupCb(ctx, stringParam(copiedParams, "session_id"), reason); err != nil {
-					logger.Warnf("async rewake callback failed for hook %s: %v", hook.Name, err)
-				}
-				return
+		if decision != nil && decision.Action == ActionBlock {
+			if err := r.wakeupCb(ctx, input.SessionID, decision.Reason); err != nil {
+				logger.Warnf("async rewake callback failed for hook %s: %v", hook.Name, err)
 			}
+			return
 		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
-			if reason == "" {
-				reason = strings.TrimSpace(exitErr.Error())
-			}
-			if err := r.wakeupCb(ctx, stringParam(copiedParams, "session_id"), reason); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
+			reason := strings.TrimSpace(exitErr.Error())
+			if err := r.wakeupCb(ctx, input.SessionID, reason); err != nil {
 				logger.Warnf("async rewake callback failed for hook %s: %v", hook.Name, err)
 			}
 		}
@@ -63,4 +69,16 @@ func (r *AsyncRunner) Close() {
 		return
 	}
 	r.pending.Wait()
+}
+
+func stringFromParams(params map[string]interface{}, key string) string {
+	if params == nil {
+		return ""
+	}
+	if v, ok := params[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }

@@ -89,7 +89,7 @@ func (t *DeleteFileTool) RequiresConfirmationForParams(params map[string]interfa
 		"license", "license.txt", "license.md",
 		"changelog.md", "changelog.txt",
 		"config.yml", "config.yaml", "config.json", "config.toml",
-		".nano.yaml", ".nano.yml", ".nano.json",
+		".nano/nano.yaml", ".nano.yml", ".nano.json",
 	}
 
 	for _, critical := range criticalFiles {

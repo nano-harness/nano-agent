@@ -16,6 +16,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
+	"github.com/nano-harness/nano-agent/pkg/toolruntime"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/nano-harness/nano-agent/pkg/tools/system"
 )
@@ -41,14 +42,14 @@ func ToolCallIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// WithApprovalHandler returns a derived context carrying a per-request approval handler.
-func WithApprovalHandler(ctx context.Context, handler func(*ToolCallInfo) bool) context.Context {
+// WithApprovalHandler returns a derived context carrying a per-request V2 approval handler.
+func WithApprovalHandler(ctx context.Context, handler func(*ToolCallInfo) ApprovalDecision) context.Context {
 	return context.WithValue(ctx, ctxKeyApprovalHandler{}, handler)
 }
 
-// approvalHandlerFromCtx extracts the per-request approval handler from ctx, or nil.
-func approvalHandlerFromCtx(ctx context.Context) func(*ToolCallInfo) bool {
-	h, _ := ctx.Value(ctxKeyApprovalHandler{}).(func(*ToolCallInfo) bool)
+// approvalHandlerFromCtx extracts the per-request V2 approval handler from ctx, or nil.
+func approvalHandlerFromCtx(ctx context.Context) func(*ToolCallInfo) ApprovalDecision {
+	h, _ := ctx.Value(ctxKeyApprovalHandler{}).(func(*ToolCallInfo) ApprovalDecision)
 	return h
 }
 
@@ -123,8 +124,7 @@ type ToolScheduler struct {
 	mutex                 sync.RWMutex
 	onUpdate              func([]*ToolCallInfo)
 	onComplete            func([]*ToolCallInfo)
-	outputHandler         func(string, string)     // callID, output chunk
-	approvalHandler       func(*ToolCallInfo) bool // returns true if approved
+	outputHandler         func(string, string) // callID, output chunk
 	approvalHandlerV2     func(*ToolCallInfo) ApprovalDecision
 	allowedExact          map[string]struct{}
 	allowedPatterns       []string
@@ -139,6 +139,8 @@ type ToolScheduler struct {
 	hookEngine *middleware.HookEngine
 	// workDir is the working directory for hook execution context
 	workDir string
+	// toolRuntime consolidates middleware chain + hook dispatch for hot-path execution
+	toolRuntime *toolruntime.Runtime
 }
 
 // SetEventHandler sets the event handler for the tool scheduler and propagates
@@ -151,25 +153,11 @@ func (ts *ToolScheduler) SetEventHandler(handler func(event.StreamEvent)) {
 	}
 }
 
-// SetApprovalHandler sets the approval handler for the tool scheduler.
-func (ts *ToolScheduler) SetApprovalHandler(handler func(*ToolCallInfo) bool) {
-	ts.mutex.Lock()
-	defer ts.mutex.Unlock()
-	ts.approvalHandler = handler
-}
-
 // SetApprovalHandlerV2 sets an approval handler that can approve once or always.
 func (ts *ToolScheduler) SetApprovalHandlerV2(handler func(*ToolCallInfo) ApprovalDecision) {
 	ts.mutex.Lock()
 	defer ts.mutex.Unlock()
 	ts.approvalHandlerV2 = handler
-}
-
-// GetApprovalHandler returns the current approval handler.
-func (ts *ToolScheduler) GetApprovalHandler() func(*ToolCallInfo) bool {
-	ts.mutex.RLock()
-	defer ts.mutex.RUnlock()
-	return ts.approvalHandler
 }
 
 // SetPermissionManager sets the permission manager used to bypass confirmations.
@@ -227,7 +215,6 @@ type ToolSchedulerOptions struct {
 	OnUpdate          func([]*ToolCallInfo)
 	OnComplete        func([]*ToolCallInfo)
 	OutputHandler     func(string, string) // callID, output chunk
-	ApprovalHandler   func(*ToolCallInfo) bool
 	ApprovalHandlerV2 func(*ToolCallInfo) ApprovalDecision
 }
 
@@ -253,7 +240,6 @@ func NewToolSchedulerWithOptions(opts ToolSchedulerOptions) *ToolScheduler {
 		onUpdate:          opts.OnUpdate,
 		onComplete:        opts.OnComplete,
 		outputHandler:     opts.OutputHandler,
-		approvalHandler:   opts.ApprovalHandler,
 		approvalHandlerV2: opts.ApprovalHandlerV2,
 		allowedExact:      nil,
 		allowedPatterns:   nil,
@@ -575,10 +561,12 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 		ts.mutex.RUnlock()
 		hookRequiresApproval := false
 		if hookEngine != nil {
-			preParams := make(map[string]interface{}, len(tool.Parameters)+1)
+			preParams := make(map[string]interface{}, len(tool.Parameters)+3)
 			for k, v := range tool.Parameters {
 				preParams[k] = v
 			}
+			preParams["input"] = tool.Parameters
+			preParams["tool_use_id"] = tool.ID
 			if sid := sessionIDFromContext(ctx); sid != "" {
 				preParams["session_id"] = sid
 			}
@@ -816,6 +804,10 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 				ts.mutex.RUnlock()
 				if pm != nil && pm.GetSessionAllowlist().IsAllowed(tool.Name, tool.Parameters) {
 					toolCall.RequiresApproval = false
+				} else if preflight.ExplicitlyAllowed {
+					// Auto mode fast-path already approved; a lower-confidence
+					// ActionConfirm must not override that decision.
+					toolCall.RequiresApproval = false
 				} else if pm != nil && decision.Confidence >= pm.GetConfidenceThreshold() {
 					// High-confidence confirm → auto-approve, add to session allowlist
 					toolCall.RequiresApproval = false
@@ -923,35 +915,89 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 
 		// Handle approval flow
 		if toolCall.RequiresApproval {
+			// Fire PermissionRequest hook (sync) — may short-circuit the prompt.
+			if hookEngine != nil {
+				permReqParams := map[string]interface{}{
+					"tool_name":   tool.Name,
+					"input":       tool.Parameters,
+					"tool_use_id": tool.ID,
+				}
+				if sid := sessionIDFromContext(ctx); sid != "" {
+					permReqParams["session_id"] = sid
+				}
+				permDecision, permErr := hookEngine.Execute(ctx, middleware.HookPermissionRequest, tool.Name, permReqParams)
+				if permErr != nil {
+					logger.Warnf("PermissionRequest hook error for tool %s: %v", tool.Name, permErr)
+				}
+				if permDecision != nil {
+					switch permDecision.Action {
+					case middleware.ActionAllow:
+						// Hook allows — skip user prompt.
+						toolCall.RequiresApproval = false
+					case middleware.ActionBlock:
+						// Hook denies — fire PermissionDenied and block.
+						go func() {
+							denyParams := map[string]interface{}{
+								"tool_name": tool.Name,
+								"reason":    permDecision.Reason,
+							}
+							_, _ = hookEngine.Execute(context.Background(), middleware.HookPermissionDenied, tool.Name, denyParams)
+						}()
+						tr := &interfaces.ToolResult{
+							Success:     false,
+							Error:       "blocked by permission hook",
+							Metadata:    map[string]interface{}{"code": "permission_denied", "tool_name": tool.Name, "hook_rule": permDecision.Rule},
+							LLMContent:  fmt.Sprintf("Tool '%s' blocked by permission hook: %s", tool.Name, permDecision.Reason),
+							UserContent: fmt.Sprintf("工具 '%s' 被权限 hook 拒绝: %s", tool.Name, permDecision.Reason),
+						}
+						ts.setStatus(tool.ID, StatusError, tr, fmt.Errorf("blocked by permission hook: %s", permDecision.Reason))
+						continue
+					}
+				}
+			}
+
+			// Fire Notification with subtype "permission_prompt" before prompting user.
+			if toolCall.RequiresApproval && hookEngine != nil {
+				notifyParams := map[string]interface{}{
+					"subtype":   "permission_prompt",
+					"tool_name": tool.Name,
+					"input":     tool.Parameters,
+				}
+				go func() {
+					_, _ = hookEngine.Execute(context.Background(), middleware.HookNotification, "permission_prompt", notifyParams)
+				}()
+			}
+
 			ctxApprovalHandler := approvalHandlerFromCtx(ctx)
 			ts.mutex.RLock()
 			approvalHandlerV2 := ts.approvalHandlerV2
-			approvalHandler := ts.approvalHandler
 			ts.mutex.RUnlock()
+
+			// Resolve effective V2 handler: context overrides struct field.
+			effectiveV2 := approvalHandlerV2
 			if ctxApprovalHandler != nil {
+				effectiveV2 = ctxApprovalHandler
+			}
+
+			if effectiveV2 != nil {
 				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
-				if ctxApprovalHandler(toolCall) {
-					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
-				} else {
-					tr := &interfaces.ToolResult{
-						Success:     false,
-						Error:       "cancelled by approval policy",
-						Metadata:    map[string]interface{}{"status": "cancelled", "reason": "approval_policy_declined"},
-						LLMContent:  "Tool execution was cancelled by approval policy.",
-						UserContent: "Tool execution was cancelled by approval policy.",
-					}
-					tr = ts.normalizeToolResultFields(toolCall.Name, tr, nil)
-					ts.setStatus(tool.ID, StatusCancelled, tr, fmt.Errorf("cancelled by approval policy"))
-				}
-			} else if approvalHandlerV2 != nil {
-				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
-				switch approvalHandlerV2(toolCall) {
+				switch effectiveV2(toolCall) {
 				case ApprovalApproveAlways:
 					ts.addAllowlistRules(toolCall)
 					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
 				case ApprovalApproveOnce:
 					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
 				case ApprovalReject:
+					// Fire PermissionDenied (async).
+					if hookEngine != nil {
+						go func() {
+							denyParams := map[string]interface{}{
+								"tool_name": tool.Name,
+								"reason":    "user_declined",
+							}
+							_, _ = hookEngine.Execute(context.Background(), middleware.HookPermissionDenied, tool.Name, denyParams)
+						}()
+					}
 					tr := &interfaces.ToolResult{
 						Success:     false,
 						Error:       "cancelled by user",
@@ -962,13 +1008,6 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 					tr = ts.normalizeToolResultFields(toolCall.Name, tr, nil)
 					ts.setStatus(tool.ID, StatusCancelled, tr, fmt.Errorf("cancelled by user"))
 				}
-			} else if approvalHandler != nil {
-				ts.setStatus(tool.ID, StatusAwaitingApproval, nil, nil)
-				// In TUI mode the handler is async; true means sync-approved.
-				if approvalHandler(toolCall) {
-					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
-				}
-				// else: remain in StatusAwaitingApproval until HandleConfirmationResponse is called
 			} else {
 				// No approval handler: check daemon confirm policy
 				ts.mutex.RLock()
@@ -983,12 +1022,55 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 						ts.setStatus(tool.ID, StatusScheduled, nil, nil)
 					case config.ConfirmPolicyBlock:
 						// Reject
+						ts.mutex.RLock()
+						pm := ts.permissionManager
+						ts.mutex.RUnlock()
+
+						layer := "fallback_confirm"
+						reason := "tool requires user confirmation and policy is block"
+						suggestedNext := "this call was rejected before execution; do not retry the same exact command. Try a more conservative variant of this call, or ask the workflow author to widen permissions explicitly via allow_rules."
+						if pm != nil {
+							layer, reason, suggestedNext = pm.PolicyBlockReason(tool.Name, toolCall.Parameters)
+						}
+						llmContent := strings.Join([]string{
+							"BLOCKED_BY_POLICY",
+							"layer: " + layer,
+							"reason: " + reason,
+							"suggested_next: " + suggestedNext,
+						}, "\n")
+						userContent := fmt.Sprintf("BLOCKED_BY_POLICY\n工具 '%s' 需要确认但守护进程确认策略为 'block'，已拒绝。", tool.Name)
+
+						denySample := tool.Name
+						if v := permission.ExtractMatchValue(tool.Name, toolCall.Parameters); strings.TrimSpace(v) != "" {
+							denySample = v
+						}
+						lockedOut := false
+						if pm != nil {
+							lockedOut = pm.RecordPolicyDeny(denySample)
+						}
+						if lockedOut && ts.eventHandler != nil {
+							ts.eventHandler(event.NewStreamEvent(event.EventTypeWarning, "agent_turn").
+								WithContent("Permission classifier denial limit reached; terminating run to avoid infinite retries").
+								WithMetadata("termination_cause", "classifier_lockout"))
+						}
+
+						// Fire PermissionDenied (async).
+						if hookEngine != nil {
+							go func() {
+								denyParams := map[string]interface{}{
+									"tool_name": tool.Name,
+									"reason":    reason,
+								}
+								_, _ = hookEngine.Execute(context.Background(), middleware.HookPermissionDenied, tool.Name, denyParams)
+							}()
+						}
+
 						tr := &interfaces.ToolResult{
 							Success:     false,
-							Error:       "tool requires approval but daemon confirm policy is 'block'",
-							Metadata:    map[string]interface{}{"code": "approval_blocked", "tool_name": tool.Name},
-							LLMContent:  fmt.Sprintf("Tool '%s' call rejected: requires approval but daemon confirm policy is 'block'.", tool.Name),
-							UserContent: fmt.Sprintf("工具 '%s' 需要确认但守护进程确认策略为 'block'，已拒绝。", tool.Name),
+							Error:       "blocked by policy",
+							Metadata:    map[string]interface{}{"code": "blocked_by_policy", "tool_name": tool.Name, "layer": layer},
+							LLMContent:  llmContent,
+							UserContent: userContent,
 						}
 						if ts.eventHandler != nil {
 							ts.eventHandler(event.StreamEvent{
@@ -1064,9 +1146,55 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 						ts.setStatus(tool.ID, StatusScheduled, nil, nil)
 					}
 				} else {
-					// No daemon config: default to allow for backward compatibility
-					logger.Debugf("Tool %s auto-approved (no daemon config)", tool.Name)
-					ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+					// No daemon config: fail-closed — block tools that require
+					// confirmation. SDK/API callers must configure a daemon with an
+					// explicit ConfirmPolicy to auto-approve or provide an approval
+					// handler; silently auto-approving is unsafe by default.
+					tr := &interfaces.ToolResult{
+						Success:     false,
+						Error:       "tool requires user confirmation but no approval handler or daemon config is present",
+						Metadata:    map[string]interface{}{"code": "blocked_by_policy", "tool_name": tool.Name},
+						LLMContent:  "BLOCKED_BY_POLICY\nlayer: fallback_confirm\nreason: no approval handler configured\nsuggested_next: configure a daemon ConfirmPolicy or provide an approval handler",
+						UserContent: fmt.Sprintf("BLOCKED_BY_POLICY\n工具 '%s' 需要确认但未配置审批处理程序，已拒绝。", tool.Name),
+					}
+					ts.mutex.Lock()
+					ts.toolCalls[tool.ID] = toolCall
+					ts.mutex.Unlock()
+					if ts.eventHandler != nil {
+						start := event.NewStreamEvent(event.EventTypeWorkerStart, "agent_tool_scheduler")
+						start.WorkerID = toolCall.ID
+						start = start.WithContent(toolCall.Name)
+						start = start.WithMetadata("status", string(toolCall.Status))
+						ts.eventHandler(start)
+						ts.eventHandler(event.StreamEvent{
+							Type: event.EventTypeToolCall,
+							ToolCalls: []*tools.ToolCall{{
+								ID:        toolCall.ID,
+								Name:      toolCall.Name,
+								Arguments: toolCall.Parameters,
+							}},
+						})
+						ts.eventHandler(event.StreamEvent{
+							Type: event.EventTypeToolResult,
+							ToolResult: &tools.ToolResult{
+								ID:      toolCall.ID,
+								Content: tr.LLMContent,
+								Error:   tr.Error,
+							},
+						})
+						ts.eventHandler(event.StreamEvent{
+							Type:   event.EventTypeToolUse,
+							Source: "agent_turn",
+							ToolUse: &event.ToolUse{
+								ID:         toolCall.ID,
+								ToolName:   toolCall.Name,
+								Parameters: toolCall.Parameters,
+								Status:     string(StatusError),
+								Result:     tr.UserContent,
+							},
+						})
+					}
+					ts.setStatus(tool.ID, StatusError, tr, fmt.Errorf("approval blocked: no approval handler configured"))
 				}
 			}
 		} else {
@@ -1545,35 +1673,7 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 		})
 	}
 
-	execResult := ts.recovery.ExecuteWithRecovery(callCtx, ts.toolbox, toolToExecute)
-
-	// Dispatch PostToolUse or PostToolUseFailure hook
-	ts.mutex.RLock()
-	hookEngine := ts.hookEngine
-	ts.mutex.RUnlock()
-	if hookEngine != nil {
-		hookEvent := middleware.HookPostToolUse
-		if execResult.Error != nil {
-			hookEvent = middleware.HookPostToolUseFailure
-		}
-		hookParams := make(map[string]interface{}, len(toolCall.Parameters)+3)
-		for k, v := range toolCall.Parameters {
-			hookParams[k] = v
-		}
-		if sid := sessionIDFromContext(callCtx); sid != "" {
-			hookParams["session_id"] = sid
-		}
-		if execResult.Result != nil {
-			hookParams["_result"] = execResult.Result
-		}
-		if execResult.Error != nil {
-			hookParams["_error"] = execResult.Error.Error()
-		}
-		_, err := hookEngine.Execute(callCtx, hookEvent, toolCall.Name, hookParams)
-		if err != nil {
-			logger.Warnf("PostToolUse hook execution error for tool %s: %v", toolCall.Name, err)
-		}
-	}
+	execResult := ts.executeViaRuntime(callCtx, toolToExecute)
 
 	if execResult.Error != nil {
 		logger.Errorf("Tool %s failed after recovery: %v", toolCall.Name, execResult.Error)
@@ -1968,4 +2068,76 @@ func (ts *ToolScheduler) trySchemaAutoInjection(toolName string) *interfaces.Too
 		LLMContent:  message,
 		UserContent: fmt.Sprintf("工具 '%s' 的 schema 已加载，请在下一轮重试。", toolName),
 	}
+}
+
+// executeViaRuntime delegates tool execution to the toolruntime.Runtime when available,
+// consolidating recovery + PostToolUse hook dispatch in the runtime layer.
+// Falls back to direct ToolRecoveryStrategy when toolRuntime is nil.
+func (ts *ToolScheduler) executeViaRuntime(ctx context.Context, toolCall ToolToExecute) *ToolExecutionResult {
+	ts.mutex.RLock()
+	rt := ts.toolRuntime
+	hookEngine := ts.hookEngine
+	ts.mutex.RUnlock()
+
+	if rt != nil {
+		req := toolruntime.ToolRequest{
+			ID:         toolCall.ID,
+			Name:       toolCall.Name,
+			Parameters: toolCall.Parameters,
+			SessionID:  sessionIDFromContext(ctx),
+		}
+
+		var hooks toolruntime.HookDispatcher
+		if hookEngine != nil {
+			hooks = &hookEngineAdapter{engine: hookEngine}
+		}
+
+		var recovery toolruntime.RecoveryExecutor
+		if ts.recovery != nil {
+			recovery = &recoveryAdapter{strategy: ts.recovery, executor: ts.toolbox}
+		}
+
+		rtResult := rt.ExecuteWithHooks(ctx, req, hooks, recovery)
+
+		return &ToolExecutionResult{
+			Result:        rtResult.Result,
+			Error:         rtResult.Error,
+			Attempts:      rtResult.Attempts,
+			TotalTime:     rtResult.TotalTime,
+			ErrorCategory: ErrorCategory(rtResult.ErrorCategory),
+			RecoveryInfo:  rtResult.RecoveryInfo,
+		}
+	}
+
+	// Fallback: direct execution with inline hook dispatch (legacy path)
+	execResult := ts.recovery.ExecuteWithRecovery(ctx, ts.toolbox, toolCall)
+
+	// Dispatch PostToolUse hook inline when runtime not available
+	if hookEngine != nil {
+		hookEvent := middleware.HookPostToolUse
+		if execResult.Error != nil {
+			hookEvent = middleware.HookPostToolUseFailure
+		}
+		hookParams := make(map[string]interface{}, len(toolCall.Parameters)+5)
+		for k, v := range toolCall.Parameters {
+			hookParams[k] = v
+		}
+		hookParams["input"] = toolCall.Parameters
+		hookParams["tool_use_id"] = toolCall.ID
+		if sid := sessionIDFromContext(ctx); sid != "" {
+			hookParams["session_id"] = sid
+		}
+		if execResult.Result != nil {
+			hookParams["_result"] = execResult.Result
+		}
+		if execResult.Error != nil {
+			hookParams["_error"] = execResult.Error.Error()
+		}
+		_, err := hookEngine.Execute(ctx, hookEvent, toolCall.Name, hookParams)
+		if err != nil {
+			logger.Warnf("PostToolUse hook execution error for tool %s: %v", toolCall.Name, err)
+		}
+	}
+
+	return execResult
 }

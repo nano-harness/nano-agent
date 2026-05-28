@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	agentpkg "github.com/nano-harness/nano-agent/pkg/agent"
@@ -84,7 +85,7 @@ func BuildModelSwitcher(cfgPath string) func(name string) string {
 		fields := strings.Fields(name)
 		model := fields[0]
 		if cfgPath == "" {
-			cfgPath = ".nano.yaml"
+			cfgPath = filepath.Join(".nano", "nano.yaml")
 		}
 		cfgMap, err := loadConfigMapAt(cfgPath)
 		if err != nil {
@@ -136,13 +137,13 @@ func BuildModelFallbackHandler(cfg *config.Config) func(args string) string {
 			}
 			ref := parts[1]
 			activeCfg.Fallbacks = append(activeCfg.Fallbacks, ref)
-			return fmt.Sprintf("✅ 已添加 fallback %s（当前会话生效；如需持久化请更新 .nano.yaml）。", ref)
+			return fmt.Sprintf("✅ 已添加 fallback %s（当前会话生效；如需持久化请更新 .nano/nano.yaml）。", ref)
 		case "clear":
 			activeCfg.Fallbacks = nil
 			if activeCfg.ModelRouting != nil {
 				activeCfg.ModelRouting.Fallbacks = nil
 			}
-			return "✅ 已清空 fallback 路由（当前会话生效；如需持久化请更新 .nano.yaml）。"
+			return "✅ 已清空 fallback 路由（当前会话生效；如需持久化请更新 .nano/nano.yaml）。"
 		default:
 			return fmt.Sprintf("❌ 未知 model fallback 子命令：%s", sub)
 		}

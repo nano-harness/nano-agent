@@ -35,7 +35,7 @@ func TestExecuteTaskWithMeta_FixedSessionID(t *testing.T) {
 	eng.Agent.GetSessionManager().SetStorage(nil)
 	defer eng.Shutdown()
 
-	task, err := eng.Scheduler.ScheduleTask("* * * * * *", "remember banana")
+	task, err := eng.Scheduler.ScheduleTask("0 * * * * *", "remember banana")
 	require.NoError(t, err)
 	require.NoError(t, eng.Scheduler.RunTaskNow(task.ID))
 	require.NoError(t, eng.Scheduler.RunTaskNow(task.ID))
@@ -59,7 +59,7 @@ func TestExecuteTaskWithMeta_DoesNotPolluteActiveSession(t *testing.T) {
 	mainSession := eng.Agent.GetSessionManager().GetOrCreateSession("main")
 	before := len(mainSession.GetConversationHistory())
 
-	task, err := eng.Scheduler.ScheduleTask("* * * * * *", "cron command")
+	task, err := eng.Scheduler.ScheduleTask("0 * * * * *", "cron command")
 	require.NoError(t, err)
 	require.NoError(t, eng.Scheduler.RunTaskNow(task.ID))
 
@@ -82,7 +82,7 @@ func TestExecuteTaskWithMeta_NotifierCalledStartedFinished(t *testing.T) {
 		events = append(events, ev)
 	})
 
-	task, err := eng.Scheduler.ScheduleTask("* * * * * *", "cron command")
+	task, err := eng.Scheduler.ScheduleTask("0 * * * * *", "cron command")
 	require.NoError(t, err)
 	require.NoError(t, eng.Scheduler.RunTaskNow(task.ID))
 
@@ -111,7 +111,7 @@ func TestExecuteTaskWithMeta_FinishedHasError(t *testing.T) {
 		events = append(events, ev)
 	})
 
-	task, err := eng.Scheduler.ScheduleTask("* * * * * *", "cron command")
+	task, err := eng.Scheduler.ScheduleTask("0 * * * * *", "cron command")
 	require.NoError(t, err)
 	require.NoError(t, eng.Scheduler.RunTaskNow(task.ID))
 

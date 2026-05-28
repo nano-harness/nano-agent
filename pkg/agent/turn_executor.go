@@ -77,7 +77,7 @@ func (e *turnExecutor) Execute(ctx context.Context) error {
 		t.agent.SetCurrentTurnID(t.ID)
 	}
 
-	e.prepare(ctx, config.Get())
+	e.prepare(ctx, t.agentConfig)
 	var turnErr error
 	goalContinue := false
 	for {
@@ -170,13 +170,52 @@ func (e *turnExecutor) evaluateGoal(ctx context.Context) error {
 	t := e.turn
 	condition := t.goalContext.Condition()
 	if t.goalEvaluator == nil {
-		t.goalEvaluator = NewGoalEvaluator(t.LLMClient)
+		// Provide GoalConfig to evaluator
+		goalCfg := config.GoalConfig{}
+		if t.agentConfig != nil && t.agentConfig.Goal != nil {
+			goalCfg = *t.agentConfig.Goal
+		}
+		t.goalEvaluator = NewGoalEvaluator(t.LLMClient, goalCfg)
 	}
 	result, err := t.goalEvaluator.Evaluate(ctx, condition, t.Messages)
 	if err != nil {
 		return err
 	}
+
+	// Emit event if transcript was truncated
+	if result.TranscriptStats != nil && t.eventHandler != nil {
+		payload := map[string]interface{}{
+			"original_messages":  result.TranscriptStats.OriginalMessages,
+			"preserved_messages": result.TranscriptStats.PreservedMessages,
+			"original_bytes":     result.TranscriptStats.OriginalBytes,
+			"final_bytes":        result.TranscriptStats.FinalBytes,
+			"skipped_messages":   result.TranscriptStats.SkippedMessages,
+		}
+		t.eventHandler(event.StreamEvent{
+			Type:    event.EventTypeGoalEvaluatorTruncated,
+			Source:  "goal_evaluator",
+			Payload: payload,
+		})
+	}
+
 	t.goalContext.MarkEvaluated(result.TokensUsed, result.Reason)
+
+	// Fail-closed: if evaluator consistently fails to parse, stop the goal
+	if result.EvaluatorParseFailed {
+		t.goalContext.IncrementParseFailures()
+		if t.goalContext.ConsecutiveParseFailures() >= 3 {
+			t.goalContext.MarkStopped("evaluator_parse_failure")
+			if t.eventHandler != nil {
+				t.eventHandler(event.NewStreamEvent(event.EventTypeWarning, "agent_turn").
+					WithContent("⚠️ /goal stopped: evaluator returned invalid JSON 3 consecutive times"))
+			}
+			return nil
+		}
+		t.continuationReason = result.Reason
+		return ErrContinueRequested
+	}
+	t.goalContext.ResetParseFailures()
+
 	if result.Met {
 		t.goalContext.MarkAchieved(result.Reason)
 		if t.eventHandler != nil {
@@ -212,7 +251,11 @@ func (e *turnExecutor) evaluateSatisfaction(ctx context.Context) error {
 
 	// Initialize evaluator if needed
 	if t.goalEvaluator == nil {
-		t.goalEvaluator = NewGoalEvaluator(t.LLMClient)
+		goalCfg := config.GoalConfig{}
+		if t.agentConfig != nil && t.agentConfig.Goal != nil {
+			goalCfg = *t.agentConfig.Goal
+		}
+		t.goalEvaluator = NewGoalEvaluator(t.LLMClient, goalCfg)
 	}
 
 	// Evaluate satisfaction

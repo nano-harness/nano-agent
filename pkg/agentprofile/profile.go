@@ -17,19 +17,31 @@ const (
 	frontmatterFence = "---"
 )
 
-// AgentProfile describes a reusable sub-agent declared under .nano/agents.
+// AgentProfile describes a reusable sub-agent declared under .claude/agents or .nano/agents.
 type AgentProfile struct {
-	Name             string   `json:"name" yaml:"name"`
-	Description      string   `json:"description,omitempty" yaml:"description,omitempty"`
-	InitialPrompt    string   `json:"initial_prompt,omitempty" yaml:"initial_prompt,omitempty"`
-	PermissionMode   string   `json:"permission_mode,omitempty" yaml:"permission_mode,omitempty"`
-	AllowedTools     []string `json:"allowed_tools,omitempty" yaml:"allowed_tools,omitempty"`
-	Model            string   `json:"model,omitempty" yaml:"model,omitempty"`
-	Fallbacks        []string `json:"fallbacks,omitempty" yaml:"fallbacks,omitempty"`
-	ContextProviders []string `json:"context_providers,omitempty" yaml:"context_providers,omitempty"`
-	Kind             string   `json:"kind,omitempty" yaml:"kind,omitempty"`
-	Color            string   `json:"color,omitempty" yaml:"color,omitempty"`
-	Source           string   `json:"source,omitempty" yaml:"source,omitempty"`
+	Name           string   `json:"name" yaml:"name"`
+	Description    string   `json:"description,omitempty" yaml:"description,omitempty"`
+	InitialPrompt  string   `json:"initial_prompt,omitempty" yaml:"initial_prompt,omitempty"`
+	PermissionMode string   `json:"permission_mode,omitempty" yaml:"permission_mode,omitempty"`
+	Model          string   `json:"model,omitempty" yaml:"model,omitempty"`
+	Fallbacks      []string `json:"fallbacks,omitempty" yaml:"fallbacks,omitempty"`
+	Kind           string   `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Color          string   `json:"color,omitempty" yaml:"color,omitempty"`
+	Source         string   `json:"source,omitempty" yaml:"source,omitempty"`
+
+	// New Claude-Code-aligned fields
+	Tools            []string `json:"tools,omitempty" yaml:"tools,omitempty"`                         // Tool whitelist (replaces AllowedTools); ['*'] means all
+	DisallowedTools  []string `json:"disallowed_tools,omitempty" yaml:"disallowed_tools,omitempty"`   // Explicit tool denylist
+	McpServers       []string `json:"mcp_servers,omitempty" yaml:"mcp_servers,omitempty"`             // MCP server references
+	Background       bool     `json:"background,omitempty" yaml:"background,omitempty"`               // If true, always runs async
+	Isolation        string   `json:"isolation,omitempty" yaml:"isolation,omitempty"`                 // "worktree" for git worktree isolation
+	MaxTurns         int      `json:"max_turns,omitempty" yaml:"max_turns,omitempty"`                 // Max LLM turns before forced stop
+	OmitClaudeMd     bool     `json:"omit_claude_md,omitempty" yaml:"omit_claude_md,omitempty"`       // Skip .claude.md injection
+	Plugin           string   `json:"plugin,omitempty" yaml:"plugin,omitempty"`                       // Plugin namespace ("plugin:name")
+	ContextProviders []string `json:"context_providers,omitempty" yaml:"context_providers,omitempty"` // Constrained context sources
+
+	// Deprecated: use Tools instead. Kept for backward compat during load only.
+	AllowedTools []string `json:"allowed_tools,omitempty" yaml:"allowed_tools,omitempty"`
 }
 
 // Manager discovers AgentProfile files from .nano/agents.
@@ -65,20 +77,25 @@ func (m *Manager) loadAll() {
 	if strings.TrimSpace(m.cwd) == "" {
 		return
 	}
-	root := filepath.Join(m.cwd, ".nano", "agents")
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() {
-			return nil
-		}
-		profile, err := readProfile(path)
-		if err != nil || profile.Name == "" {
-			return nil
-		}
-		if _, exists := m.profiles[profile.Name]; !exists {
+	// Search .claude/agents first, then .nano/agents (project-local overrides all)
+	roots := []string{
+		filepath.Join(m.cwd, ".claude", "agents"),
+		filepath.Join(m.cwd, ".nano", "agents"),
+	}
+	for _, root := range roots {
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d == nil || d.IsDir() {
+				return nil
+			}
+			profile, err := readProfile(path)
+			if err != nil || profile.Name == "" {
+				return nil
+			}
+			// Later roots override earlier ones (project-local wins)
 			m.profiles[profile.Name] = profile
-		}
-		return nil
-	})
+			return nil
+		})
+	}
 }
 
 func readProfile(path string) (AgentProfile, error) {
@@ -122,6 +139,11 @@ func readProfile(path string) (AgentProfile, error) {
 	if profile.Kind == "" {
 		profile.Kind = "in_process"
 	}
+	// Migrate AllowedTools → Tools (backward compat)
+	if len(profile.AllowedTools) > 0 && len(profile.Tools) == 0 {
+		profile.Tools = append([]string(nil), profile.AllowedTools...)
+	}
+	profile.AllowedTools = nil
 	return profile, nil
 }
 

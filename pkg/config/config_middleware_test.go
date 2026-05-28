@@ -21,19 +21,23 @@ func TestDefaultConfig_AuditRotationDefaults(t *testing.T) {
 	}
 }
 
-func TestConfigDeepCopyCopiesHookEnvWhitelist(t *testing.T) {
+func TestConfigDeepCopyCopiesHooksEvents(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.Security = &SecurityConfig{}
-	cfg.Security.Hooks = []HookConfig{{
-		Name:         "hook",
-		EnvWhitelist: []string{"PATH"},
-	}}
+	cfg.Hooks = &HooksConfig{
+		Events: map[string][]HookCommand{
+			"Stop": {{
+				Matcher: "*",
+				Command: "echo hi",
+				Timeout: 10,
+			}},
+		},
+	}
 
 	copied := cfg.DeepCopy()
-	copied.Security.Hooks[0].EnvWhitelist[0] = "HOME"
+	copied.Hooks.Events["Stop"][0].Command = "echo changed"
 
-	if cfg.Security.Hooks[0].EnvWhitelist[0] != "PATH" {
-		t.Fatalf("DeepCopy aliased hook env whitelist: %#v", cfg.Security.Hooks[0].EnvWhitelist)
+	if cfg.Hooks.Events["Stop"][0].Command != "echo hi" {
+		t.Fatalf("DeepCopy aliased hooks.events: %#v", cfg.Hooks.Events["Stop"][0])
 	}
 }
 

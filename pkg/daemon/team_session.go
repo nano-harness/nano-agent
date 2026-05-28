@@ -37,19 +37,23 @@ type TeamLeadSession struct {
 	mu       sync.RWMutex
 	metadata map[string]interface{}
 
+	// pendingApprovals tracks tool calls awaiting external approval decisions.
+	pendingApprovals map[string]chan agent.ApprovalDecision
+	approvalMutex    sync.Mutex
+
 	// executeFunc overrides Execute in tests.
 	executeFunc func(ctx context.Context, taskID, command string, callback func(event.StreamEvent)) error
 	approveFunc func(callID string, approved bool) error
 }
 
 // NewTeamLeadSession creates a new team-lead session
-func NewTeamLeadSession(sessionID, teamName string, cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*TeamLeadSession, error) {
+func NewTeamLeadSession(sessionID, teamName string, cfg *config.Config) (*TeamLeadSession, error) {
 	if teamName == "" {
 		teamName = "default"
 	}
 
-	// Create engine for team-lead
-	eng, err := engine.NewLeadEngine(cfg, approvalHandler, teamName)
+	// Create engine for team-lead (no V1 approval handler; V2 is set via EnableInteractiveApproval)
+	eng, err := engine.NewLeadEngine(cfg, teamName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create lead engine: %w", err)
 	}
@@ -84,13 +88,24 @@ func (s *TeamLeadSession) EnableInteractiveApproval() {
 	if s == nil || s.Engine == nil || s.Engine.Agent == nil {
 		return
 	}
-	s.Engine.Agent.SetApprovalHandler(s.requestToolApproval)
+	s.Engine.Agent.SetApprovalHandlerV2(s.requestToolApprovalV2)
 }
 
-func (s *TeamLeadSession) requestToolApproval(info *agent.ToolCallInfo) bool {
+func (s *TeamLeadSession) requestToolApprovalV2(info *agent.ToolCallInfo) agent.ApprovalDecision {
 	if info == nil {
-		return false
+		return agent.ApprovalReject
 	}
+
+	// Register pending approval channel before emitting the event to avoid races.
+	ch := make(chan agent.ApprovalDecision, 1)
+	s.approvalMutex.Lock()
+	if s.pendingApprovals == nil {
+		s.pendingApprovals = make(map[string]chan agent.ApprovalDecision)
+	}
+	s.pendingApprovals[info.ID] = ch
+	s.approvalMutex.Unlock()
+
+	// Emit WaitingForUser event so the UI/client can prompt.
 	s.enrichAndRecordEvent(event.StreamEvent{
 		Type: event.EventTypeWaitingForUser,
 		Metadata: map[string]interface{}{
@@ -101,17 +116,37 @@ func (s *TeamLeadSession) requestToolApproval(info *agent.ToolCallInfo) bool {
 			"status":     string(info.Status),
 		},
 	})
-	return false
+
+	// Block until external SubmitToolApproval provides a decision.
+	decision := <-ch
+
+	// Cleanup
+	s.approvalMutex.Lock()
+	delete(s.pendingApprovals, info.ID)
+	s.approvalMutex.Unlock()
+
+	return decision
 }
 
 func (s *TeamLeadSession) SubmitToolApproval(callID string, approved bool) error {
 	if s.approveFunc != nil {
 		return s.approveFunc(callID, approved)
 	}
-	if s == nil || s.Engine == nil || s.Engine.Agent == nil || s.Engine.Agent.GetToolScheduler() == nil {
-		return fmt.Errorf("team-lead approval handler is unavailable")
+
+	s.approvalMutex.Lock()
+	ch, exists := s.pendingApprovals[callID]
+	s.approvalMutex.Unlock()
+
+	if !exists {
+		return fmt.Errorf("no pending approval for call %s", callID)
 	}
-	return s.Engine.Agent.GetToolScheduler().HandleConfirmationResponse(callID, approved)
+
+	if approved {
+		ch <- agent.ApprovalApproveOnce
+	} else {
+		ch <- agent.ApprovalReject
+	}
+	return nil
 }
 
 // Execute executes a command in the team-lead session

@@ -161,33 +161,15 @@ func (t *ShellTool) AnalyzeCommand(ctx context.Context, command string) (*middle
 	return t.guard.Analyze(ctx, command)
 }
 
-// AnalyzeSecurityDecision returns the full security decision, including any
-// hook-proposed parameter modifications that should be applied before execution.
+// AnalyzeSecurityDecision implements interfaces.SecurityAnalyzableTool.
+// Returns the full security decision, including any hook-proposed parameter
+// modifications that should be applied before execution.
 func (t *ShellTool) AnalyzeSecurityDecision(ctx context.Context, params map[string]interface{}) (*middleware.Decision, error) {
 	command, ok := params["command"].(string)
 	if !ok {
 		return &middleware.Decision{Action: middleware.ActionConfirm, Reason: "command parameter missing"}, nil
 	}
 	return t.AnalyzeCommand(ctx, command)
-}
-
-// AnalyzeSecurity implements interfaces.SecurityAnalyzableTool.
-// It returns the security action as an int so the interfaces package does not
-// need to import the middleware package (which would create a cycle).
-//
-//	0 = middleware.ActionAllow
-//	1 = middleware.ActionConfirm
-//	2 = middleware.ActionBlock
-func (t *ShellTool) AnalyzeSecurity(ctx context.Context, params map[string]interface{}) (action int, reason string, err error) {
-	command, ok := params["command"].(string)
-	if !ok {
-		return int(middleware.ActionConfirm), "command parameter missing", nil
-	}
-	d, err := t.AnalyzeCommand(ctx, command)
-	if err != nil {
-		return int(middleware.ActionConfirm), "analysis error", err
-	}
-	return int(d.Action), d.Reason, nil
 }
 
 // validateCommand checks whether the command is permitted by the CommandGuard.
@@ -622,22 +604,32 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 
 		if runtime.GOOS != "windows" {
 			go func() {
-				<-cmdCtx.Done()
-				if cmd.Process == nil {
-					return
-				}
-				pgid := -cmd.Process.Pid
-				// Try graceful SIGTERM first
-				_ = syscall.Kill(pgid, syscall.SIGTERM)
-				// Give it 200ms grace period
-				timer := time.NewTimer(200 * time.Millisecond)
-				defer timer.Stop()
 				select {
-				case <-timer.C:
-					// Grace period expired, force kill
-					_ = syscall.Kill(pgid, syscall.SIGKILL)
+				case <-cmdCtx.Done():
+					// Check if process already exited
+					select {
+					case <-waitedCh:
+						return
+					default:
+					}
+					if cmd.Process == nil {
+						return
+					}
+					pgid := -cmd.Process.Pid
+					// Try graceful SIGTERM first
+					_ = syscall.Kill(pgid, syscall.SIGTERM)
+					// Give it 200ms grace period
+					timer := time.NewTimer(200 * time.Millisecond)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						// Grace period expired, force kill
+						_ = syscall.Kill(pgid, syscall.SIGKILL)
+					case <-waitedCh:
+						// Process already exited gracefully
+					}
 				case <-waitedCh:
-					// Process already exited gracefully
+					// Process exited normally, no cleanup needed
 				}
 			}()
 		}
@@ -681,11 +673,20 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 			result.Metadata["max_output_bytes"] = MaxShellOutputBytes
 		}
 
-		// Check for timeout
+		// Check for timeout or context cancellation
 		if cmdCtx.Err() == context.DeadlineExceeded {
 			result.TimedOut = true
 			result.ExitCode = -1
 			result.Success = true // Timeout is considered a successful execution
+		} else if cmdCtx.Err() == context.Canceled {
+			result.ExitCode = -1
+			result.TimedOut = false
+			result.Success = false
+			result.Stderr = "Command interrupted: agent session was terminated"
+			if result.Metadata == nil {
+				result.Metadata = make(map[string]interface{})
+			}
+			result.Metadata["interrupted"] = true
 		} else if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok {
 				result.ExitCode = exitError.ExitCode()
@@ -711,6 +712,15 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 			result.TimedOut = true
 			result.ExitCode = -1
 			result.Success = true // Timeout is considered a successful execution
+		} else if cmdCtx.Err() == context.Canceled {
+			result.ExitCode = -1
+			result.TimedOut = false
+			result.Success = false
+			result.Stderr = "Command interrupted: agent session was terminated"
+			if result.Metadata == nil {
+				result.Metadata = make(map[string]interface{})
+			}
+			result.Metadata["interrupted"] = true
 		} else if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok {
 				result.ExitCode = exitError.ExitCode()

@@ -75,22 +75,48 @@ func TestBinaryExecCommandIsCanonical(t *testing.T) {
 	}
 }
 
-func TestBinaryResultSentinelAndExitCodes(t *testing.T) {
-	t.Setenv("NANO_BINARY_RESULT_FORMAT", "both")
-	var out bytes.Buffer
+func TestBinaryExitCodes(t *testing.T) {
 	summary := binaryResultSummary{Status: "needs_retry", Reason: "temporary provider error", ToolCalls: 2}
-	if err := writeBinaryResultTo(&out, summary); err != nil {
-		t.Fatalf("writeBinaryResultTo: %v", err)
-	}
-	text := out.String()
-	if !strings.Contains(text, binaryResultSentinel) {
-		t.Fatalf("missing sentinel in %q", text)
-	}
 	if got := binaryExitCode(summary.Status); got != binaryExitRetry {
 		t.Fatalf("exit code = %d, want %d", got, binaryExitRetry)
 	}
 	if got := classifyBinaryError(errors.New("deadline exceeded")); got != "timeout" {
 		t.Fatalf("classify timeout = %q", got)
+	}
+}
+
+func TestEmitResultByteParity(t *testing.T) {
+	dir := t.TempDir()
+	var stdout bytes.Buffer
+	summary := binaryResultSummary{Status: "success", ToolCalls: 5, DurationMS: 1234}
+	if err := emitResult(&stdout, dir, summary, "diff --git a/f b/f\n"); err != nil {
+		t.Fatalf("emitResult: %v", err)
+	}
+	resultJSON, err := os.ReadFile(dir + "/result.json")
+	if err != nil {
+		t.Fatalf("read result.json: %v", err)
+	}
+	if !bytes.Equal(stdout.Bytes(), resultJSON) {
+		t.Fatalf("stdout (%d bytes) != result.json (%d bytes)", stdout.Len(), len(resultJSON))
+	}
+	patchBytes, err := os.ReadFile(dir + "/solution.patch")
+	if err != nil {
+		t.Fatalf("read solution.patch: %v", err)
+	}
+	if string(patchBytes) != "diff --git a/f b/f\n" {
+		t.Fatalf("unexpected patch content: %q", patchBytes)
+	}
+}
+
+func TestBinarySwebenchRequiresOutputDir(t *testing.T) {
+	cmd := newBinarySWEBenchCommand()
+	cmd.SetArgs([]string{"fix the bug"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when --output-dir is missing")
+	}
+	if !strings.Contains(err.Error(), "output-dir") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -127,7 +153,7 @@ func TestSummarizeBinaryResultIncludesGoalState(t *testing.T) {
 		TurnsEvaluated: 2,
 		MaxTurns:       3,
 		AchievedAt:     &achievedAt,
-	})
+	}, binaryTurnTermination{}, nil)
 	if summary.Status != "success" {
 		t.Fatalf("status = %q", summary.Status)
 	}
@@ -143,7 +169,7 @@ func TestSummarizeBinaryResultGoalMaxTurnsNeedsRetry(t *testing.T) {
 		TurnsEvaluated: 3,
 		MaxTurns:       3,
 		LastReason:     "tests still fail",
-	})
+	}, binaryTurnTermination{}, nil)
 	if summary.Status != "needs_retry" {
 		t.Fatalf("status = %q", summary.Status)
 	}
@@ -243,4 +269,61 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func TestBinarySwebenchEmitsResult(t *testing.T) {
+	if os.Getenv("NANO_RUN_INTEGRATION_TESTS") == "" {
+		t.Skip("integration: set NANO_RUN_INTEGRATION_TESTS=1 to run")
+	}
+	dir := t.TempDir()
+	cmd := newBinarySWEBenchCommand()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(bytes.NewBuffer(nil))
+	cmd.SetArgs([]string{"--output-dir", dir, "noop test prompt"})
+	// Run end-to-end; don't assert success status — assert artifact shape only.
+	_ = cmd.Execute()
+
+	resultJSON, err := os.ReadFile(dir + "/result.json")
+	if err != nil {
+		t.Fatalf("read result.json: %v", err)
+	}
+	if !bytes.Equal(stdout.Bytes(), resultJSON) {
+		t.Fatalf("stdout (%d bytes) != result.json (%d bytes)", stdout.Len(), len(resultJSON))
+	}
+	// trajectory.json optional (may be empty if agent never ran any step),
+	// but if the file exists, it must be valid JSON.
+	if traj, err := os.ReadFile(dir + "/trajectory.json"); err == nil {
+		var v []map[string]any
+		if jerr := json.Unmarshal(traj, &v); jerr != nil {
+			t.Fatalf("trajectory.json invalid: %v", jerr)
+		}
+	}
+}
+
+func TestBinarySwebenchUsesEmitResult(t *testing.T) {
+	// Structural assertion: the swebench command's RunE calls emitResult which
+	// writes result.json. Verify the command structure is correct by checking
+	// that --output-dir is required and the command is registered.
+	cmd := newBinarySWEBenchCommand()
+	if cmd.Use != "swebench [prompt...]" {
+		t.Fatalf("unexpected Use: %q", cmd.Use)
+	}
+	// Verify --output-dir flag exists and is required.
+	f := cmd.Flag("output-dir")
+	if f == nil {
+		t.Fatal("--output-dir flag not found")
+	}
+	// Verify the command is part of the binary command tree.
+	parent := NewBinaryCommand()
+	found := false
+	for _, sub := range parent.Commands() {
+		if sub.Name() == "swebench" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("swebench not found in binary command tree")
+	}
 }

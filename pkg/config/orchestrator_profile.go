@@ -11,7 +11,7 @@ import (
 // Profiles run during LoadConfig after file/env overrides and before managed settings,
 // so enterprise managed settings can still override injected values. A profile should
 // typically Detect on well-known environment variables and Inject MCP servers, skills,
-// or prompt settings without requiring the orchestrator to write .nano.yaml glue.
+// or prompt settings without requiring the orchestrator to write .nano/nano.yaml glue.
 type OrchestratorProfile interface {
 	Detect() bool
 	Inject(*Config) error

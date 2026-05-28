@@ -59,8 +59,8 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		}
 	}
 
-	// Create engine with nil approval handler (will be set per-session if needed)
-	eng, err := engine.New(opts.Config, nil)
+	// Create engine (approval handler will be set per-session via SetApprovalHandlerV2)
+	eng, err := engine.New(opts.Config)
 	if err != nil {
 		return nil, fmt.Errorf("create engine: %w", err)
 	}

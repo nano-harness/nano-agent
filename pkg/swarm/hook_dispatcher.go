@@ -41,13 +41,15 @@ func (d *SwarmHookDispatcher) DispatchSubagentStop(ctx context.Context, identity
 	return err
 }
 
-// DispatchTeammateIdle fires HookTeammateIdle when a teammate is waiting for
-// input or has nothing to do.
+// DispatchTeammateIdle fires HookNotification with subtype "idle_prompt" when
+// a teammate is waiting for input or has nothing to do.
 func (d *SwarmHookDispatcher) DispatchTeammateIdle(ctx context.Context, identity *TeammateIdentity) error {
 	if d == nil || d.hookEngine == nil || identity == nil {
 		return nil
 	}
-	_, err := d.hookEngine.Execute(ctx, middleware.HookTeammateIdle, "teammate", identityParams(identity, ""))
+	params := identityParams(identity, "")
+	params["subtype"] = "idle_prompt"
+	_, err := d.hookEngine.Execute(ctx, middleware.HookNotification, "idle_prompt", params)
 	return err
 }
 

@@ -28,7 +28,7 @@ type MCPServerEntry struct {
 // status of MCP servers through conversation.  Mutating actions (add/remove)
 // require user confirmation before writing to config.
 type ManageMCPTool struct {
-	configPath string // path to .nano.yaml being managed
+	configPath string // path to .nano/nano.yaml being managed
 	cfg        *config.Config
 	confirmFn  func(summary string) bool
 }
@@ -49,7 +49,7 @@ func (t *ManageMCPTool) Name() string { return "manage_mcp_server" }
 
 // Description returns the tool description.
 func (t *ManageMCPTool) Description() string {
-	return "Manage MCP servers: add, remove, enable, disable, list, or check status. Add/remove require user confirmation and write to .nano.yaml."
+	return "Manage MCP servers: add, remove, enable, disable, list, or check status. Add/remove require user confirmation and write to .nano/nano.yaml."
 }
 
 // Category returns the tool category.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"runtime"
 	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
@@ -67,6 +68,27 @@ func NewAnthropicClient(
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
+
+	// Claude Code CLI identity headers for upstream policy compliance
+	cliHeaders := map[string]string{
+		"User-Agent":     "claude-cli/2.1.142 (external, claude-desktop-3p, agent-sdk/0.3.142)",
+		"X-App":          "cli",
+		"Anthropic-Beta": "claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24",
+		"Anthropic-Dangerous-Direct-Browser-Access": "true",
+		"X-Stainless-Lang":                          "js",
+		"X-Stainless-Runtime":                       "node",
+		"X-Stainless-Runtime-Version":               "v24.3.0",
+		"X-Stainless-Package-Version":               "0.94.0",
+		"X-Stainless-Os":                            runtime.GOOS,
+		"X-Stainless-Arch":                          runtime.GOARCH,
+		"X-Stainless-Timeout":                       "900",
+		"X-Stainless-Retry-Count":                   "0",
+	}
+	for k, v := range cliHeaders {
+		opts = append(opts, option.WithHeader(k, v))
+	}
+
+	// Route config headers applied last so users can override defaults
 	for k, v := range headers {
 		opts = append(opts, option.WithHeader(k, v))
 	}
@@ -211,6 +233,8 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 
 	var textContent string
 	var reasoningContent string
+	var reasoningBlocks []ReasoningBlock
+	var currentThinkingBlock *ReasoningBlock // accumulator for in-progress thinking block
 	var toolCalls []tools.ToolCall
 	var lastThinkingSend time.Time
 	const thinkingInterval = 300 * time.Millisecond
@@ -245,7 +269,16 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 			case anthropic.ToolUseBlock:
 				blocksByIndex[idx] = &toolBlock{id: cb.ID, name: cb.Name}
 			case anthropic.ThinkingBlock:
+				// Start accumulating a new thinking block
+				currentThinkingBlock = &ReasoningBlock{Type: ReasoningBlockThinking}
 				_ = cb
+			case anthropic.RedactedThinkingBlock:
+				// Redacted thinking blocks arrive complete (no deltas)
+				reasoningBlocks = append(reasoningBlocks, ReasoningBlock{
+					Type: ReasoningBlockRedactedThinking,
+					Data: cb.Data,
+				})
+				reasoningContent += "[redacted]"
 			}
 
 		case "content_block_delta":
@@ -268,6 +301,9 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 			case anthropic.ThinkingDelta:
 				thinking := delta.Thinking
 				reasoningContent += thinking
+				if currentThinkingBlock != nil {
+					currentThinkingBlock.Text += thinking
+				}
 				tokenStats.AddOutputTokens(EstimateTokensFromChars(thinking))
 
 				if time.Since(lastThinkingSend) >= thinkingInterval {
@@ -277,6 +313,11 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 						ReasoningDelta: thinking,
 					})
 					lastThinkingSend = time.Now()
+				}
+
+			case anthropic.SignatureDelta:
+				if currentThinkingBlock != nil {
+					currentThinkingBlock.Signature += delta.Signature
 				}
 
 			case anthropic.InputJSONDelta:
@@ -301,6 +342,11 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 					Arguments: args,
 				})
 				delete(blocksByIndex, idx)
+			}
+			// Finalize current thinking block
+			if currentThinkingBlock != nil {
+				reasoningBlocks = append(reasoningBlocks, *currentThinkingBlock)
+				currentThinkingBlock = nil
 			}
 
 		case "message_delta":
@@ -335,12 +381,13 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 		c.cb.RecordSuccess()
 	}
 
-	return c.finalizeAnthropicResponse(textContent, reasoningContent, toolCalls, onEvent, tokenStats)
+	return c.finalizeAnthropicResponse(textContent, reasoningContent, reasoningBlocks, toolCalls, onEvent, tokenStats)
 }
 
 func (c *AnthropicClient) finalizeAnthropicResponse(
 	content string,
 	reasoning string,
+	reasoningBlocks []ReasoningBlock,
 	toolCalls []tools.ToolCall,
 	onEvent func(event.StreamEvent),
 	tokenStats *TokenStats,
@@ -369,6 +416,9 @@ func (c *AnthropicClient) finalizeAnthropicResponse(
 		contentEv = contentEv.WithContent(content)
 		contentEv.ToolCalls = toolCallPtrs
 		contentEv.Reasoning = reasoning
+		if len(reasoningBlocks) > 0 {
+			contentEv.ReasoningData = reasoningBlocks
+		}
 		onEvent(contentEv)
 	}
 

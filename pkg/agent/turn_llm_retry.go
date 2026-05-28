@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 )
@@ -68,7 +67,7 @@ func (t *Turn) requestLLMWithRetry(ctx context.Context, maxRetries int) (string,
 
 func (t *Turn) llmLoopBackoffDelay() time.Duration {
 	maxBackoff := 60 * time.Second
-	if cfg := config.Get(); cfg != nil && cfg.Advanced != nil &&
+	if cfg := t.agentConfig; cfg != nil && cfg.Advanced != nil &&
 		cfg.Advanced.CircuitBreaker != nil &&
 		cfg.Advanced.CircuitBreaker.MaxDelayMs > 0 {
 		maxBackoff = time.Duration(cfg.Advanced.CircuitBreaker.MaxDelayMs) * time.Millisecond

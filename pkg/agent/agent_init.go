@@ -46,7 +46,7 @@ type agentBootstrap struct {
 	hookEngine        *middleware.HookEngine
 }
 
-func buildAgentBootstrap(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool) (*agentBootstrap, error) {
+func buildAgentBootstrap(cfg *config.Config) (*agentBootstrap, error) {
 	workingDir, err := resolveAgentWorkingDir(cfg)
 	if err != nil {
 		return nil, err
@@ -58,7 +58,7 @@ func buildAgentBootstrap(cfg *config.Config, approvalHandler func(*ToolCallInfo)
 	startToolboxLLMUpdates(agentCtx, toolbox, llmClient)
 
 	memoryManager := newAgentMemoryManager(cfg, workingDir)
-	toolScheduler := newAgentToolScheduler(cfg, toolbox, approvalHandler)
+	toolScheduler := newAgentToolScheduler(cfg, toolbox)
 	stateStore := newAgentStateStore(cfg)
 	sessionManager := newAgentSessionManager(cfg, workingDir)
 	permissionManager := newAgentPermissionManager(cfg, workingDir)
@@ -186,7 +186,7 @@ func newAgentMemoryManager(cfg *config.Config, workingDir string) *memory.Manage
 	return memory.NewManager(workingDir, "", cfg.Memory != nil)
 }
 
-func newAgentToolScheduler(cfg *config.Config, toolbox *tools.Toolbox, approvalHandler func(*ToolCallInfo) bool) *ToolScheduler {
+func newAgentToolScheduler(cfg *config.Config, toolbox *tools.Toolbox) *ToolScheduler {
 	defaultEventHandler := func(event event.StreamEvent) {
 		logger.Debugf("Tool scheduler event: %s", event.Type)
 	}
@@ -196,7 +196,6 @@ func newAgentToolScheduler(cfg *config.Config, toolbox *tools.Toolbox, approvalH
 		Toolbox:          toolbox,
 		EventHandler:     defaultEventHandler,
 		RecoveryStrategy: recovery,
-		ApprovalHandler:  approvalHandler,
 	})
 	toolScheduler.SetAgentConfig(cfg)
 	return toolScheduler
@@ -327,14 +326,97 @@ func newAgentSessionStorage(cfg *config.Config, workingDir string) SessionStorag
 func newAgentPermissionManager(cfg *config.Config, workingDir string) *permission.Manager {
 	mode := permission.ModeDefault
 	switch permission.PermissionMode(cfg.PermissionMode) {
-	case permission.ModeAcceptEdits, permission.ModeYOLO:
+	case permission.ModeAcceptEdits, permission.ModePlan, permission.ModeAuto, permission.ModeYOLO:
 		mode = permission.PermissionMode(cfg.PermissionMode)
 	}
 	var rules []permission.PermissionRule
-	for _, raw := range cfg.AllowedRules {
-		rules = append(rules, permission.ParseRule(raw))
+	if mode == permission.ModeAuto && cfg.PermissionAuto != nil {
+		for _, raw := range permission.ApplyModeAutoHardening(cfg.PermissionAuto.AllowRules) {
+			rules = append(rules, permission.ParseRule(raw))
+		}
+	} else {
+		for _, raw := range cfg.AllowedRules {
+			rules = append(rules, permission.ParseRule(raw))
+		}
 	}
-	return permission.NewManagerWithWorkdir(mode, rules, workingDir)
+	pm := permission.NewManagerWithWorkdir(mode, rules, workingDir)
+
+	// Wire classifier for ModeAuto
+	if mode == permission.ModeAuto && cfg.PermissionAuto != nil {
+		classifier := wirePermissionClassifier(cfg)
+		if classifier != nil {
+			pm.SetClassifier(classifier)
+			if cfg.PermissionAuto.ConfidenceThreshold > 0 {
+				pm.SetConfidenceThreshold(cfg.PermissionAuto.ConfidenceThreshold)
+			}
+		}
+
+		maxConsecutive := cfg.PermissionAuto.DenialMaxConsecutive
+		maxTotal := cfg.PermissionAuto.DenialMaxTotal
+		if maxConsecutive == 0 {
+			maxConsecutive = 3
+		}
+		if maxTotal == 0 {
+			maxTotal = 20
+		}
+		pm.SetDenialTracker(permission.NewDenialTracker(maxConsecutive, maxTotal))
+	}
+
+	return pm
+}
+
+// wirePermissionClassifier constructs a Classifier based on cfg.PermissionAuto settings.
+func wirePermissionClassifier(cfg *config.Config) permission.Classifier {
+	if cfg.PermissionAuto == nil {
+		return nil
+	}
+
+	backend := cfg.PermissionAuto.Backend
+	if backend == "" {
+		backend = "llm" // default
+	}
+
+	switch backend {
+	case "fail_closed":
+		timeout := 5 * time.Second
+		if cfg.PermissionAuto.TimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
+		}
+		return &permission.FailClosedClassifier{
+			Reason:   "fail_closed backend configured",
+			Timeout_: timeout,
+		}
+
+	case "llm":
+		// Use existing LLM client infrastructure
+		model := cfg.PermissionAuto.Model
+		if model == "" {
+			model = cfg.Model // fallback to main model
+		}
+
+		timeout := 5 * time.Second
+		if cfg.PermissionAuto.TimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
+		}
+
+		llmClassifier := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, model, timeout)
+
+		// Wrap with caching layer
+		cacheTTL := 30 * time.Minute
+		if cfg.PermissionAuto.CacheTTLMinutes > 0 {
+			cacheTTL = time.Duration(cfg.PermissionAuto.CacheTTLMinutes) * time.Minute
+		}
+
+		return &permission.CachingClassifier{
+			Delegate: llmClassifier,
+			TTL:      cacheTTL,
+			MaxSize:  512,
+		}
+
+	default:
+		logger.Warnf("Unknown permission_auto backend %q, falling back to nil classifier", backend)
+		return nil
+	}
 }
 
 func newAgentSkillManager(cfg *config.Config, workingDir string, stateStore *config.StateStore) *skill.Manager {
@@ -408,64 +490,23 @@ func newPreloadedSystemPromptBuilder(cfg *config.Config, workingDir string, tool
 
 func newAgentHookEngine(cfg *config.Config, workingDir string) *middleware.HookEngine {
 	var hooks []middleware.Hook
-	if cfg.Security != nil {
-		for _, hookCfg := range cfg.Security.Hooks {
-			if !hookCfg.Enabled {
-				continue
-			}
-
-			// Default to command type if not specified
-			hookType := hookservice.HookType(hookCfg.Type)
-			if hookType == "" {
-				hookType = hookservice.HookTypeCommand
-			}
-
-			h := middleware.Hook{
-				Name:          hookCfg.Name,
-				Event:         hookservice.Event(hookCfg.Event),
-				Pattern:       hookCfg.Pattern,
-				Type:          hookType,
-				Command:       hookCfg.Command,
-				Enabled:       hookCfg.Enabled,
-				FailurePolicy: hookservice.FailurePolicy(hookCfg.FailurePolicy),
-				EnvWhitelist:  hookCfg.EnvWhitelist,
-				Async:         hookCfg.Async,
-				AsyncRewake:   hookCfg.AsyncRewake,
-				Once:          hookCfg.Once,
-				StatusMessage: hookCfg.StatusMessage,
-			}
-
-			// Translate HTTP sub-config
-			if hookCfg.HTTP != nil {
-				h.HTTPConfig = &hookservice.HTTPHookConfig{
-					URL:            hookCfg.HTTP.URL,
-					Method:         hookCfg.HTTP.Method,
-					Headers:        hookCfg.HTTP.Headers,
-					URLAllowlist:   hookCfg.HTTP.URLAllowlist,
-					AllowedEnvVars: hookCfg.HTTP.AllowedEnvVars,
-					TimeoutSeconds: hookCfg.HTTP.TimeoutSeconds,
-					MaxResponseKB:  hookCfg.HTTP.MaxResponseKB,
+	if cfg.Hooks != nil && len(cfg.Hooks.Events) > 0 {
+		for eventKey, cmds := range cfg.Hooks.Events {
+			ev := normalizeHookEventName(eventKey)
+			for i, cmd := range cmds {
+				pattern := strings.TrimSpace(cmd.Matcher)
+				if pattern == "" {
+					pattern = "*"
 				}
+				hooks = append(hooks, middleware.Hook{
+					Name:    fmt.Sprintf("%s-%d", eventKey, i),
+					Event:   ev,
+					Pattern: pattern,
+					Command: cmd.Command,
+					Enabled: true,
+					Timeout: time.Duration(cmd.Timeout) * time.Second,
+				})
 			}
-
-			// Translate Prompt sub-config
-			if hookCfg.Prompt != nil {
-				h.PromptConfig = &hookservice.PromptHookConfig{
-					Prompt:    hookCfg.Prompt.Prompt,
-					Model:     hookCfg.Prompt.Model,
-					MaxTokens: hookCfg.Prompt.MaxTokens,
-				}
-			}
-
-			// Translate Agent sub-config
-			if hookCfg.Agent != nil {
-				h.AgentConfig = &hookservice.AgentHookConfig{
-					Agent: hookCfg.Agent.Agent,
-					Task:  hookCfg.Agent.Task,
-				}
-			}
-
-			hooks = append(hooks, h)
 		}
 	}
 
@@ -479,6 +520,52 @@ func newAgentHookEngine(cfg *config.Config, workingDir string) *middleware.HookE
 		hookEngine.RegisterProgrammaticHook(permission.NewFirewallHook(newAgentFirewallConfig(cfg.Firewall)))
 	}
 	return hookEngine
+}
+
+func normalizeHookEventName(key string) hookservice.Event {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return hookservice.EventPreToolUse
+	}
+	normalized := strings.ToLower(trimmed)
+	normalized = strings.ReplaceAll(normalized, "_", "")
+	normalized = strings.ReplaceAll(normalized, "-", "")
+
+	switch normalized {
+	case "pretooluse":
+		return hookservice.EventPreToolUse
+	case "posttooluse":
+		return hookservice.EventPostToolUse
+	case "posttoolusefailure":
+		return hookservice.EventPostToolUseFailure
+	case "sessionstart":
+		return hookservice.EventSessionStart
+	case "sessionend":
+		return hookservice.EventSessionEnd
+	case "precompact":
+		return hookservice.EventPreCompact
+	case "postcompact":
+		return hookservice.EventPostCompact
+	case "userpromptsubmit":
+		return hookservice.EventUserPromptSubmit
+	case "stop":
+		return hookservice.EventStop
+	case "stopfailure":
+		return hookservice.EventStopFailure
+	case "subagentstart":
+		return hookservice.EventSubagentStart
+	case "subagentstop":
+		return hookservice.EventSubagentStop
+	case "permissionrequest":
+		return hookservice.EventPermissionRequest
+	case "permissiondenied":
+		return hookservice.EventPermissionDenied
+	case "notification":
+		return hookservice.EventNotification
+	default:
+		logger.Warnf("Unknown hook event %q; defaulting to pre_tool_use", key)
+		return hookservice.EventPreToolUse
+	}
 }
 
 func newAgentFirewallConfig(cfg *config.FirewallConfig) permission.FirewallConfig {

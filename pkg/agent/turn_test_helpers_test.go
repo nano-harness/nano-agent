@@ -16,7 +16,7 @@ func newTestTurn() *Turn {
 		Actions:             []string{},
 		ToolResults:         []interfaces.ToolResult{},
 		TokenStats:          &event.TokenStats{},
-		compressionStrategy: NewCompressionStrategy(),
+		compressionStrategy: NewCompressionStrategy(nil),
 		CompletionCriteria: &CompletionCriteria{
 			ErrorThreshold:    10,
 			CurrentIteration:  0,

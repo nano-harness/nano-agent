@@ -14,17 +14,18 @@ import (
 // SessionEvent represents a single event in the JSONL session log.
 // Each line in the .jsonl file is one SessionEvent.
 type SessionEvent struct {
-	Type        string                 `json:"type"`                   // "user_message", "assistant_message", "tool_call", "tool_result"
-	Content     string                 `json:"content,omitempty"`      // Text content for messages
-	Contents    []llm.MessageContent   `json:"contents,omitempty"`     // Multimodal content support
-	Role        string                 `json:"role,omitempty"`         // "user", "assistant", "tool"
-	ToolCalls   []tools.ToolCall       `json:"tool_calls,omitempty"`   // Tool calls in assistant message
-	ToolResults []tools.ToolResult     `json:"tool_results,omitempty"` // Tool results
-	ToolCallID  string                 `json:"tool_call_id,omitempty"` // Tool call ID for tool results
-	Reasoning   string                 `json:"reasoning,omitempty"`    // Reasoning tokens from the model
-	Timestamp   int64                  `json:"timestamp"`              // Unix timestamp
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`     // Additional metadata
-	Seq         int64                  `json:"seq,omitempty"`          // Monotonic sequence number for resume
+	Type            string                 `json:"type"`                       // "user_message", "assistant_message", "tool_call", "tool_result"
+	Content         string                 `json:"content,omitempty"`          // Text content for messages
+	Contents        []llm.MessageContent   `json:"contents,omitempty"`         // Multimodal content support
+	Role            string                 `json:"role,omitempty"`             // "user", "assistant", "tool"
+	ToolCalls       []tools.ToolCall       `json:"tool_calls,omitempty"`       // Tool calls in assistant message
+	ToolResults     []tools.ToolResult     `json:"tool_results,omitempty"`     // Tool results
+	ToolCallID      string                 `json:"tool_call_id,omitempty"`     // Tool call ID for tool results
+	Reasoning       string                 `json:"reasoning,omitempty"`        // Deprecated: use ReasoningBlocks; populated from BlocksToText for display only
+	ReasoningBlocks []llm.ReasoningBlock   `json:"reasoning_blocks,omitempty"` // Structured reasoning blocks
+	Timestamp       int64                  `json:"timestamp"`                  // Unix timestamp
+	Metadata        map[string]interface{} `json:"metadata,omitempty"`         // Additional metadata
+	Seq             int64                  `json:"seq,omitempty"`              // Monotonic sequence number for resume
 
 	StateTransition *StateTransition  `json:"state_transition,omitempty"`  // State machine transition event
 	Compaction      *CompactionMarker `json:"compaction_marker,omitempty"` // Autocompact checkpoint marker
@@ -77,13 +78,14 @@ func SessionEventsToMessages(events []SessionEvent) []llm.Message {
 			continue
 		}
 		msg := llm.Message{
-			Role:        event.Role,
-			Content:     event.Content,
-			Contents:    event.Contents,
-			ToolCalls:   event.ToolCalls,
-			ToolResults: event.ToolResults,
-			ToolCallID:  event.ToolCallID,
-			Reasoning:   event.Reasoning,
+			Role:            event.Role,
+			Content:         event.Content,
+			Contents:        event.Contents,
+			ToolCalls:       event.ToolCalls,
+			ToolResults:     event.ToolResults,
+			ToolCallID:      event.ToolCallID,
+			Reasoning:       event.Reasoning,
+			ReasoningBlocks: event.ReasoningBlocks,
 		}
 		messages = append(messages, msg)
 	}
@@ -107,16 +109,17 @@ func MessagesToSessionEvents(messages []llm.Message) []SessionEvent {
 		}
 
 		event := SessionEvent{
-			Type:        eventType,
-			Content:     msg.Content,
-			Contents:    msg.Contents,
-			Role:        msg.Role,
-			ToolCalls:   msg.ToolCalls,
-			ToolResults: msg.ToolResults,
-			ToolCallID:  msg.ToolCallID,
-			Reasoning:   msg.Reasoning,
-			Timestamp:   time.Now().Unix(), // Set timestamp per message
-			Seq:         int64(i + 1),
+			Type:            eventType,
+			Content:         msg.Content,
+			Contents:        msg.Contents,
+			Role:            msg.Role,
+			ToolCalls:       msg.ToolCalls,
+			ToolResults:     msg.ToolResults,
+			ToolCallID:      msg.ToolCallID,
+			Reasoning:       msg.Reasoning,
+			ReasoningBlocks: msg.ReasoningBlocks,
+			Timestamp:       time.Now().Unix(), // Set timestamp per message
+			Seq:             int64(i + 1),
 		}
 		events = append(events, event)
 	}

@@ -33,16 +33,12 @@ Metadata/list subcommands accept `--json` for machine-readable output.
 
 | Subcommand               | Purpose                                                  |
 | ------------------------ | -------------------------------------------------------- |
-| `binary exec <prompt>`  | Run a single prompt and exit (replaces `--binary-mode`)  |
+| `binary exec <prompt>`  | Run a single prompt and exit                             |
 | `binary list-models`     | List configured provider/model presets                   |
 | `binary list-tools`      | List built-in tool descriptors                           |
 | `binary list-slash`      | List built-in slash commands                             |
 | `binary list-skills`     | List installed skills (personal + project)               |
 | `binary swebench <p>`    | SWE-bench-compatible one-shot evaluation                 |
-
-The legacy `--binary-mode` global flag is still accepted but emits a
-deprecation warning recommending `nano binary swebench`. It will be removed
-in a future release.
 
 ## 三端能力一致性矩阵
 
@@ -76,8 +72,8 @@ silently ignored.
 
 ## Migration notes
 
-- `--binary-mode` → `nano binary swebench` (or `nano binary exec`).
-  See `swe_bench_test/run_swe_bench.py` for the updated invocation.
+- `nano binary swebench` (or `nano binary exec`) is the entry point for
+  headless evaluation. See `swe_bench_test/run_swe_bench.py` for the invocation.
 - `nano binary exec` supports embedded goal loops with `--goal`,
   `--goal-max-turns`, or a first-line `/goal <condition>` prompt directive.
 - `nano mcp servers stop <name>` now persistently disables the server in

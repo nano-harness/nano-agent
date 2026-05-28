@@ -25,9 +25,9 @@ func (s *WorkdirAutoApprovalSuite) TestShellGrepInWorkdir_NoApproval() {
 	s.CreateFile("src/a.txt", "foo\n")
 
 	approvalCalls := 0
-	s.Agent.SetApprovalHandler(func(_ *agent.ToolCallInfo) bool {
+	s.Agent.SetApprovalHandlerV2(func(_ *agent.ToolCallInfo) agent.ApprovalDecision {
 		approvalCalls++
-		return true
+		return agent.ApprovalApproveOnce
 	})
 
 	s.MockServer.AddResponse(MockResponse{
@@ -54,9 +54,9 @@ func (s *WorkdirAutoApprovalSuite) TestShellGrepInWorkdir_NoApproval() {
 
 func (s *WorkdirAutoApprovalSuite) TestShellGrepOutsideWorkdir_RequiresApproval() {
 	approvalCalls := 0
-	s.Agent.SetApprovalHandler(func(_ *agent.ToolCallInfo) bool {
+	s.Agent.SetApprovalHandlerV2(func(_ *agent.ToolCallInfo) agent.ApprovalDecision {
 		approvalCalls++
-		return true
+		return agent.ApprovalApproveOnce
 	})
 
 	s.MockServer.AddResponse(MockResponse{
@@ -83,9 +83,9 @@ func (s *WorkdirAutoApprovalSuite) TestShellGrepOutsideWorkdir_RequiresApproval(
 
 func (s *WorkdirAutoApprovalSuite) TestWriteFileInWorkdir_NoApproval() {
 	approvalCalls := 0
-	s.Agent.SetApprovalHandler(func(_ *agent.ToolCallInfo) bool {
+	s.Agent.SetApprovalHandlerV2(func(_ *agent.ToolCallInfo) agent.ApprovalDecision {
 		approvalCalls++
-		return true
+		return agent.ApprovalApproveOnce
 	})
 
 	s.MockServer.AddResponse(MockResponse{
@@ -112,9 +112,9 @@ func (s *WorkdirAutoApprovalSuite) TestWriteFileInWorkdir_NoApproval() {
 
 func (s *WorkdirAutoApprovalSuite) TestWriteFileOutsideWorkdir_RequiresApproval() {
 	approvalCalls := 0
-	s.Agent.SetApprovalHandler(func(_ *agent.ToolCallInfo) bool {
+	s.Agent.SetApprovalHandlerV2(func(_ *agent.ToolCallInfo) agent.ApprovalDecision {
 		approvalCalls++
-		return true
+		return agent.ApprovalApproveOnce
 	})
 
 	s.MockServer.AddResponse(MockResponse{

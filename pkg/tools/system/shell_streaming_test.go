@@ -277,8 +277,8 @@ func TestShellTool_StreamingWithSizeLimit(t *testing.T) {
 
 	// Generate ~20MB of output
 	params := map[string]interface{}{
-		"command":         "i=1; while [ $i -le 20000 ]; do printf '%1024s' | tr ' ' 'x'; i=$((i + 1)); done",
-		"timeout_seconds": float64(30),
+		"command":         "head -c 20971520 /dev/zero | tr '\\0' 'x'",
+		"timeout_seconds": float64(10),
 	}
 
 	result, err := tool.Execute(ctx, params)

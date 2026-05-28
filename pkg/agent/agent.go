@@ -198,12 +198,12 @@ func WithLLMClient(client llm.LLMClient) Option {
 }
 
 // New creates a new AI agent instance
-func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...Option) (*Agent, error) {
+func New(cfg *config.Config, opts ...Option) (*Agent, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 
-	bootstrap, err := buildAgentBootstrap(cfg, approvalHandler)
+	bootstrap, err := buildAgentBootstrap(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +228,9 @@ func New(cfg *config.Config, approvalHandler func(*ToolCallInfo) bool, opts ...O
 
 	// Apply functional options
 	for _, opt := range opts {
-		opt(agent)
+		if opt != nil {
+			opt(agent)
+		}
 	}
 
 	agent.runtime = newAgentRuntime(agent)
@@ -311,12 +313,7 @@ func (a *Agent) GetPermissionManager() *permission.Manager {
 	return a.permissionManager
 }
 
-// SetApprovalHandler sets the approval handler for the agent.
-func (a *Agent) SetApprovalHandler(handler func(*ToolCallInfo) bool) {
-	a.toolScheduler.SetApprovalHandler(handler)
-}
-
-// K2.3: SetApprovalHandlerV2 sets the V2 approval handler for the agent.
+// SetApprovalHandlerV2 sets the V2 approval handler for the agent.
 func (a *Agent) SetApprovalHandlerV2(handler func(*ToolCallInfo) ApprovalDecision) {
 	a.toolScheduler.SetApprovalHandlerV2(handler)
 }
@@ -324,6 +321,11 @@ func (a *Agent) SetApprovalHandlerV2(handler func(*ToolCallInfo) ApprovalDecisio
 // GetMemoryManager returns the memory manager for advanced usage
 func (a *Agent) GetMemoryManager() *memory.Manager {
 	return a.memoryManager
+}
+
+// GetHookEngine returns the hook engine for lifecycle event dispatch
+func (a *Agent) GetHookEngine() *middleware.HookEngine {
+	return a.hookEngine
 }
 
 // SetMemoryManager replaces the agent's memory manager
@@ -613,8 +615,13 @@ func (a *Agent) processStreamWithSessionInternal(ctx context.Context, session *S
 		HookEngine:                a.hookEngine,
 		RalphContext:              ralphCtx,
 		GoalContext:               goalCtx,
-		GoalEvaluator:             NewGoalEvaluator(a.llmClient),
-		Transcript:                session.Transcript(),
+		GoalEvaluator: func() *GoalEvaluator {
+			if a.config != nil && a.config.Goal != nil {
+				return NewGoalEvaluator(a.llmClient, *a.config.Goal)
+			}
+			return NewGoalEvaluator(a.llmClient, config.GoalConfig{})
+		}(),
+		Transcript: session.Transcript(),
 	}
 
 	if a.toolScheduler != nil {
@@ -790,7 +797,7 @@ func (a *Agent) GetContextStatus(sessionID string) (ContextStatus, bool) {
 	if !ok || session == nil {
 		return ContextStatus{}, false
 	}
-	strategy := NewCompressionStrategy()
+	strategy := NewCompressionStrategy(a.config)
 	var last *CompressionInfo
 	if raw, ok := session.GetMetadata("last_compression"); ok {
 		if info, ok := raw.(*CompressionInfo); ok {
@@ -995,7 +1002,7 @@ func convertMCPConfig(cfg *config.MCPConfig) *mcp.MCPConfig {
 // discover_tools, discover_skills) into the toolbox.
 func (a *Agent) registerBuiltinManagementTools(tb *tools.Toolbox, cfg *config.Config, workingDir string) {
 	// Resolve the project-level config path for MCP mutations.
-	configPath := filepath.Join(workingDir, ".nano.yaml")
+	configPath := filepath.Join(workingDir, ".nano", "nano.yaml")
 
 	// manage_skill: delegates to the agent's skill manager (may be nil)
 	manageSkillTool := builtin.NewManageSkillTool(a.skillManager, a.approvalConfirmFn)

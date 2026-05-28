@@ -207,7 +207,7 @@ func (s *TurnExecutionSuite) TestMaxIterations() {
 	if s.Agent != nil {
 		_ = s.Agent.Shutdown()
 	}
-	agentInstance, err := agent.New(cfg, func(info *agent.ToolCallInfo) bool { return true })
+	agentInstance, err := agent.New(cfg)
 	require.NoError(s.T(), err)
 	s.Agent = agentInstance
 

@@ -59,6 +59,10 @@ type Server struct {
 	// engineManaged indicates that scheduler lifecycle is managed by Engine
 	engineManaged bool
 
+	// pendingApprovals tracks tool calls awaiting external approval decisions.
+	pendingApprovals map[string]chan agent.ApprovalDecision
+	approvalMutex    sync.Mutex
+
 	// teamLeadRegistry manages team-lead sessions (optional, nil if not using teams)
 	teamLeadRegistry *TeamLeadRegistry
 }
@@ -232,7 +236,7 @@ func (ds *Server) EnableInteractiveApproval() {
 	if ds == nil || ds.agent == nil {
 		return
 	}
-	ds.agent.SetApprovalHandler(ds.requestToolApproval)
+	ds.agent.SetApprovalHandlerV2(ds.requestToolApprovalV2)
 }
 
 func (ds *Server) initTaskStateLocked() {
@@ -244,10 +248,21 @@ func (ds *Server) initTaskStateLocked() {
 	}
 }
 
-func (ds *Server) requestToolApproval(info *agent.ToolCallInfo) bool {
+func (ds *Server) requestToolApprovalV2(info *agent.ToolCallInfo) agent.ApprovalDecision {
 	if ds == nil || ds.agent == nil || info == nil {
-		return false
+		return agent.ApprovalReject
 	}
+
+	// Register pending approval channel before emitting the event to avoid races.
+	ch := make(chan agent.ApprovalDecision, 1)
+	ds.approvalMutex.Lock()
+	if ds.pendingApprovals == nil {
+		ds.pendingApprovals = make(map[string]chan agent.ApprovalDecision)
+	}
+	ds.pendingApprovals[info.ID] = ch
+	ds.approvalMutex.Unlock()
+
+	// Emit WaitingForUser event so the UI/client can prompt.
 	if handler := ds.agent.GetEventHandler(); handler != nil {
 		handler(event.StreamEvent{
 			Type: event.EventTypeWaitingForUser,
@@ -260,14 +275,33 @@ func (ds *Server) requestToolApproval(info *agent.ToolCallInfo) bool {
 			},
 		})
 	}
-	return false
+
+	// Block until external SubmitToolApproval provides a decision.
+	decision := <-ch
+
+	// Cleanup
+	ds.approvalMutex.Lock()
+	delete(ds.pendingApprovals, info.ID)
+	ds.approvalMutex.Unlock()
+
+	return decision
 }
 
 func (ds *Server) SubmitToolApproval(callID string, approved bool) error {
-	if ds == nil || ds.agent == nil || ds.agent.GetToolScheduler() == nil {
-		return fmt.Errorf("daemon approval handler is unavailable")
+	ds.approvalMutex.Lock()
+	ch, exists := ds.pendingApprovals[callID]
+	ds.approvalMutex.Unlock()
+
+	if !exists {
+		return fmt.Errorf("no pending approval for call %s", callID)
 	}
-	return ds.agent.GetToolScheduler().HandleConfirmationResponse(callID, approved)
+
+	if approved {
+		ch <- agent.ApprovalApproveOnce
+	} else {
+		ch <- agent.ApprovalReject
+	}
+	return nil
 }
 
 // NewServerWithEngine builds a Server from a pre-constructed Engine.
@@ -3170,13 +3204,8 @@ func (ds *Server) createTeamLeadSessionHandler(w http.ResponseWriter, r *http.Re
 	// Get agent config
 	cfg := ds.agent.GetConfig()
 
-	// Create approval handler (auto-approve for daemon)
-	approvalHandler := func(*agent.ToolCallInfo) bool {
-		return true
-	}
-
 	// Create or get session
-	session, err := ds.teamLeadRegistry.GetOrCreate(req.SessionID, req.TeamName, cfg, approvalHandler)
+	session, err := ds.teamLeadRegistry.GetOrCreate(req.SessionID, req.TeamName, cfg)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create session: %v", err), http.StatusInternalServerError)
 		return

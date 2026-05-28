@@ -164,25 +164,21 @@ func (s *ToolRobustnessSuite) TestUserRejectsToolCall() {
 	err := s.Agent.GetToolbox().Register(confirmTool)
 	require.NoError(s.T(), err)
 
-	// 重新创建 agent，使用异步拒绝审批处理器（模仿 TUI 行为）：
-	// 返回 false 让工具保持 StatusAwaitingApproval，然后通过
-	// HandleConfirmationResponse 异步拒绝。
+	// 重新创建 agent，使用拒绝审批处理器（模仿 TUI 行为）：
+	// 对 confirm_required_tool 直接返回 Reject。
 	cfg := s.Config
 	if s.Agent != nil {
 		_ = s.Agent.Shutdown()
 	}
 	var agentInstance *agent.Agent
-	agentInstance, err = agent.New(cfg, func(info *agent.ToolCallInfo) bool {
-		if info.Name == "confirm_required_tool" {
-			// Async rejection via HandleConfirmationResponse (mirrors TUI flow)
-			go func() {
-				_ = agentInstance.GetToolScheduler().HandleConfirmationResponse(info.ID, false)
-			}()
-			return false
-		}
-		return true
-	})
+	agentInstance, err = agent.New(cfg)
 	require.NoError(s.T(), err)
+	agentInstance.SetApprovalHandlerV2(func(info *agent.ToolCallInfo) agent.ApprovalDecision {
+		if info.Name == "confirm_required_tool" {
+			return agent.ApprovalReject
+		}
+		return agent.ApprovalApproveOnce
+	})
 	s.Agent = agentInstance
 
 	// 重新注册工具（agent 重新创建了）

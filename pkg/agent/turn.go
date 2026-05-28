@@ -163,9 +163,9 @@ type Turn struct {
 	continuationReason string
 
 	// Structured termination tracking (for binary sentinel and orchestrators)
-	terminationCause    string // e.g., "task_done", "error_threshold", "diminishing_returns"
-	blockerFingerprint  string // Normalized blocker ID, e.g., "dr_no_progress:3rounds"
-	terminationReason   string // Human-readable explanation
+	terminationCause   string // e.g., "task_done", "error_threshold", "diminishing_returns"
+	blockerFingerprint string // Normalized blocker ID, e.g., "dr_no_progress:3rounds"
+	terminationReason  string // Human-readable explanation
 
 	// Context usage stream throttling
 	contextUsageStreamCounter int // Count of streaming TokenStats events
@@ -205,8 +205,8 @@ func NewTurnWithMultimodal(userInput string, images []llm.MultimodalImage, confi
 		configInput = &TurnConfig{}
 	}
 
-	// Create default compression strategy - use no-args constructor
-	compressionStrategy := NewCompressionStrategy()
+	// Create default compression strategy
+	compressionStrategy := NewCompressionStrategy(configInput.AgentConfig)
 
 	// Default completion criteria with enhanced settings
 	completionCriteria := &CompletionCriteria{
@@ -307,7 +307,7 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 	compressionStrategy := t.compressionStrategy
 	if compressionStrategy == nil {
 		logger.Warn("Compression strategy is nil, creating new one with default config")
-		compressionStrategy = NewCompressionStrategy()
+		compressionStrategy = NewCompressionStrategy(t.agentConfig)
 		t.compressionStrategy = compressionStrategy // 保存策略实例避免重复创建
 	}
 
@@ -346,6 +346,8 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 	}
 
 	if compressedMessages != nil && compressionInfo != nil {
+		// Filter orphaned thinking-only messages that compression may have created
+		compressedMessages = llm.FilterOrphanedThinkingOnlyMessages(compressedMessages)
 		t.Messages = compressedMessages
 		t.wasCompressed = true
 		t.lastCompressionInfo = compressionInfo
@@ -443,7 +445,7 @@ func (t *Turn) ShouldCompress() bool {
 	compressionStrategy := t.compressionStrategy
 	if compressionStrategy == nil {
 		logger.Warn("Compression strategy is nil in ShouldCompress, creating new one")
-		compressionStrategy = NewCompressionStrategy()
+		compressionStrategy = NewCompressionStrategy(t.agentConfig)
 		t.compressionStrategy = compressionStrategy // 保存策略实例
 	}
 
@@ -660,6 +662,10 @@ func (t *Turn) updateConsecutiveErrorsFromToolResults(toolResults map[string]*in
 		if result == nil {
 			continue
 		}
+		// Skip interrupted results (e.g. parent context cancel) from failure tracking
+		if meta, ok := result.Metadata["interrupted"]; ok && meta == true {
+			continue
+		}
 		if result.Success {
 			hasSuccess = true
 		} else {
@@ -747,6 +753,7 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 	var response string
 	var toolCalls []*tools.ToolCall
 	var reasoning string
+	var reasoningBlocks []llm.ReasoningBlock
 
 	wrappedHandler := func(streamEvent event.StreamEvent) {
 		if streamEvent.Type == event.EventTypeTokenStats &&
@@ -765,6 +772,9 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 			response = streamEvent.Content
 			toolCalls = streamEvent.ToolCalls
 			reasoning = streamEvent.Reasoning
+			if blocks, ok := streamEvent.ReasoningData.([]llm.ReasoningBlock); ok && len(blocks) > 0 {
+				reasoningBlocks = blocks
+			}
 		case event.EventTypeToolCall:
 			toolCalls = streamEvent.ToolCalls
 		case event.EventTypeTokenStats:
@@ -797,7 +807,7 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 
 	// Add assistant response to messages
 	// Include tool calls on the assistant message when present to satisfy API ordering
-	assistantMsg := llm.Message{Role: "assistant", Content: response, Reasoning: reasoning}
+	assistantMsg := llm.Message{Role: "assistant", Content: response, Reasoning: reasoning, ReasoningBlocks: reasoningBlocks}
 	if len(toolCalls) > 0 {
 		converted := make([]tools.ToolCall, len(toolCalls))
 		for i, tc := range toolCalls {
@@ -808,6 +818,8 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 	// Append assistant message to conversation
 	if response != "" || len(toolCalls) > 0 {
 		t.Messages = append(t.Messages, assistantMsg)
+		// Apply trailing thinking filter before next API call
+		t.Messages = llm.FilterTrailingThinkingFromLastAssistant(t.Messages)
 		t.appendTranscriptMessage("assistant", assistantMsg)
 	}
 	if response != "" {
@@ -1061,7 +1073,7 @@ func (t *Turn) saveConversationMemory() error {
 	}
 
 	// Get user and agent IDs from config
-	cfg := config.Get()
+	cfg := t.agentConfig
 	var userID, agentID string
 	if cfg != nil && cfg.Memory != nil {
 		userID = cfg.Memory.UserID

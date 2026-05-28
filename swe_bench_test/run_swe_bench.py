@@ -471,7 +471,7 @@ class SWEBenchRunner:
             testbed_dir = "/testbed"  # SWE-bench标准的代码仓库目录
 
             # 构建nano agent命令行参数
-            # 使用 `nano binary swebench` 子命令（替代旧的 --binary-mode 标志）
+            # 使用 `nano binary swebench` 子命令
             nano_args = [
                 "/usr/local/bin/nano",
                 "binary", "swebench",

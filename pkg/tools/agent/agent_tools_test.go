@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nano-harness/nano-agent/pkg/agent"
+	"github.com/nano-harness/nano-agent/pkg/agentprofile"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/stretchr/testify/assert"
@@ -20,7 +20,6 @@ func TestMain(m *testing.M) {
 }
 
 // newTestConfig returns a minimal config suitable for unit tests.
-// CustomSystemPrompt is set to avoid subprocess-spawning tool detection.
 func newTestConfig() *config.Config {
 	return &config.Config{
 		Model:              "gpt-4",
@@ -58,51 +57,62 @@ func newTestConfig() *config.Config {
 	}
 }
 
-func TestMainAgentTool(t *testing.T) {
+func TestAgentToolSchema(t *testing.T) {
 	cfg := newTestConfig()
-
-	// Create a mock approval handler
-	approvalHandler := func(toolCall *agent.ToolCallInfo) bool {
-		return true // Auto-approve all tool calls in tests
-	}
-
-	// Create a mock agent (in real scenario, this would be a proper agent)
-	mockAgent, err := agent.New(cfg, approvalHandler)
-	require.NoError(t, err)
-
-	// Create MainAgentTool
-	tool := NewMainAgentTool(cfg, mockAgent)
+	resolver := agentprofile.NewResolver("")
+	tool := NewAgentTool(cfg, resolver)
 
 	// Test tool properties
-	assert.Equal(t, "main_agent", tool.Name())
-	assert.Equal(t, "Execute tasks using the main agent with full capabilities", tool.Description())
-	assert.Equal(t, interfaces.CategoryBuild, tool.Category())
+	assert.Equal(t, "Agent", tool.Name())
+	assert.Equal(t, interfaces.CategoryAgent, tool.Category())
 	assert.False(t, tool.RequiresConfirmation())
+	assert.False(t, tool.ConcurrencySafe())
 
 	// Test schema
 	schema := tool.Schema()
 	assert.NotNil(t, schema)
-	assert.Contains(t, schema.Properties, "task")
-	assert.Contains(t, schema.Properties, "context")
-	assert.Contains(t, schema.Properties, "stream")
-	assert.Contains(t, schema.Required, "task")
+	assert.Contains(t, schema.Properties, "description")
+	assert.Contains(t, schema.Properties, "prompt")
+	assert.Contains(t, schema.Properties, "subagent_type")
+	assert.Contains(t, schema.Properties, "model")
+	assert.Contains(t, schema.Properties, "isolation")
+	assert.Contains(t, schema.Properties, "run_in_background")
+	assert.Contains(t, schema.Properties, "fork_from")
+	assert.Contains(t, schema.Properties, "resume_from")
+	assert.Contains(t, schema.Required, "description")
+	assert.Contains(t, schema.Required, "prompt")
+	assert.Contains(t, schema.Required, "subagent_type")
+}
 
-	// Test execution with missing task parameter
+func TestAgentToolExecute_MissingPrompt(t *testing.T) {
+	cfg := newTestConfig()
+	resolver := agentprofile.NewResolver("")
+	tool := NewAgentTool(cfg, resolver)
+
 	ctx := context.Background()
-	result, err := tool.Execute(ctx, map[string]interface{}{})
+	result, err := tool.Execute(ctx, map[string]interface{}{
+		"description":   "test",
+		"subagent_type": "explore",
+	})
 	require.NoError(t, err)
 	assert.False(t, result.Success)
-	assert.Contains(t, result.Error, "task parameter is required")
+	assert.Contains(t, result.Error, "prompt")
+}
 
-	// Test execution with nil agent returns an error result (no real LLM call)
-	nilTool := NewMainAgentTool(cfg, nil)
-	params := map[string]interface{}{
-		"task": "Test task execution",
-	}
-	result, err = nilTool.Execute(ctx, params)
+func TestAgentToolExecute_UnknownType(t *testing.T) {
+	cfg := newTestConfig()
+	resolver := agentprofile.NewResolver("")
+	tool := NewAgentTool(cfg, resolver)
+
+	ctx := context.Background()
+	result, err := tool.Execute(ctx, map[string]interface{}{
+		"description":   "test",
+		"prompt":        "do something",
+		"subagent_type": "nonexistent-type",
+	})
 	require.NoError(t, err)
 	assert.False(t, result.Success)
-	assert.Contains(t, result.Error, "main agent not initialized")
+	assert.Contains(t, result.Error, "unknown subagent_type")
 }
 
 func TestAgentToolsRegistration(t *testing.T) {
@@ -113,31 +123,77 @@ func TestAgentToolsRegistration(t *testing.T) {
 		tools: make(map[string]interfaces.Tool),
 	}
 
-	// Create a mock approval handler
-	approvalHandler := func(toolCall *agent.ToolCallInfo) bool {
-		return true // Auto-approve all tool calls in tests
-	}
-
-	// Create a mock agent
-	mockAgent, err := agent.New(cfg, approvalHandler)
-	require.NoError(t, err)
-
 	// Test RegisterAgentTools
-	RegisterAgentTools(registry, cfg, mockAgent)
+	RegisterAgentTools(registry, cfg)
 
-	// Verify main_agent tool is registered by RegisterAgentTools
-	mainTool, exists := registry.Get("main_agent")
+	// Verify Agent tool is registered
+	agentTool, exists := registry.Get("Agent")
 	assert.True(t, exists)
-	assert.NotNil(t, mainTool)
+	assert.NotNil(t, agentTool)
 
 	// Test GetAgentToolNames
 	toolNames := GetAgentToolNames()
-	assert.Contains(t, toolNames, "main_agent")
+	assert.Contains(t, toolNames, "Agent")
+	assert.Contains(t, toolNames, "TaskOutput")
+	assert.Contains(t, toolNames, "TaskStop")
 	assert.Contains(t, toolNames, "send_message")
-	assert.Contains(t, toolNames, "spawn_teammate")
-	assert.Contains(t, toolNames, "team_create")
-	assert.Contains(t, toolNames, "team_list")
-	assert.Len(t, toolNames, 5)
+	assert.Len(t, toolNames, 4)
+}
+
+func TestToolFilter_DisallowedTools(t *testing.T) {
+	profile := agentprofile.AgentProfile{
+		Tools: []string{"*"},
+	}
+	parentTools := []string{"read_file", "write_file", "Agent", "ExitPlanMode", "run_shell_command"}
+	result := ResolveAgentTools(profile, parentTools, false)
+
+	// Agent and ExitPlanMode should be filtered
+	assert.NotContains(t, result, "Agent")
+	assert.NotContains(t, result, "ExitPlanMode")
+	assert.Contains(t, result, "read_file")
+	assert.Contains(t, result, "write_file")
+	assert.Contains(t, result, "run_shell_command")
+}
+
+func TestToolFilter_AsyncTools(t *testing.T) {
+	profile := agentprofile.AgentProfile{
+		Tools: []string{"*"},
+	}
+	parentTools := []string{"read_file", "write_file"}
+
+	// Sync agent should NOT get send_message
+	syncResult := ResolveAgentTools(profile, parentTools, false)
+	assert.NotContains(t, syncResult, "send_message")
+
+	// Async agent SHOULD get send_message
+	asyncResult := ResolveAgentTools(profile, parentTools, true)
+	assert.Contains(t, asyncResult, "send_message")
+}
+
+func TestToolFilter_MCPPassthrough(t *testing.T) {
+	profile := agentprofile.AgentProfile{
+		Tools: []string{"read_file"},
+	}
+	parentTools := []string{"read_file", "mcp__server__tool1", "mcp__server__tool2"}
+	result := ResolveAgentTools(profile, parentTools, false)
+
+	// MCP tools should pass through
+	assert.Contains(t, result, "mcp__server__tool1")
+	assert.Contains(t, result, "mcp__server__tool2")
+	assert.Contains(t, result, "read_file")
+}
+
+func TestToolFilter_ProfileWhitelist(t *testing.T) {
+	profile := agentprofile.AgentProfile{
+		Tools: []string{"read_file", "list_files"},
+	}
+	parentTools := []string{"read_file", "write_file", "list_files", "run_shell_command"}
+	result := ResolveAgentTools(profile, parentTools, false)
+
+	assert.Contains(t, result, "read_file")
+	assert.Contains(t, result, "list_files")
+	assert.NotContains(t, result, "write_file")
+	assert.NotContains(t, result, "run_shell_command")
 }
 
 // MockToolRegistry is a simple mock implementation for testing

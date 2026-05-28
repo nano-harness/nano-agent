@@ -109,7 +109,10 @@ func transcriptEntryForMessage(sessionID, cwd, turnID string, iteration int, typ
 	if msg.ToolCallID != "" {
 		message["tool_call_id"] = msg.ToolCallID
 	}
-	if msg.Reasoning != "" {
+	if len(msg.ReasoningBlocks) > 0 {
+		message["reasoning_blocks"] = msg.ReasoningBlocks
+		message["reasoning"] = llm.BlocksToText(msg.ReasoningBlocks)
+	} else if msg.Reasoning != "" {
 		message["reasoning"] = msg.Reasoning
 	}
 	return TranscriptEntry{

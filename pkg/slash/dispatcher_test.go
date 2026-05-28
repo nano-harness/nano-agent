@@ -293,3 +293,35 @@ func TestLocalDispatcher_UnknownSlashUnchanged(t *testing.T) {
 		t.Fatalf("unknown slash should be unhandled, got %+v", r)
 	}
 }
+
+func TestLocalDispatcher_BuiltinAgentSlash(t *testing.T) {
+	// Use an empty cwd so no filesystem agents shadow built-ins.
+	cwd := t.TempDir()
+	d := NewLocalDispatcher("", cwd)
+
+	r := d.Dispatch("/explore find all tests")
+	if r.Handled {
+		t.Fatalf("built-in agent dispatch should not set Handled, got %+v", r)
+	}
+	if !r.ShouldSubmit {
+		t.Fatalf("expected ShouldSubmit for /explore, got %+v", r)
+	}
+	for _, want := range []string{
+		"spawn_teammate",
+		`name="explore"`,
+		"find all tests",
+	} {
+		if !strings.Contains(r.SubmitInput, want) {
+			t.Errorf("SubmitInput missing %q: %s", want, r.SubmitInput)
+		}
+	}
+
+	// No prompt -> uses built-in InitialPrompt.
+	r = d.Dispatch("/explore")
+	if !r.ShouldSubmit {
+		t.Fatalf("expected ShouldSubmit for /explore without prompt, got %+v", r)
+	}
+	if !strings.Contains(r.SubmitInput, "exploration subagent") {
+		t.Errorf("SubmitInput missing built-in initial_prompt: %s", r.SubmitInput)
+	}
+}

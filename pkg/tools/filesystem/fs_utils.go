@@ -15,15 +15,32 @@ import (
 
 // validatePathCommon validates a given path and returns its absolute, cleaned,
 // symlink-resolved path. Path access control is delegated to sandbox.PathChecker;
-// this function only normalizes the path.
+// this function blocks relative path traversal outside the working directory and
+// normalizes the path for subsequent sandbox checks.
 func validatePathCommon(workingDir, path string) (string, error) {
-	// Clean the path
-	cleaned := filepath.Clean(path)
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	if cleaned == "" || cleaned == "." {
+		return "", fmt.Errorf("path is empty")
+	}
 
-	// Convert to absolute path
-	absPath, err := filepath.Abs(cleaned)
+	// Resolve working dir to an absolute, symlink-free base for relative path validation.
+	base, err := filepath.Abs(workingDir)
 	if err != nil {
-		return "", fmt.Errorf("failed to get absolute path: %v", err)
+		return "", fmt.Errorf("failed to get absolute working directory: %v", err)
+	}
+	baseReal, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve working directory symlinks: %v", err)
+	}
+
+	// Convert to absolute, resolving relative paths against workingDir.
+	absPath := cleaned
+	if !filepath.IsAbs(absPath) {
+		absPath = filepath.Join(baseReal, absPath)
+		// Reject relative path traversal attempts (e.g. "../outside.txt").
+		if rel, err := filepath.Rel(baseReal, absPath); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("path escapes working directory: %q", path)
+		}
 	}
 
 	// Resolve all symlinks to prevent traversal attacks (e.g., a symlink
@@ -36,6 +53,14 @@ func validatePathCommon(workingDir, path string) (string, error) {
 			realPath = resolveNonExistentPath(absPath)
 		} else {
 			return "", fmt.Errorf("symlink resolution failed: %v", err)
+		}
+	}
+
+	// If the caller provided a relative path, ensure the resolved realPath is still
+	// within the working directory (covers symlink escape via existing parents).
+	if !filepath.IsAbs(cleaned) {
+		if rel, err := filepath.Rel(baseReal, realPath); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("path escapes working directory via symlink resolution: %q", path)
 		}
 	}
 

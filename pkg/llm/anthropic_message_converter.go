@@ -159,8 +159,30 @@ func (c *anthropicMessageConverter) convertUserMessage(msg Message) anthropic.Me
 func (c *anthropicMessageConverter) convertAssistantMessage(msg Message) anthropic.MessageParam {
 	var blocks []anthropic.ContentBlockParamUnion
 
-	// Add reasoning as thinking block if present
-	if msg.Reasoning != "" {
+	// Add reasoning blocks if present (structured format with signatures)
+	if len(msg.ReasoningBlocks) > 0 {
+		for _, rb := range msg.ReasoningBlocks {
+			if rb.Empty() {
+				continue
+			}
+			switch rb.Type {
+			case ReasoningBlockThinking:
+				blocks = append(blocks, anthropic.ContentBlockParamUnion{
+					OfThinking: &anthropic.ThinkingBlockParam{
+						Thinking:  rb.Text,
+						Signature: rb.Signature,
+					},
+				})
+			case ReasoningBlockRedactedThinking:
+				blocks = append(blocks, anthropic.ContentBlockParamUnion{
+					OfRedactedThinking: &anthropic.RedactedThinkingBlockParam{
+						Data: rb.Data,
+					},
+				})
+			}
+		}
+	} else if msg.Reasoning != "" {
+		// Fallback for legacy plain-text reasoning (no signature available)
 		blocks = append(blocks, anthropic.ContentBlockParamUnion{
 			OfThinking: &anthropic.ThinkingBlockParam{
 				Thinking: msg.Reasoning,

@@ -115,13 +115,13 @@ func newTestModelRoot() *cobra.Command {
 
 func readNanoYAML(t *testing.T) map[interface{}]interface{} {
 	t.Helper()
-	data, err := os.ReadFile(".nano.yaml")
+	data, err := os.ReadFile(".nano/nano.yaml")
 	if err != nil {
-		t.Fatalf("read .nano.yaml: %v", err)
+		t.Fatalf("read .nano/nano.yaml: %v", err)
 	}
 	var cfg map[interface{}]interface{}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("parse .nano.yaml: %v", err)
+		t.Fatalf("parse .nano/nano.yaml: %v", err)
 	}
 	return cfg
 }

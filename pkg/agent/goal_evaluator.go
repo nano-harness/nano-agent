@@ -6,23 +6,29 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 )
 
 type GoalEvalResult struct {
-	Met                   bool
-	Reason                string
-	TokensUsed            int
-	EvaluatorParseFailed  bool // True when JSON parsing failed
+	Met                  bool
+	Reason               string
+	TokensUsed           int
+	EvaluatorParseFailed bool // True when JSON parsing failed
+	TranscriptStats      *TranscriptStats
 }
 
 type GoalEvaluator struct {
 	client llm.StreamClient
+	cfg    goalTranscriptConfig
 }
 
-func NewGoalEvaluator(client llm.StreamClient) *GoalEvaluator {
-	return &GoalEvaluator{client: client}
+func NewGoalEvaluator(client llm.StreamClient, goalCfg config.GoalConfig) *GoalEvaluator {
+	return &GoalEvaluator{
+		client: client,
+		cfg:    newGoalTranscriptConfig(goalCfg),
+	}
 }
 
 func (e *GoalEvaluator) Evaluate(ctx context.Context, condition string, messages []llm.Message) (*GoalEvalResult, error) {
@@ -34,6 +40,8 @@ func (e *GoalEvaluator) Evaluate(ctx context.Context, condition string, messages
 		return &GoalEvalResult{Met: false, Reason: "goal condition is empty"}, nil
 	}
 
+	transcript, stats, truncated := formatGoalTranscriptBudgeted(messages, e.cfg)
+
 	evalMessages := []llm.Message{
 		{
 			Role: "system",
@@ -44,7 +52,7 @@ func (e *GoalEvaluator) Evaluate(ctx context.Context, condition string, messages
 		},
 		{
 			Role:    "user",
-			Content: "Conversation transcript:\n" + formatGoalTranscript(messages),
+			Content: "Conversation transcript:\n" + transcript,
 		},
 	}
 
@@ -94,30 +102,15 @@ func (e *GoalEvaluator) Evaluate(ctx context.Context, condition string, messages
 	if strings.TrimSpace(parsed.Reason) == "" {
 		parsed.Reason = "No reason provided"
 	}
-	return &GoalEvalResult{Met: parsed.Met, Reason: parsed.Reason, TokensUsed: tokensUsed}, nil
-}
-
-func formatGoalTranscript(messages []llm.Message) string {
-	var b strings.Builder
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			continue
-		}
-		role := msg.Role
-		if role == "" {
-			role = "unknown"
-		}
-		fmt.Fprintf(&b, "[%s] %s\n", role, msg.Content)
-		if len(msg.ToolCalls) > 0 {
-			for _, tc := range msg.ToolCalls {
-				fmt.Fprintf(&b, "[assistant tool_call] %s %v\n", tc.Name, tc.Arguments)
-			}
-		}
-		if msg.ToolCallID != "" {
-			fmt.Fprintf(&b, "[tool_result %s] %s\n", msg.ToolCallID, msg.Content)
-		}
+	result := &GoalEvalResult{
+		Met:        parsed.Met,
+		Reason:     parsed.Reason,
+		TokensUsed: tokensUsed,
 	}
-	return strings.TrimSpace(b.String())
+	if truncated {
+		result.TranscriptStats = &stats
+	}
+	return result, nil
 }
 
 func extractGoalEvalJSON(raw string) string {
@@ -138,11 +131,12 @@ func extractGoalEvalJSON(raw string) string {
 
 // SatisfactionEvalResult contains user satisfaction evaluation result
 type SatisfactionEvalResult struct {
-	Satisfied             bool
-	Score                 float64 // 0.0-1.0 satisfaction score
-	Reason                string
-	TokensUsed            int
-	EvaluatorParseFailed  bool // True when JSON parsing failed
+	Satisfied            bool
+	Score                float64 // 0.0-1.0 satisfaction score
+	Reason               string
+	TokensUsed           int
+	EvaluatorParseFailed bool // True when JSON parsing failed
+	TranscriptStats      *TranscriptStats
 }
 
 // EvaluateSatisfaction evaluates whether the user's request has been satisfied
@@ -154,6 +148,8 @@ func (e *GoalEvaluator) EvaluateSatisfaction(ctx context.Context, userInput stri
 	if strings.TrimSpace(userInput) == "" {
 		return &SatisfactionEvalResult{Satisfied: false, Score: 0.0, Reason: "user input is empty"}, nil
 	}
+
+	transcript, stats, truncated := formatGoalTranscriptBudgeted(messages, e.cfg)
 
 	evalMessages := []llm.Message{
 		{
@@ -170,7 +166,7 @@ func (e *GoalEvaluator) EvaluateSatisfaction(ctx context.Context, userInput stri
 		},
 		{
 			Role:    "user",
-			Content: "Conversation transcript:\n" + formatGoalTranscript(messages),
+			Content: "Conversation transcript:\n" + transcript,
 		},
 	}
 
@@ -228,10 +224,14 @@ func (e *GoalEvaluator) EvaluateSatisfaction(ctx context.Context, userInput stri
 	} else if parsed.Score > 1.0 {
 		parsed.Score = 1.0
 	}
-	return &SatisfactionEvalResult{
+	result := &SatisfactionEvalResult{
 		Satisfied:  parsed.Satisfied,
 		Score:      parsed.Score,
 		Reason:     parsed.Reason,
 		TokensUsed: tokensUsed,
-	}, nil
+	}
+	if truncated {
+		result.TranscriptStats = &stats
+	}
+	return result, nil
 }

@@ -12,6 +12,22 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 )
 
+// SandboxExecSandbox is a stub on Linux – sandbox-exec is a macOS-only tool.
+type SandboxExecSandbox struct {
+	cfg        *config.SandboxConfig
+	workingDir string
+}
+
+// NewSandboxExecSandbox is a stub on Linux.
+func NewSandboxExecSandbox(cfg *config.SandboxConfig, workingDir string) *SandboxExecSandbox {
+	return &SandboxExecSandbox{cfg: cfg, workingDir: workingDir}
+}
+
+// BuildProfileForInspection is a stub on Linux.
+func (s *SandboxExecSandbox) BuildProfileForInspection() string {
+	return "# sandbox-exec profiles are only available on macOS\n"
+}
+
 // newSandboxExecSandbox is a stub on Linux – sandbox-exec is a macOS-only tool.
 func newSandboxExecSandbox(cfg *config.SandboxConfig, _ string) Sandbox {
 	logger.Warnf("sandbox: sandbox-exec is only supported on macOS – falling back to no isolation")

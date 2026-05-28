@@ -28,17 +28,18 @@ type GoalState struct {
 
 // GoalContext tracks /goal lifecycle state for a session.
 type GoalContext struct {
-	mu                 sync.Mutex
-	condition          string
-	active             bool
-	startedAt          time.Time
-	turnsEvaluated     int
-	tokensSpent        int
-	lastReason         string
-	achievedAt         *time.Time
-	maxConditionLength int
-	maxTurns           int
-	onChange           func(GoalState)
+	mu                       sync.Mutex
+	condition                string
+	active                   bool
+	startedAt                time.Time
+	turnsEvaluated           int
+	tokensSpent              int
+	lastReason               string
+	achievedAt               *time.Time
+	maxConditionLength       int
+	maxTurns                 int
+	onChange                 func(GoalState)
+	consecutiveParseFailures int
 }
 
 func NewGoalContext(cfg *config.Config) *GoalContext {
@@ -183,6 +184,7 @@ func (g *GoalContext) MarkEvaluated(tokens int, reason string) {
 		g.tokensSpent += tokens
 	}
 	g.lastReason = strings.TrimSpace(reason)
+	g.consecutiveParseFailures = 0
 	g.notifyLocked()
 }
 
@@ -211,6 +213,36 @@ func (g *GoalContext) MarkStopped(reason string) {
 	g.active = false
 	g.lastReason = strings.TrimSpace(reason)
 	g.notifyLocked()
+}
+
+// IncrementParseFailures increments the consecutive parse failure counter.
+func (g *GoalContext) IncrementParseFailures() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.consecutiveParseFailures++
+}
+
+// ResetParseFailures resets the consecutive parse failure counter.
+func (g *GoalContext) ResetParseFailures() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.consecutiveParseFailures = 0
+}
+
+// ConsecutiveParseFailures returns the current consecutive parse failure count.
+func (g *GoalContext) ConsecutiveParseFailures() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.consecutiveParseFailures
 }
 
 func (g *GoalContext) Status() string {

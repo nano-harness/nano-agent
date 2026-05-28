@@ -76,7 +76,7 @@ func (r *TeamLeadRegistry) OnSessionLifecycle(ctx context.Context, sessionID str
 }
 
 // GetOrCreate gets an existing session or creates a new one
-func (r *TeamLeadRegistry) GetOrCreate(sessionID, teamName string, cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool) (*TeamLeadSession, error) {
+func (r *TeamLeadRegistry) GetOrCreate(sessionID, teamName string, cfg *config.Config) (*TeamLeadSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -87,7 +87,7 @@ func (r *TeamLeadRegistry) GetOrCreate(sessionID, teamName string, cfg *config.C
 	}
 
 	// Create new session
-	session, err := NewTeamLeadSession(sessionID, teamName, cfg, approvalHandler)
+	session, err := NewTeamLeadSession(sessionID, teamName, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create team-lead session: %w", err)
 	}

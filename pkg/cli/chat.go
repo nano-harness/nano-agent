@@ -98,12 +98,20 @@ func runChat(cmd *cobra.Command, args []string) error {
 			cfg.AllowedRules = append(cfg.AllowedRules, raw)
 		}
 
-		approvalHandler := func(*agent.ToolCallInfo) bool { return false }
+		// Resolve permission mode using unified resolver
+		res, warns := ResolvePermission(cfg, PermissionResolveOpts{
+			EnvHintEnabled: true,
+		})
+		LogPermissionResolution("chat.lead", res, warns)
+
 		var err error
-		eng, err = engine.NewLeadEngine(cfg, approvalHandler, teamName)
+		eng, err = engine.NewLeadEngine(cfg, teamName)
 		if err != nil {
 			return fmt.Errorf("failed to create lead engine: %w", err)
 		}
+		eng.Agent.SetApprovalHandlerV2(func(*agent.ToolCallInfo) agent.ApprovalDecision {
+			return agent.ApprovalReject
+		})
 		defer func() { _ = eng.Shutdown() }()
 		session := eng.Agent.GetSessionManager().GetOrCreateSession(sessionID)
 		session.SetMetadata("swarm", agent.SessionMetadata{
@@ -141,7 +149,7 @@ func runChat(cmd *cobra.Command, args []string) error {
 		btAdapter.SetTeamName(teamName)
 		btAdapter.SetModelLister(slash.BuildModelLister(cfg))
 		btAdapter.SetModelStatusGetter(slash.BuildModelStatusGetter(cfg))
-		btAdapter.SetModelSwitcher(slash.BuildModelSwitcher(filepath.Join(cwd, ".nano.yaml")))
+		btAdapter.SetModelSwitcher(slash.BuildModelSwitcher(filepath.Join(cwd, ".nano", "nano.yaml")))
 		btAdapter.SetModelFallbackHandler(slash.BuildModelFallbackHandler(cfg))
 		btAdapter.SetModelDoctor(slash.BuildModelDoctor(cfg))
 		btAdapter.SetContextStatusGetter(slash.BuildContextStatusGetter(eng.Agent))

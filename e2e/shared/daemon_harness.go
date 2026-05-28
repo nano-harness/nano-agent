@@ -50,14 +50,14 @@ func NewDaemonHarness(t *testing.T, mockServer interface{}) *DaemonHarness {
 	cfg := NewTestConfig(mockURL, workDir, true)
 	config.SetGlobalConfig(cfg)
 
-	// Create agent with approval handler that always approves
-	approvalHandler := func(info *agent.ToolCallInfo) bool {
-		return true
-	}
-
 	// Create engine (which creates the agent internally)
-	eng, err := engine.New(cfg, approvalHandler)
+	eng, err := engine.New(cfg)
 	require.NoError(t, err, "failed to create engine")
+
+	// Auto-approve all tools for testing
+	eng.Agent.SetApprovalHandlerV2(func(*agent.ToolCallInfo) agent.ApprovalDecision {
+		return agent.ApprovalApproveOnce
+	})
 
 	// Configure daemon settings
 	daemonCfg := &config.DaemonConfig{

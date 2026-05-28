@@ -151,8 +151,8 @@ func (m *Manager) startBackground() error {
 	programArgs := []string{"daemon", "foreground"}
 	if v := strings.TrimSpace(os.Getenv("NANO_CONFIG_FILE")); v != "" {
 		programArgs = append(programArgs, "--config", v)
-	} else if _, err := os.Stat(".nano.yaml"); err == nil {
-		programArgs = append(programArgs, "--config", ".nano.yaml")
+	} else if _, err := os.Stat(filepath.Join(".nano", "nano.yaml")); err == nil {
+		programArgs = append(programArgs, "--config", filepath.Join(".nano", "nano.yaml"))
 	}
 
 	useGoRun := strings.Contains(executable, "/go-build") || strings.Contains(executable, "\\go-build")

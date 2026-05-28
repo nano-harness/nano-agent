@@ -3,7 +3,7 @@
 // Managed settings are placed at OS-specific system paths by IT and override
 // any user/project configuration. The precedence chain is:
 //
-//	managed > project (.nano.yaml) > user (~/.config/nano/config.yaml) > defaults
+//	managed > project (.nano/nano.yaml) > user (~/.config/nano/config.yaml) > defaults
 //
 // Operators are expected to deploy this file via MDM/Group Policy. Nano always
 // loads it read-only and reports its presence in `nano doctor`.

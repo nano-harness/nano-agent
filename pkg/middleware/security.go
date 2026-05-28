@@ -11,61 +11,33 @@ import (
 
 	"github.com/nano-harness/nano-agent/pkg/hookservice"
 	"github.com/nano-harness/nano-agent/pkg/patternutil"
+	"github.com/nano-harness/nano-agent/pkg/policy"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 )
 
-// ── Decision types ────────────────────────────────────────────────────────────
+// ── Decision types (canonical definitions in pkg/policy) ──────────────────────
 
-// Action is the result of a permission decision.
-type Action int
+// Action is an alias for policy.PermissionAction.
+type Action = policy.PermissionAction
 
+// Action constants re-exported from policy for backward compatibility.
 const (
-	ActionAllow   Action = iota // Proceed automatically (read-only, safe commands)
-	ActionConfirm               // Request user confirmation before proceeding
-	ActionBlock                 // Hard-block, do not execute
+	ActionAllow   = policy.PermissionAllow
+	ActionConfirm = policy.PermissionConfirm
+	ActionBlock   = policy.PermissionBlock
 )
 
-func (a Action) String() string {
-	switch a {
-	case ActionAllow:
-		return "allow"
-	case ActionConfirm:
-		return "confirm"
-	case ActionBlock:
-		return "block"
-	default:
-		return "unknown"
-	}
-}
-
-// Layer identifies which decision layer produced the result.
+// Layer constants re-exported from policy.
 const (
-	LayerConfig   = 1
-	LayerHook     = 2
-	LayerAnalyzer = 3
+	LayerConfig   = policy.LayerConfig
+	LayerHook     = policy.LayerHook
+	LayerAnalyzer = policy.LayerAnalyzer
 )
 
-// Decision is the result of the four-layer permission decision pipeline.
-type Decision struct {
-	Action Action // Allow / Confirm / Block
-	Reason string // Human-readable explanation
-	Rule   string // Matched rule or checker name
-	Layer  int    // Layer that produced this decision (1-4)
-	// Confidence is the confidence level of this decision (0.0 to 1.0).
-	// Higher confidence means less need for user confirmation.
-	Confidence float64
-	// Suggestions provides alternative safe approaches when blocking.
-	Suggestions []string
-	// AutoWhitelist indicates this operation should be added to session allowlist.
-	AutoWhitelist bool
-	// ModifiedParams contains hook-proposed tool parameter overrides that should
-	// be applied before execution after the final security decision permits it.
-	ModifiedParams map[string]interface{}
-	// AuditMetadata carries structured hook metadata for UI/status integrations.
-	AuditMetadata map[string]interface{}
-}
+// Decision is an alias for policy.PermissionDecision (unified in P1-1).
+type Decision = policy.PermissionDecision
 
 // ── Read-only auto-approval list ─────────────────────────────────────────────
 
@@ -75,7 +47,7 @@ var readOnlyCommands = map[string]bool{
 	"ls": true, "ll": true, "la": true,
 	"cat": true, "head": true, "tail": true,
 	"less": true, "more": true,
-	"grep": true, "rg": true, "ag": true, "awk": true, "sed": true,
+	"grep": true, "rg": true, "ag": true, "sed": true,
 	"find": true, "locate": true,
 	"wc": true, "file": true, "which": true, "type": true,
 	"whoami": true, "id": true, "pwd": true,
@@ -88,6 +60,7 @@ var readOnlyCommands = map[string]bool{
 	"ps":   true, "top": true, "htop": true,
 	"df": true, "du": true, "free": true,
 	"uname": true, "hostname": true,
+	"git":    true, // sub-commands checked below
 	"go":     true, // sub-commands checked below
 	"node":   true,
 	"python": true, "python3": true,
@@ -126,10 +99,6 @@ var readOnlySubcommands = map[string]map[string]bool{
 	},
 	"pip": {
 		"--version": true, "list": true, "show": true, "freeze": true,
-	},
-	"npm": {
-		"--version": true, "list": true, "ls": true, "test": true,
-		"run": true, // npm run test, npm run lint, etc.
 	},
 }
 
@@ -629,7 +598,7 @@ var defaultSensitiveReadPaths = []string{
 	".env.local",
 	".env.production",
 	".env.development",
-	".nano.yaml",
+	".nano/nano.yaml",
 	".nano.local.yaml",
 	"NANO.local.md",
 	"~/.ssh",
@@ -1068,11 +1037,13 @@ func (a *SemanticAnalyzer) Analyze(command string) (*Decision, error) {
 		}
 	}
 	// Default: for simple commands (no compound statements, no substitutions),
-	// allow with low confidence. Complex/compound commands still require confirmation.
+	// require confirmation with low confidence. Complex/compound commands also
+	// require confirmation. Unclassified commands should not be silently allowed
+	// since they may include tools like kubectl, curl, nc, or pip install.
 	if pc != nil && len(pc.Statements) == 1 && len(pc.Substitutions) == 0 {
 		return &Decision{
-			Action:     ActionAllow,
-			Reason:     "simple unclassified command auto-allowed",
+			Action:     ActionConfirm,
+			Reason:     "simple unclassified command requires confirmation",
 			Rule:       "SimpleCommandAutoAllow",
 			Layer:      LayerAnalyzer,
 			Confidence: 0.6,
@@ -1139,10 +1110,9 @@ func (g *CommandGuard) Analyze(ctx context.Context, command string) (*Decision, 
 	if err != nil {
 		return nil, fmt.Errorf("hook engine error: %w", err)
 	}
-	middlewareDecision := hookDecisionToMiddleware(hookDecision)
-	middlewareDecision.Layer = LayerHook
-	if middlewareDecision.Action != ActionAllow {
-		return middlewareDecision, nil
+	hookDecision.Layer = LayerHook
+	if hookDecision.Action != ActionAllow {
+		return hookDecision, nil
 	}
 
 	// Layer 3: Semantic analyzer (AST + checkers)
@@ -1154,7 +1124,7 @@ func (g *CommandGuard) Analyze(ctx context.Context, command string) (*Decision, 
 	if err != nil {
 		return nil, err
 	}
-	if len(hookDecision.ModifiedParams) > 0 && decision.Action == ActionAllow {
+	if len(hookDecision.ModifiedParams) > 0 && decision.Action != ActionBlock {
 		decision.ModifiedParams = copyDecisionParams(hookDecision.ModifiedParams)
 		if decision.Rule == "" {
 			decision.Rule = hookDecision.Rule

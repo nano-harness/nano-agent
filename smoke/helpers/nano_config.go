@@ -15,9 +15,13 @@ type NanoConfig struct {
 	APIKey  string
 }
 
-// WriteMinimalConfig creates a minimal .nano.yaml for testing.
+// WriteMinimalConfig creates a minimal .nano/nano.yaml for testing.
 func WriteMinimalConfig(t *testing.T, workDir string, mockURL string) string {
-	configPath := filepath.Join(workDir, ".nano.yaml")
+	nanoDir := filepath.Join(workDir, ".nano")
+	if err := os.MkdirAll(nanoDir, 0755); err != nil {
+		t.Fatalf("Failed to create .nano directory: %v", err)
+	}
+	configPath := filepath.Join(nanoDir, "nano.yaml")
 
 	config := fmt.Sprintf(`# Minimal test configuration
 openai:

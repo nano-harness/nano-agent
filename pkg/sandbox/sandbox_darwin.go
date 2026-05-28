@@ -27,10 +27,16 @@ type SandboxExecSandbox struct {
 	workingDir string
 }
 
-// newSandboxExecSandbox creates a SandboxExecSandbox.
+// NewSandboxExecSandbox creates a SandboxExecSandbox.
+// sandbox-exec is always present on macOS so no binary look-up is needed.
+func NewSandboxExecSandbox(cfg *config.SandboxConfig, workingDir string) *SandboxExecSandbox {
+	return &SandboxExecSandbox{cfg: cfg, workingDir: workingDir}
+}
+
+// newSandboxExecSandbox creates a SandboxExecSandbox (implements Sandbox interface).
 // sandbox-exec is always present on macOS so no binary look-up is needed.
 func newSandboxExecSandbox(cfg *config.SandboxConfig, workingDir string) Sandbox {
-	return &SandboxExecSandbox{cfg: cfg, workingDir: workingDir}
+	return NewSandboxExecSandbox(cfg, workingDir)
 }
 
 // IsEnabled always returns true for a SandboxExecSandbox.
@@ -76,12 +82,10 @@ func (s *SandboxExecSandbox) WrapCommand(workingDir, cmd string, args []string) 
 		// Only pass through NANO_* prefixed variables and essential runtime vars
 		switch {
 		case strings.HasPrefix(k, "NANO_"),
-			k == "PATH", k == "TERM", k == "LANG", k == "LC_ALL":
+			k == "PATH", k == "TERM", k == "LANG", k == "LC_ALL", k == "HOME":
 			envArgs = append(envArgs, k+"="+v)
 		}
 	}
-	// Set HOME to the working directory (sandbox doesn't allow access to real home)
-	envArgs = append(envArgs, "HOME="+dir)
 
 	// Build the full command: env -i <env...> sandbox-exec -p <profile> <cmd> <args...>
 	wrapped := []string{"-i"}
@@ -105,6 +109,20 @@ func canonicalize(p string) string {
 		return resolved
 	}
 	return p
+}
+
+// BuildProfileForInspection returns the rendered SBPL profile string for
+// debugging and audit purposes (used by `nano-agent sandbox print`).
+func (s *SandboxExecSandbox) BuildProfileForInspection() string {
+	dir := s.workingDir
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			dir = "."
+		}
+	}
+	return s.buildProfile(canonicalize(dir))
 }
 
 // buildProfile generates the SBPL profile string.
@@ -147,6 +165,41 @@ func (s *SandboxExecSandbox) buildProfile(workingDir string) string {
 	for _, p := range s.cfg.ExtraWritablePaths {
 		fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %q))\n", canonicalize(p))
 	}
+
+	// ── HOME read-allow + hard blacklist ─────────────────────────────────────
+	home := os.Getenv("HOME")
+	if home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			home = h
+		}
+	}
+	if home != "" {
+		home = canonicalize(home)
+
+		// Blanket HOME read-allow (claude-code parity). Writes still default-deny
+		// outside workdir / /tmp / extra_writable_paths.
+		fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", home)
+
+		// Built-in critical blacklist — read+write denied unconditionally.
+		// Emitted after the allow so it always wins (SBPL: later rules override
+		// earlier ones). The list is hardcoded; operators can extend via
+		// ExtraDeniedPaths but cannot remove from it.
+		for _, rel := range BuiltinDeniedRelPaths {
+			fmt.Fprintf(&b, "(deny file-read* file-write* (subpath %q))\n",
+				filepath.Join(home, rel))
+		}
+	}
+
+	// Arbitrary absolute denies (not necessarily under $HOME).
+	for _, p := range s.cfg.ExtraDeniedPaths {
+		fmt.Fprintf(&b, "(deny file-read* file-write* (subpath %q))\n", canonicalize(p))
+	}
+
+	// Anti-tamper: deny-write the .nano/ namespace inside the working directory.
+	// The agent must not rewrite its own config or other symphony-managed state.
+	// Reads remain allowed for self-inspection.
+	fmt.Fprintf(&b, "(deny file-write* (subpath %q))\n",
+		canonicalize(filepath.Join(workingDir, ".nano")))
 
 	// ── Network ─────────────────────────────────────────────────────────────
 	if s.cfg.NetworkAccess {

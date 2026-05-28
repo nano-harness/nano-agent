@@ -15,6 +15,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStreamHandler_RequiresSessionID(t *testing.T) {
@@ -319,20 +320,29 @@ func TestTeamLeadSessionStreamHandler_LeadInputExecutesAndStreams(t *testing.T) 
 
 func TestTeamLeadSessionInteractiveApprovalPublishesWaitingEvent(t *testing.T) {
 	session := &TeamLeadSession{
-		ID:          "lead-alpha-chat",
-		TeamName:    "alpha",
-		Store:       NewTaskEventStore(100),
-		Broadcaster: NewEventBroadcaster(),
-		activeTasks: make(map[string]*ActiveTask),
+		ID:               "lead-alpha-chat",
+		TeamName:         "alpha",
+		Store:            NewTaskEventStore(100),
+		Broadcaster:      NewEventBroadcaster(),
+		activeTasks:      make(map[string]*ActiveTask),
+		pendingApprovals: make(map[string]chan agent.ApprovalDecision),
 	}
 
-	approvedImmediately := session.requestToolApproval(&agent.ToolCallInfo{
-		ID:         "call-1",
-		Name:       "bash",
-		Parameters: map[string]interface{}{"command": "rm -rf tmp"},
-	})
+	// requestToolApprovalV2 blocks until SubmitToolApproval sends a decision,
+	// so run it in a goroutine and verify the waiting event was published.
+	done := make(chan agent.ApprovalDecision, 1)
+	go func() {
+		decision := session.requestToolApprovalV2(&agent.ToolCallInfo{
+			ID:         "call-1",
+			Name:       "bash",
+			Parameters: map[string]interface{}{"command": "rm -rf tmp"},
+		})
+		done <- decision
+	}()
 
-	assert.False(t, approvedImmediately)
+	// Give the goroutine time to register the pending approval and publish the event.
+	time.Sleep(50 * time.Millisecond)
+
 	events := session.Store.Since(0, func(event.StreamEvent) bool { return true })
 	if assert.Len(t, events, 1) {
 		assert.Equal(t, event.EventTypeWaitingForUser, events[0].Type)
@@ -340,6 +350,11 @@ func TestTeamLeadSessionInteractiveApprovalPublishesWaitingEvent(t *testing.T) {
 		assert.Equal(t, "call-1", events[0].Metadata["call_id"])
 		assert.Equal(t, "bash", events[0].Metadata["tool_name"])
 	}
+
+	// Unblock the handler
+	require.NoError(t, session.SubmitToolApproval("call-1", false))
+	decision := <-done
+	assert.Equal(t, agent.ApprovalReject, decision)
 }
 
 func TestTeamLeadSessionStreamHandler_ToolApprovalFrame(t *testing.T) {

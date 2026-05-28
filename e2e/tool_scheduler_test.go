@@ -181,10 +181,10 @@ func (s *ToolSchedulerSuite) TestToolExecutionStatusEvents() {
 // --- 用户拒绝工具调用：RequiresConfirmation 工具被拒绝 ---
 
 func (s *ToolSchedulerSuite) TestUserRejection() {
-	// 将 Agent 的审批 handler 设为始终返回 false，模拟“等待用户确认”模式
-	s.Agent.SetApprovalHandler(func(info *agent.ToolCallInfo) bool {
+	// 将 Agent 的审批 handler 设为始终返回 Reject，模拟"等待用户确认"模式
+	s.Agent.SetApprovalHandlerV2(func(info *agent.ToolCallInfo) agent.ApprovalDecision {
 		// 所有需要确认的工具都先挂起，稍后通过 HandleConfirmationResponse 决定
-		return false
+		return agent.ApprovalReject
 	})
 
 	// Turn 1: LLM 希望写入敏感文件

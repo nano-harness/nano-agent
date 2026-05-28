@@ -19,7 +19,7 @@ func testSwarmConfig() *config.Config {
 
 func TestNewLeadEngineInjectsMailbox(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	eng, err := NewLeadEngine(testSwarmConfig(), nil, "alpha")
+	eng, err := NewLeadEngine(testSwarmConfig(), "alpha")
 	if err != nil {
 		t.Fatalf("NewLeadEngine() error = %v", err)
 	}
@@ -38,7 +38,7 @@ func TestNewTeammateEngineInjectsMailboxesAndIdleHook(t *testing.T) {
 		TeamName:        "alpha",
 		ParentSessionID: "lead-alpha-chat-123",
 	}
-	eng, err := NewTeammateEngine(testSwarmConfig(), nil, identity)
+	eng, err := NewTeammateEngine(testSwarmConfig(), identity)
 	if err != nil {
 		t.Fatalf("NewTeammateEngine() error = %v", err)
 	}

@@ -8,7 +8,7 @@ import (
 
 func TestSensitiveReadPath_DefaultsRequireConfirm(t *testing.T) {
 	tests := []string{
-		"cat .nano.yaml",
+		"cat .nano/nano.yaml",
 		"cat ~/.ssh/id_rsa",
 		"less .env.production",
 		"grep -r KEY ~/.aws/",

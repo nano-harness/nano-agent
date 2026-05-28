@@ -4,13 +4,15 @@ import (
 	"context"
 	"testing"
 
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 )
 
 func TestGoalEvaluatorMet(t *testing.T) {
 	client := llm.NewMockClient()
 	client.DefaultResp = llm.MockResponse{Content: `{"met": true, "reason": "tests passed"}`}
-	ev := NewGoalEvaluator(client)
+	cfg := config.GoalConfig{}
+	ev := NewGoalEvaluator(client, cfg)
 	result, err := ev.Evaluate(context.Background(), "tests pass", []llm.Message{{Role: "assistant", Content: "tests passed"}})
 	if err != nil {
 		t.Fatalf("Evaluate failed: %v", err)
@@ -23,7 +25,8 @@ func TestGoalEvaluatorMet(t *testing.T) {
 func TestGoalEvaluatorNotMet(t *testing.T) {
 	client := llm.NewMockClient()
 	client.DefaultResp = llm.MockResponse{Content: `{"met": false, "reason": "tests still failing"}`}
-	ev := NewGoalEvaluator(client)
+	cfg := config.GoalConfig{}
+	ev := NewGoalEvaluator(client, cfg)
 	result, err := ev.Evaluate(context.Background(), "tests pass", nil)
 	if err != nil {
 		t.Fatalf("Evaluate failed: %v", err)
@@ -36,7 +39,8 @@ func TestGoalEvaluatorNotMet(t *testing.T) {
 func TestGoalEvaluatorInvalidJSONDefaultsNotMet(t *testing.T) {
 	client := llm.NewMockClient()
 	client.DefaultResp = llm.MockResponse{Content: "not json"}
-	ev := NewGoalEvaluator(client)
+	cfg := config.GoalConfig{}
+	ev := NewGoalEvaluator(client, cfg)
 	result, err := ev.Evaluate(context.Background(), "tests pass", nil)
 	if err != nil {
 		t.Fatalf("Evaluate failed: %v", err)

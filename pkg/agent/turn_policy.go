@@ -51,6 +51,18 @@ func (t *Turn) shouldTerminate() bool {
 }
 
 func (t *Turn) turnPolicyDecision() turnpolicy.Decision {
+	if t.agent != nil {
+		if pm := t.agent.GetPermissionManager(); pm != nil && pm.DenialTrackerLockedOut() {
+			t.SetTerminationInfo(
+				"classifier_lockout",
+				"classifier_lockout",
+				"consecutive deny limit reached",
+			)
+			return turnpolicy.NewDecision(turnpolicy.ActionTerminate, "classifier_lockout").
+				WithMetadata("reason", "classifier_lockout")
+		}
+	}
+
 	var state turnpolicy.TurnState
 	if t.ctx != nil {
 		state.ContextErr = t.ctx.Err()

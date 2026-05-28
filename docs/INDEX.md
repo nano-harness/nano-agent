@@ -58,6 +58,13 @@ Migration guides for upgrading between versions:
   - Single-agent to swarm mode migration
   - Version-specific migration instructions
 
+## Integration
+
+Cross-repository contracts and interop documentation:
+
+- [Symphony Interop Contract](symphony-interop.md) - Interface contract with nano-symphony orchestrator (exit codes, stdout JSON, file artifacts, flag priority)
+- [Sandbox × Permission Matrix](sandbox-permission-matrix.md) - Flag combination behavior matrix across platforms
+
 ## Testing
 
 Testing infrastructure and guidelines:

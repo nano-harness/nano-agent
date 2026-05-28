@@ -1139,55 +1139,44 @@ func (spb *SystemPromptBuilder) buildTeammateAddendum(identity *swarm.TeammateId
 	sb.WriteString("# You are a Teammate Agent\n\n")
 	sb.WriteString(fmt.Sprintf("You are **%s**, a teammate agent in the **%s** team.\n\n", identity.AgentName, identity.TeamName))
 	sb.WriteString("## Your Responsibilities\n\n")
-	sb.WriteString("1. **Work on assigned subtasks**: Focus on the specific task assigned to you by the team-lead\n")
-	sb.WriteString("2. **Communicate progress**: Use `send_message` to report findings, ask questions, or request help\n")
-	sb.WriteString("3. **Check your inbox**: Use `check_inbox` to receive messages and instructions from the team-lead\n")
-	sb.WriteString("4. **Stay focused**: Complete your assigned work before taking on new tasks\n\n")
+	sb.WriteString("1. **Work on assigned subtasks**: Focus on the specific task assigned to you by the parent agent\n")
+	sb.WriteString("2. **Communicate progress**: Use `send_message` to report findings or request help\n")
+	sb.WriteString("3. **Stay focused**: Complete your assigned work before taking on new tasks\n\n")
 	sb.WriteString("## Communication Guidelines\n\n")
-	sb.WriteString("- Send progress updates to 'team-lead' when you make significant progress\n")
-	sb.WriteString("- Ask the team-lead for clarification if requirements are unclear\n")
+	sb.WriteString("- Send progress updates when you make significant progress\n")
 	sb.WriteString("- Report blockers or issues immediately\n")
 	sb.WriteString("- Use clear, concise messages focused on actionable information\n\n")
 	sb.WriteString("## Limitations\n\n")
-	sb.WriteString("- You cannot spawn other teammates (team-lead only)\n")
-	sb.WriteString("- You cannot create new teams (team-lead only)\n")
-	sb.WriteString("- You can see other team members using `team_list`\n\n")
+	sb.WriteString("- You cannot spawn other subagents\n")
+	sb.WriteString("- You cannot create new teams\n\n")
 
 	return sb.String()
 }
 
-// buildSwarmToolsSection generates documentation for swarm/team collaboration tools
+// buildSwarmToolsSection generates documentation for agent collaboration tools
 func (spb *SystemPromptBuilder) buildSwarmToolsSection(ctx context.Context) string {
 	// Check if we're in a swarm context
 	isTeammate := ctx != nil && swarm.IsTeammate(ctx)
 
 	var sb strings.Builder
-	sb.WriteString("\n\n# MULTI-AGENT COLLABORATION TOOLS\n\n")
-	sb.WriteString("You have access to tools for multi-agent team collaboration:\n\n")
-
-	// Tools available to both lead and teammates
-	sb.WriteString("## Communication Tools\n\n")
-	sb.WriteString("- **send_message**: Send messages to other team members (teammates or team-lead)\n")
-	sb.WriteString("- **check_inbox**: Check for new messages in your inbox\n")
-	sb.WriteString("- **team_list**: List all team members and their status\n\n")
+	sb.WriteString("\n\n# AGENT COLLABORATION TOOLS\n\n")
 
 	if !isTeammate {
-		// Team-lead specific tools
-		sb.WriteString("## Team Management Tools (Team-Lead Only)\n\n")
-		sb.WriteString("- **team_create**: Create a new multi-agent team\n")
-		sb.WriteString("- **spawn_teammate**: Spawn a new teammate agent to work on a subtask\n")
-		sb.WriteString("  - Choose `in_process` for lightweight goroutine execution\n")
-		sb.WriteString("  - Choose `subprocess` for isolated tmux/iTerm2 pane execution\n\n")
-		sb.WriteString("## When to Use Multi-Agent Collaboration\n\n")
-		sb.WriteString("Consider spawning teammates for:\n")
+		sb.WriteString("You have the `Agent` tool to spawn subagents for focused tasks.\n\n")
+		sb.WriteString("## Agent Tool\n\n")
+		sb.WriteString("- **Agent**: Spawn a subagent to perform a focused task\n")
+		sb.WriteString("- **TaskOutput**: Read output from a background agent\n")
+		sb.WriteString("- **TaskStop**: Cancel a running background agent\n\n")
+		sb.WriteString("## When to Use Subagents\n\n")
+		sb.WriteString("Consider spawning subagents for:\n")
 		sb.WriteString("- **Parallel research**: Multiple independent investigation threads\n")
 		sb.WriteString("- **Complex tasks**: Break down large projects into focused subtasks\n")
 		sb.WriteString("- **Specialized work**: Assign specific areas to focused agents\n\n")
 		sb.WriteString("**Best Practices**:\n")
-		sb.WriteString("1. Give each teammate a clear, focused task\n")
-		sb.WriteString("2. Check your inbox regularly for teammate updates\n")
-		sb.WriteString("3. Coordinate and integrate teammate work\n")
-		sb.WriteString("4. Use descriptive teammate names (e.g., 'researcher', 'tester')\n\n")
+		sb.WriteString("1. Give each subagent a clear, focused task\n")
+		sb.WriteString("2. Include ALL necessary context in the prompt (agents are stateless)\n")
+		sb.WriteString("3. Use appropriate subagent_type for the task\n")
+		sb.WriteString("4. Use run_in_background for long-running tasks\n\n")
 	}
 
 	return sb.String()
@@ -1374,54 +1363,55 @@ func (spb *SystemPromptBuilder) BuildSubAgentDispatchPrompt() string {
 
 	return `
 
-## Parallel Sub-Agent Dispatch (` + "`task`" + ` tool)
+## Sub-Agent Dispatch (` + "`Agent`" + ` tool)
 
-You have a ` + "`task`" + ` tool to dispatch one or more sub-agents in parallel for independent research/exploration/modification tasks.
+You have an ` + "`Agent`" + ` tool to spawn subagents for focused tasks. Subagents run independently and return results.
 
-### When to USE the ` + "`task`" + ` tool
+### When to USE the ` + "`Agent`" + ` tool
 - 2+ independent codebase exploration tasks
 - Wide-ranging searches that don't depend on each other
 - Synthesizing information from multiple isolated sources
 - Independent modification tasks on different modules
+- Complex multi-step tasks that benefit from isolation
 
 ### When NOT to use it
 - Reading a known file path → use ` + "`read_file`" + ` directly
-- Single-shot file search/listing → use ` + "`run_shell_command`" + ` with rg/fd/find/ls/tree
+- Single-shot file search/listing → use ` + "`run_shell_command`" + `
 - Tasks needing user interaction (sub-agents cannot ask questions)
 - Trivial single-step operations
 - Tasks with sequential dependencies
 
-### How to call it (PREFER batch mode for parallelism)
-Pass a ` + "`tasks`" + ` array to dispatch multiple sub-agents concurrently in ONE call:
+### How to call it
 ` + "```json" + `
 {
-  "tasks": [
-    {"description": "调研模块 A", "prompt": "...", "subagent_type": "explore"},
-    {"description": "调研模块 B", "prompt": "...", "subagent_type": "explore"}
-  ]
+  "description": "Explore auth module",
+  "prompt": "Find all authentication-related files and describe the auth flow...",
+  "subagent_type": "explore"
 }
 ` + "```" + `
+
+### Key parameters
+- ` + "`description`" + `: Short 3-5 word task label
+- ` + "`prompt`" + `: Full self-contained instructions (MUST include all context)
+- ` + "`subagent_type`" + `: Agent capability profile (see below)
+- ` + "`run_in_background`" + `: Set true for long-running tasks (returns task handle)
+- ` + "`isolation`" + `: Set "worktree" for git-isolated modifications
+- ` + "`model`" + `: Override model (omit to inherit)
 
 ### CRITICAL: Each sub-agent is STATELESS
 - Sub-agents have ZERO access to your conversation history
 - Your ` + "`prompt`" + ` MUST be fully self-contained: include all relevant context, file paths, constraints, and the EXACT information you want returned
 - Do NOT reference "the file we discussed" or "what you found earlier"
 
-### Sub-agent capability boundaries
-- ✅ Read-only ops: read_file and safe shell search/listing commands via run_shell_command
-- ✅ Edit files within working directory (write_file, edit_file, delete_file)
-- ✅ Safe shell commands (ls, git status, go test, go build)
-- ❌ Network ops (web_fetch, web_search) — auto-rejected
-- ❌ Operations on paths in the sensitive-file blocklist are rejected
-- ❌ Dangerous shell (rm -rf, sudo) — auto-rejected
-- ❌ Cannot ask user questions; cannot dispatch further sub-agents
-
 ### Available ` + "`subagent_type`" + ` values
-- ` + "`explore`" + `: code/architecture investigation (read-heavy)
-- ` + "`plan`" + `: design proposal & step-by-step planning
-- ` + "`execute`" + `: focused code modification
-- ` + "`verify`" + `: test / validation tasks
-- (Plus any custom Experts registered in your project; see "Available Experts" section)
+- ` + "`general-purpose`" + `: Full-capability agent (default)
+- ` + "`explore`" + `: Code/architecture investigation (read-only)
+- ` + "`plan`" + `: Design proposal & step-by-step planning
+- ` + "`verify`" + `: Test / validation tasks
+- (Plus any custom agents defined in .claude/agents/ or .nano/agents/)
+
+### Background agents
+Set ` + "`run_in_background: true`" + ` for long-running tasks. Use ` + "`TaskOutput`" + ` to check results and ` + "`TaskStop`" + ` to cancel.
 `
 }
 

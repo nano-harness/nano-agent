@@ -89,7 +89,7 @@ func (t *WriteFileTool) RequiresConfirmationForParams(params map[string]interfac
 		"license", "license.txt", "license.md",
 		"changelog.md", "changelog.txt",
 		"config.yml", "config.yaml", "config.json", "config.toml",
-		".nano.yaml", ".nano.yml", ".nano.json",
+		".nano/nano.yaml", ".nano.yml", ".nano.json",
 	}
 
 	// Check if it's a critical file

@@ -105,7 +105,14 @@ func runTeammate(cmd *cobra.Command, args []string) error {
 	}
 	cfg = configForTeammate(cfg, identity)
 
+	// Resolve permission mode using unified resolver
+	res, warns := ResolvePermission(cfg, PermissionResolveOpts{
+		EnvHintEnabled: true,
+	})
+	LogPermissionResolution("teammate", res, warns)
+
 	logger.Infof("Starting teammate '%s' in team '%s'", name, team)
+	logger.Infof("Teammate entry auto-approves all tools by default; to restrict, set PermissionMode=plan/default + ConfirmPolicy=block")
 
 	// Setup signal handling
 	ctx := signalContext()
@@ -115,16 +122,16 @@ func runTeammate(cmd *cobra.Command, args []string) error {
 		defer cancel()
 	}
 
-	// Create approval handler (auto-approve for teammates)
-	approvalHandler := func(info *agent.ToolCallInfo) bool {
-		return true
-	}
-
 	// Build teammate engine
-	eng, err := engine.NewTeammateEngine(cfg, approvalHandler, identity)
+	eng, err := engine.NewTeammateEngine(cfg, identity)
 	if err != nil {
 		return fmt.Errorf("failed to create teammate engine: %w", err)
 	}
+	// Auto-approve all tools for teammate autonomy.
+	// To tighten control, configure permission_mode and confirm_policy in config.
+	eng.Agent.SetApprovalHandlerV2(func(*agent.ToolCallInfo) agent.ApprovalDecision {
+		return agent.ApprovalApproveOnce
+	})
 	defer eng.Shutdown()
 
 	// Run the teammate with initial prompt

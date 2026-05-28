@@ -22,7 +22,9 @@ const (
 	HookStopFailure        HookEvent = hookservice.EventStopFailure
 	HookSubagentStart      HookEvent = hookservice.EventSubagentStart
 	HookSubagentStop       HookEvent = hookservice.EventSubagentStop
-	HookTeammateIdle       HookEvent = hookservice.EventTeammateIdle
+	HookPermissionRequest  HookEvent = hookservice.EventPermissionRequest
+	HookPermissionDenied   HookEvent = hookservice.EventPermissionDenied
+	HookNotification       HookEvent = hookservice.EventNotification
 )
 
 // Hook is a user-defined shell script that fires before or after tool execution.
@@ -91,8 +93,8 @@ func (e *HookEngine) HasProgrammaticHook(name string) bool {
 }
 
 // Execute runs all matching hooks for the given event/tool combination.
-// The hook script receives the tool input as NANO_TOOL_INPUT (JSON).
-// Exit codes: 0 = allow, 1 = confirm, 2 = block.
+// The hook command receives the hook input as JSON via stdin.
+// Exit codes: 0 = allow, 2 = block; other exit codes are treated as warn+allow.
 // The first non-allow decision wins.
 func (e *HookEngine) Execute(ctx context.Context, event HookEvent, toolName string, params map[string]interface{}) (*Decision, error) {
 	decision, err := e.execute(ctx, event, toolName, params)
@@ -127,11 +129,7 @@ func (e *HookEngine) execute(ctx context.Context, event HookEvent, toolName stri
 	if e == nil || e.service == nil {
 		return &Decision{Action: ActionAllow, Reason: "no hooks configured"}, nil
 	}
-	decision, err := e.service.Execute(ctx, event, toolName, params)
-	if err != nil {
-		return nil, err
-	}
-	return hookDecisionToMiddleware(decision), nil
+	return e.service.Execute(ctx, event, toolName, params)
 }
 
 func (e *HookEngine) executeProgrammatic(ctx context.Context, event HookEvent, toolName string, params map[string]interface{}) *Decision {
@@ -150,43 +148,15 @@ func (e *HookEngine) executeProgrammatic(ctx context.Context, event HookEvent, t
 				Rule:   hook.Name(),
 			}
 		}
-		middlewareDecision := hookDecisionToMiddleware(decision)
-		if middlewareDecision == nil {
+		if decision == nil {
 			continue
 		}
-		if middlewareDecision.Rule == "" {
-			middlewareDecision.Rule = hook.Name()
+		if decision.Rule == "" {
+			decision.Rule = hook.Name()
 		}
-		if middlewareDecision.Action != ActionAllow {
-			return middlewareDecision
+		if decision.Action != ActionAllow {
+			return decision
 		}
 	}
 	return &Decision{Action: ActionAllow, Reason: "all programmatic hooks passed"}
-}
-
-func hookDecisionToMiddleware(decision *hookservice.Decision) *Decision {
-	if decision == nil {
-		return nil
-	}
-	return &Decision{
-		Action:         hookActionToMiddleware(decision.Action),
-		Reason:         decision.Reason,
-		Rule:           decision.Rule,
-		Suggestions:    append([]string(nil), decision.Warnings...),
-		AuditMetadata:  copyDecisionParams(decision.AuditMetadata),
-		ModifiedParams: copyDecisionParams(decision.ModifiedParams),
-	}
-}
-
-func hookActionToMiddleware(action hookservice.Action) Action {
-	switch action {
-	case hookservice.ActionAllow:
-		return ActionAllow
-	case hookservice.ActionConfirm:
-		return ActionConfirm
-	case hookservice.ActionBlock:
-		return ActionBlock
-	default:
-		return ActionConfirm
-	}
 }

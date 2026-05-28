@@ -6,12 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/pprof"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -20,11 +18,9 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
 	"github.com/nano-harness/nano-agent/pkg/logger"
-	"github.com/nano-harness/nano-agent/pkg/patch"
 )
-
-const binaryResultSentinel = "<<<NANO_RESULT>>>"
 
 var unsafeCacheKeyChars = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 
@@ -36,13 +32,23 @@ const (
 	binaryExitUnclassified = 1
 )
 
+// Sentinel errors for binary error classification.
+// Wrap these with fmt.Errorf("...: %w", ErrTimeout) to enable errors.Is matching.
+var (
+	ErrTimeout       = errors.New("timeout")
+	ErrRateLimit     = errors.New("rate limit")
+	ErrSandboxDenied = errors.New("sandbox denied")
+)
+
 type binaryOptions struct {
-	OutputDir    string
-	Sandbox      string
-	OnExitCmd    string
-	Goal         string
-	GoalMaxTurns int
-	SessionID    string // NEW: explicit override
+	OutputDir      string
+	Sandbox        string
+	Goal           string
+	GoalMaxTurns   int
+	SessionID      string // NEW: explicit override
+	HookService    *hookservice.Service
+	PermissionMode string // --permission-mode flag value
+	SkipPerms      bool   // --dangerously-skip-permissions flag value
 }
 
 type binaryResultTokens struct {
@@ -51,139 +57,51 @@ type binaryResultTokens struct {
 }
 
 type binaryResultSummary struct {
-	Status              string             `json:"status"`
-	Reason              string             `json:"reason,omitempty"`
-	TerminationCause    string             `json:"termination_cause,omitempty"`   // Structured enum: task_done, error_threshold, etc.
-	BlockerFingerprint  string             `json:"blocker_fingerprint,omitempty"` // Stable blocker ID
-	ToolCalls           int                `json:"tool_calls"`
-	DurationMS          int64              `json:"duration_ms"`
-	Tokens              binaryResultTokens `json:"tokens"`
-	GoalState           *agent.GoalState   `json:"goal_state,omitempty"`
-	CacheKey            string             `json:"cache_key,omitempty"`
+	Status                string             `json:"status"`
+	Reason                string             `json:"reason,omitempty"`
+	TerminationCause      string             `json:"termination_cause,omitempty"`   // Structured enum: task_done, error_threshold, etc.
+	BlockerFingerprint    string             `json:"blocker_fingerprint,omitempty"` // Stable blocker ID
+	BlockedCommandsSample []string           `json:"blocked_commands_sample,omitempty"`
+	ToolCalls             int                `json:"tool_calls"`
+	DurationMS            int64              `json:"duration_ms"`
+	Tokens                binaryResultTokens `json:"tokens"`
+	GoalState             *agent.GoalState   `json:"goal_state,omitempty"`
+	CacheKey              string             `json:"cache_key,omitempty"`
 }
 
-// runBinaryMode executes the agent in binary mode for SWE-bench evaluation
-func runBinaryMode(args []string, outputDir string) error {
-	return runBinaryModeWithOptions(args, binaryOptions{OutputDir: outputDir, Sandbox: "auto"})
+type binaryTurnTermination struct {
+	Cause       string
+	Fingerprint string
+	Reason      string
 }
 
-func runBinaryModeWithOptions(args []string, opts binaryOptions) error {
-	if len(args) == 0 {
-		return fmt.Errorf("prompt required in binary mode")
-	}
+type binaryExecution struct {
+	Result                string
+	Trajectory            []trajectoryEvent
+	GoalState             *agent.GoalState
+	SessionID             string
+	Termination           binaryTurnTermination
+	BlockedCommandsSample []string
+}
 
-	prompt := strings.Join(args, " ")
-	start := time.Now()
-	summary := binaryResultSummary{Status: "abandoned", Reason: "not started"}
-	exitHook := firstNonEmpty(opts.OnExitCmd, os.Getenv("NANO_ON_EXIT"))
-	defer func() {
-		runBinaryExitHook(exitHook, summary)
-	}()
-
-	// Create output directory if specified
-	if opts.OutputDir != "" {
-		if err := os.MkdirAll(opts.OutputDir, 0755); err != nil {
-			return fmt.Errorf("error creating output directory: %w", err)
-		}
-	}
-
-	// Get current working directory as project path
-	projectPath, err := os.Getwd()
+// emitResult writes byte-identical JSON to both stdout and <outputDir>/result.json.
+// If patch is non-empty it is also written to <outputDir>/solution.patch.
+func emitResult(stdout io.Writer, outputDir string, summary binaryResultSummary, patch string) error {
+	payload, err := json.Marshal(summary)
 	if err != nil {
-		return fmt.Errorf("error getting current directory: %w", err)
+		return fmt.Errorf("marshal result: %w", err)
 	}
-
-	cacheKey, cacheErr := recordBinaryPromptCacheKey(prompt)
-	if cacheErr != nil {
-		logger.Warnf("binary prompt cache metadata: %v", cacheErr)
+	if err := os.WriteFile(filepath.Join(outputDir, "result.json"), payload, 0o644); err != nil {
+		return fmt.Errorf("write result.json: %w", err)
 	}
-
-	// Execute agent in binary mode
-	// Optional: start local-only pprof server using top-level config only
-	cfg := config.Get()
-	var pprofServer *http.Server
-	if cfg != nil {
-		pprofEnabled := cfg.EnablePprof
-		pprofPort := cfg.PprofPort
-		if pprofEnabled {
-			if pprofPort == 0 {
-				pprofPort = 6060
-			}
-			pprofMux := http.NewServeMux()
-			pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
-			pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-			pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-			pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-
-			addr := fmt.Sprintf("%s:%d", "127.0.0.1", pprofPort)
-			pprofServer = &http.Server{Addr: addr, Handler: pprofMux}
-			go func() {
-				logger.Infof("Starting pprof server on %s (local-only)", addr)
-				if err := pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					logger.Warnf("pprof server error: %v", err)
-				}
-			}()
-			defer func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancel()
-				_ = pprofServer.Shutdown(ctx)
-			}()
+	if patch != "" {
+		if err := os.WriteFile(filepath.Join(outputDir, "solution.patch"), []byte(patch), 0o644); err != nil {
+			return fmt.Errorf("write solution.patch: %w", err)
 		}
 	}
-
-	result, trajectory, goalState, err := executeBinaryModeWithOptions(prompt, projectPath, opts)
-	summary = summarizeBinaryResult(trajectory, start, result, err, goalState)
-	summary.CacheKey = cacheKey
-	if err != nil {
-		_ = writeBinaryResult(os.Stdout, summary)
-		return fmt.Errorf("error executing agent: %w", err)
+	if _, err := stdout.Write(payload); err != nil {
+		return fmt.Errorf("write stdout: %w", err)
 	}
-
-	// Generate patch using PatchGenerator
-	baseCommit := os.Getenv("NANO_BASE_COMMIT")
-	patchGen := patch.NewGenerator(projectPath, baseCommit)
-	patchContent, err := patchGen.GenerateGitDiff()
-	if err != nil {
-		return fmt.Errorf("error generating patch: %w", err)
-	}
-
-	// Save patch file or output to stdout
-	if opts.OutputDir != "" {
-		patchPath := filepath.Join(opts.OutputDir, "solution.patch")
-		if err := patchGen.SavePatch(patchContent, patchPath); err != nil {
-			return fmt.Errorf("error writing patch file: %w", err)
-		}
-		logger.Infof("Patch saved to: %s", patchPath)
-
-		// Save trajectory file alongside patch
-		if trajectory != nil {
-			trajPath := filepath.Join(opts.OutputDir, "trajectory.json")
-			f, err := os.Create(trajPath)
-			if err != nil {
-				return fmt.Errorf("error creating trajectory file: %w", err)
-			}
-			defer func() { _ = f.Close() }()
-			enc := json.NewEncoder(f)
-			enc.SetIndent("", "  ")
-			if err := enc.Encode(trajectory); err != nil {
-				return fmt.Errorf("error writing trajectory file: %w", err)
-			}
-			logger.Infof("Trajectory saved to: %s", trajPath)
-		}
-	} else {
-		fmt.Print(patchContent)
-	}
-	// Write summary to stderr so stdout only contains the patch/result
-	if err := writeBinaryResult(os.Stderr, summary); err != nil {
-		return err
-	}
-
-	// Output result to stderr for logging
-	if result != "" {
-		_, _ = fmt.Fprintf(os.Stderr, "Agent execution completed\n")
-	}
-
 	return nil
 }
 
@@ -251,13 +169,7 @@ func (to *trajectoryOptimizer) shouldRecordEvent(eventType event.EventType) bool
 	}
 }
 
-// executeBinaryMode runs the agent with the given prompt
-func executeBinaryMode(prompt, projectPath, outputDir string) (string, []trajectoryEvent, error) {
-	result, trajectory, _, err := executeBinaryModeWithOptions(prompt, projectPath, binaryOptions{OutputDir: outputDir, Sandbox: "auto"})
-	return result, trajectory, err
-}
-
-// resolveBinarySessionID picks a stable session id for binary-mode hooks/lifecycle.
+// resolveBinarySessionID picks a stable session id for binary exec hooks/lifecycle.
 // Priority: --session-id flag → NANO_SESSION_ID env → SYMPHONY_ISSUE_ID env → fresh session_<hex>
 func resolveBinarySessionID(opts binaryOptions) string {
 	// 1. Explicit flag (highest priority)
@@ -276,11 +188,12 @@ func resolveBinarySessionID(opts binaryOptions) string {
 	return agent.NewSession().ID
 }
 
-func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions) (string, []trajectoryEvent, *agent.GoalState, error) {
+func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions) (binaryExecution, error) {
+	execRes := binaryExecution{}
 	prompt, goalCondition, goalFromPrompt := prepareBinaryGoal(prompt, opts)
 	cfg := config.Get()
 	if cfg == nil {
-		return "", nil, nil, fmt.Errorf("configuration not initialized")
+		return execRes, fmt.Errorf("configuration not initialized")
 	}
 
 	// Configure logger based on verbose setting from config
@@ -290,7 +203,7 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 	// Embedded execution (under symphony or other orchestrators) needs MCP to
 	// call back to the orchestrator. Standalone binary mode (SWE-bench style)
 	// should not auto-connect to user-configured MCP servers like
-	// chrome-devtools that they have in their global ~/.nano.yaml.
+	// chrome-devtools that they have in their global ~/.config/nano/config.yaml.
 	//
 	// Detection mirrors applyBinarySandboxMode below: SYMPHONY_* /
 	// NANO_ORCHESTRATOR_PROFILE env vars indicate embedded mode.
@@ -311,27 +224,37 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 		}
 		cfgCopy.Goal.MaxTurns = opts.GoalMaxTurns
 	}
+
+	// Resolve permission mode using unified resolver (includes env var resolution)
+	res, warns := ResolvePermission(&cfgCopy, PermissionResolveOpts{
+		FlagMode:       opts.PermissionMode,
+		SkipPerms:      opts.SkipPerms,
+		EnvHintEnabled: true,
+	})
+	LogPermissionResolution("binary", res, warns)
+
 	applyBinarySandboxMode(&cfgCopy, opts.Sandbox, projectPath)
 
 	// Change to project directory
 	oldDir, err := os.Getwd()
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("failed to get current directory: %v", err)
+		return execRes, fmt.Errorf("failed to get current directory: %v", err)
 	}
 	defer func() { _ = os.Chdir(oldDir) }()
 
 	if err := os.Chdir(projectPath); err != nil {
-		return "", nil, nil, fmt.Errorf("failed to change to project directory: %v", err)
+		return execRes, fmt.Errorf("failed to change to project directory: %v", err)
 	}
 
 	// Create agent instance
 	agentInstance, err := agent.New(&cfgCopy, nil)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("failed to create agent: %v", err)
+		return execRes, fmt.Errorf("failed to create agent: %v", err)
 	}
 
 	// Resolve and set session ID before accessing session
 	sessionID := resolveBinarySessionID(opts)
+	execRes.SessionID = sessionID
 	agentInstance.SetActiveSessionID(sessionID)
 
 	if strings.TrimSpace(opts.OutputDir) != "" {
@@ -342,7 +265,7 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 	goalCtx.Configure(&cfgCopy)
 	if goalCondition != "" {
 		if err := goalCtx.SetGoal(goalCondition); err != nil {
-			return "", nil, nil, err
+			return execRes, err
 		}
 		if goalFromPrompt {
 			logger.Infof("Binary mode enabled /goal from prompt: %s", goalCondition)
@@ -515,10 +438,25 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 		traj = append(traj, e)
 	}
 
+	// Fire SessionStart hook once per binary execution (before first LLM call).
+	if opts.HookService != nil && len(opts.HookService.HooksForEvent(hookservice.EventSessionStart)) > 0 {
+		_, err := opts.HookService.Dispatch(ctx, hookservice.EventSessionStart, "", hookservice.Input{
+			Event:         hookservice.EventSessionStart,
+			HookEventName: "SessionStart",
+			SessionID:     sessionID,
+			Cwd:           projectPath,
+			Source:        "startup",
+		})
+		if err != nil {
+			logger.Warnf("SessionStart hook dispatch failed: %v", err)
+		}
+	}
+
 	err = agentInstance.ProcessStream(ctx, prompt, eventHandler)
 	goalState := goalSnapshotPtr(goalCtx)
 	if err != nil {
-		return "", nil, goalState, fmt.Errorf("failed to process request: %v", err)
+		execRes.GoalState = goalState
+		return execRes, fmt.Errorf("failed to process request: %v", err)
 	}
 
 	// 若未捕获到完成事件但仍有最终 token_stats，则在结束时补充一次
@@ -565,14 +503,29 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 			Timestamp: time.Now().Unix(),
 		})
 	}
-	return final, traj, goalState, nil
+
+	execRes.Result = final
+	execRes.Trajectory = traj
+	execRes.GoalState = goalState
+	if pm := agentInstance.GetPermissionManager(); pm != nil {
+		execRes.BlockedCommandsSample = pm.DenialTrackerSample()
+		if pm.DenialTrackerLockedOut() {
+			execRes.Termination = binaryTurnTermination{
+				Cause:       "classifier_lockout",
+				Fingerprint: "classifier_lockout",
+				Reason:      "consecutive deny limit reached",
+			}
+		}
+	}
+	return execRes, nil
 }
 
-func summarizeBinaryResult(traj []trajectoryEvent, start time.Time, result string, runErr error, goalState *agent.GoalState) binaryResultSummary {
+func summarizeBinaryResult(traj []trajectoryEvent, start time.Time, result string, runErr error, goalState *agent.GoalState, term binaryTurnTermination, blockedSample []string) binaryResultSummary {
 	summary := binaryResultSummary{
-		Status:     "success",
-		DurationMS: time.Since(start).Milliseconds(),
-		GoalState:  goalState,
+		Status:                "success",
+		DurationMS:            time.Since(start).Milliseconds(),
+		GoalState:             goalState,
+		BlockedCommandsSample: blockedSample,
 	}
 
 	// Derive termination cause from available signals
@@ -586,6 +539,16 @@ func summarizeBinaryResult(traj []trajectoryEvent, start time.Time, result strin
 		summary.TerminationCause = "llm_failure"
 		summary.BlockerFingerprint = "error:" + summary.Status
 	}
+	if runErr == nil && strings.TrimSpace(term.Cause) != "" {
+		summary.TerminationCause = term.Cause
+		summary.BlockerFingerprint = term.Fingerprint
+		if strings.TrimSpace(term.Reason) != "" {
+			summary.Reason = term.Reason
+		}
+		if term.Cause == "classifier_lockout" {
+			summary.Status = "abandoned"
+		}
+	}
 
 	if runErr == nil && goalState != nil {
 		if goalState.AchievedAt != nil {
@@ -596,6 +559,16 @@ func summarizeBinaryResult(traj []trajectoryEvent, start time.Time, result strin
 			summary.Reason = firstNonEmpty(goalState.LastReason, "goal max turns reached")
 			summary.TerminationCause = "goal_max_turns"
 			summary.BlockerFingerprint = fmt.Sprintf("goal_max_turns:%d", goalState.MaxTurns)
+		} else if goalState.Condition != "" && goalState.AchievedAt == nil && !goalState.Active {
+			// Goal stopped (e.g. evaluator_parse_failure)
+			summary.Status = "needs_retry"
+			summary.Reason = firstNonEmpty(goalState.LastReason, "goal stopped without achievement")
+			summary.TerminationCause = "goal_stopped"
+		} else if goalState.Condition != "" && goalState.AchievedAt == nil && goalState.Active {
+			// Final fallback: goal active but agent exited without achievement
+			summary.Status = "abandoned"
+			summary.Reason = firstNonEmpty(goalState.LastReason, "goal active but agent exited without achievement")
+			summary.TerminationCause = "goal_unresolved"
 		}
 	}
 
@@ -618,6 +591,16 @@ func classifyBinaryError(err error) string {
 	if err == nil {
 		return "success"
 	}
+	// Prefer sentinel error matching via errors.Is
+	switch {
+	case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, ErrRateLimit):
+		return "needs_retry"
+	case errors.Is(err, ErrSandboxDenied):
+		return "abandoned"
+	}
+	// Fallback: string-based classification for legacy/unwrapped errors
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
@@ -644,49 +627,9 @@ func binaryExitCode(status string) int {
 	}
 }
 
-func writeBinaryResult(out *os.File, summary binaryResultSummary) error {
-	return writeBinaryResultTo(out, summary)
-}
-
-func writeBinaryResultTo(out interface{ Write([]byte) (int, error) }, summary binaryResultSummary) error {
-	switch strings.ToLower(firstNonEmpty(os.Getenv("NANO_BINARY_RESULT_FORMAT"), "both")) {
-	case "plain", "none", "off":
-		return nil
-	case "json":
-		return json.NewEncoder(out).Encode(summary)
-	default:
-		data, err := json.Marshal(summary)
-		if err != nil {
-			return err
-		}
-		_, err = fmt.Fprintf(out, "\n%s%s\n", binaryResultSentinel, data)
-		return err
-	}
-}
-
-// runBinaryExitHook executes an optional shell hook after binary execution.
-// The hook receives NANO_RESULT_JSON, NANO_RESULT_STATUS, and NANO_RESULT_EXIT_CODE
-// so orchestrators can report completion even when they did not parse stdout.
-func runBinaryExitHook(command string, summary binaryResultSummary) {
-	if strings.TrimSpace(command) == "" {
-		return
-	}
-	payload, _ := json.Marshal(summary)
-	shellPath, err := exec.LookPath("sh")
-	if err != nil {
-		logger.Warnf("binary exit hook skipped: sh not found in PATH: %v", err)
-		return
-	}
-	cmd := exec.Command(shellPath, "-c", command)
-	cmd.Env = append(os.Environ(),
-		"NANO_RESULT_JSON="+string(payload),
-		"NANO_RESULT_STATUS="+summary.Status,
-		"NANO_RESULT_EXIT_CODE="+fmt.Sprintf("%d", binaryExitCode(summary.Status)),
-	)
-	if err := cmd.Run(); err != nil {
-		logger.Warnf("binary exit hook failed: %v", err)
-	}
-}
+// dispatchBinaryStopHook is removed — per-run result delivery now uses clean
+// stdout JSON (AgentResultSummary). The hook layer no longer transports aggregated
+// run summaries; this matches Claude Code's design.
 
 func prepareBinaryGoal(prompt string, opts binaryOptions) (string, string, bool) {
 	conditionFromPrompt, strippedPrompt, foundInPrompt := extractPromptGoal(prompt)

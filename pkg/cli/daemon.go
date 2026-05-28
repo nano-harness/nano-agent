@@ -584,6 +584,12 @@ func runDaemonForeground() error {
 	}
 	logger.ConfigureForDaemon(logPath, alsoConsole)
 
+	// Resolve permission mode using unified resolver
+	res, warns := ResolvePermission(cfg, PermissionResolveOpts{
+		EnvHintEnabled: true,
+	})
+	LogPermissionResolution("daemon", res, warns)
+
 	// Apply secure defaults for daemon mode (hardened environment)
 	// Only set values when not explicitly configured by the user where possible
 	// 1) Env filtering: in daemon mode, do NOT enforce strict allowlist; only block sensitive env vars
@@ -670,7 +676,7 @@ func runDaemonForeground() error {
 	}
 
 	// Create engine instance
-	eng, err := engine.New(cfg, nil, engine.WithScheduler())
+	eng, err := engine.New(cfg, engine.WithScheduler())
 	if err != nil {
 		logger.Errorf("Failed to create engine: %v", err)
 		return fmt.Errorf("failed to create engine: %w", err)

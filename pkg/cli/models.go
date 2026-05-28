@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -191,7 +192,7 @@ func newModelUseCommand() *cobra.Command {
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "use <model>",
-		Short: "Persist the primary model in .nano.yaml",
+		Short: "Persist the primary model in .nano/nano.yaml",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			model := strings.TrimSpace(args[0])
@@ -237,7 +238,7 @@ func newModelUseCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&providerID, "provider", "", "provider preset id")
 	cmd.Flags().StringVar(&baseURL, "base-url", "", "OpenAI-compatible base URL")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print changes without writing .nano.yaml")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print changes without writing .nano/nano.yaml")
 	return cmd
 }
 
@@ -281,7 +282,7 @@ func newModelFallbackAddCommand() *cobra.Command {
 	var name, providerID, baseURL, apiKey, apiKeyEnv string
 	cmd := &cobra.Command{
 		Use:   "add <model>",
-		Short: "Add or replace a fallback route in .nano.yaml",
+		Short: "Add or replace a fallback route in .nano/nano.yaml",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			model := strings.TrimSpace(args[0])
@@ -364,7 +365,7 @@ func newModelFallbackAddCommand() *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "", "fallback route name")
 	cmd.Flags().StringVar(&providerID, "provider", "", "provider preset id")
 	cmd.Flags().StringVar(&baseURL, "base-url", "", "OpenAI-compatible base URL")
-	cmd.Flags().StringVar(&apiKey, "api-key", "", "API key to store in .nano.yaml (prefer --api-key-env)")
+	cmd.Flags().StringVar(&apiKey, "api-key", "", "API key to store in .nano/nano.yaml (prefer --api-key-env)")
 	cmd.Flags().StringVar(&apiKeyEnv, "api-key-env", "", "environment variable that contains the provider API key")
 	return cmd
 }
@@ -530,14 +531,15 @@ func printModelFallbacks(jsonOutput bool) error {
 }
 
 func loadProjectConfigMap() (map[string]interface{}, error) {
-	data, err := os.ReadFile(".nano.yaml")
+	cfgPath := filepath.Join(".nano", "nano.yaml")
+	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to read .nano.yaml: %w", err)
+		return nil, fmt.Errorf("failed to read %s: %w", cfgPath, err)
 	}
 	cfgMap := make(map[string]interface{})
 	if len(data) > 0 {
 		if err := yaml.Unmarshal(data, &cfgMap); err != nil {
-			return nil, fmt.Errorf("failed to parse .nano.yaml: %w", err)
+			return nil, fmt.Errorf("failed to parse %s: %w", cfgPath, err)
 		}
 	}
 	return cfgMap, nil
@@ -548,8 +550,12 @@ func writeProjectConfigMap(cfgMap map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-	if err := os.WriteFile(".nano.yaml", out, 0o600); err != nil {
-		return fmt.Errorf("failed to write .nano.yaml: %w", err)
+	if err := os.MkdirAll(".nano", 0o755); err != nil {
+		return fmt.Errorf("failed to create .nano directory: %w", err)
+	}
+	cfgPath := filepath.Join(".nano", "nano.yaml")
+	if err := os.WriteFile(cfgPath, out, 0o600); err != nil {
+		return fmt.Errorf("failed to write %s: %w", cfgPath, err)
 	}
 	return nil
 }

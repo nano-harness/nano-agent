@@ -348,9 +348,9 @@ func TestToolScheduler_BlockedShellCommand_NoApproval(t *testing.T) {
 		Toolbox:          tb,
 		EventHandler:     handler,
 		RecoveryStrategy: NewToolRecoveryStrategy(handler),
-		ApprovalHandler: func(_ *ToolCallInfo) bool {
+		ApprovalHandlerV2: func(_ *ToolCallInfo) ApprovalDecision {
 			approvalCalled = true
-			return true
+			return ApprovalApproveOnce
 		},
 	})
 
@@ -399,9 +399,9 @@ func TestToolScheduler_ConfirmShellCommand_TriggersApproval(t *testing.T) {
 		Toolbox:          tb,
 		EventHandler:     handler,
 		RecoveryStrategy: NewToolRecoveryStrategy(handler),
-		ApprovalHandler: func(_ *ToolCallInfo) bool {
+		ApprovalHandlerV2: func(_ *ToolCallInfo) ApprovalDecision {
 			approvalCalled = true
-			return true // sync-approve
+			return ApprovalApproveOnce
 		},
 	})
 
@@ -432,15 +432,15 @@ func TestToolScheduler_ContextApprovalHandler(t *testing.T) {
 		Toolbox:          tb,
 		EventHandler:     func(_ event.StreamEvent) {},
 		RecoveryStrategy: NewToolRecoveryStrategy(nil),
-		ApprovalHandler: func(_ *ToolCallInfo) bool {
+		ApprovalHandlerV2: func(_ *ToolCallInfo) ApprovalDecision {
 			globalApprovalCalled = true
-			return false
+			return ApprovalReject
 		},
 	})
 
-	ctx := WithApprovalHandler(context.Background(), func(_ *ToolCallInfo) bool {
+	ctx := WithApprovalHandler(context.Background(), func(_ *ToolCallInfo) ApprovalDecision {
 		contextApprovalCalled = true
-		return true
+		return ApprovalApproveOnce
 	})
 	if _, err := ts.ExecuteParallel(ctx, []ToolToExecute{{
 		ID:         "context-approval-1",
@@ -522,9 +522,9 @@ func TestToolScheduler_AllowShellCommand_NoApproval(t *testing.T) {
 		Toolbox:          tb,
 		EventHandler:     handler,
 		RecoveryStrategy: NewToolRecoveryStrategy(handler),
-		ApprovalHandler: func(_ *ToolCallInfo) bool {
+		ApprovalHandlerV2: func(_ *ToolCallInfo) ApprovalDecision {
 			approvalCalled = true
-			return true
+			return ApprovalApproveOnce
 		},
 	})
 
@@ -564,9 +564,9 @@ func TestExecuteShell_FirewallBlocksDangerous(t *testing.T) {
 		Toolbox:          tb,
 		EventHandler:     func(_ event.StreamEvent) {},
 		RecoveryStrategy: NewToolRecoveryStrategy(nil),
-		ApprovalHandler: func(_ *ToolCallInfo) bool {
+		ApprovalHandlerV2: func(_ *ToolCallInfo) ApprovalDecision {
 			approvalCalled = true
-			return true
+			return ApprovalApproveOnce
 		},
 	})
 	ts.SetHookEngine(hookEngine)
@@ -607,9 +607,9 @@ func TestExecuteShell_FirewallAllowsSafe(t *testing.T) {
 		Toolbox:          tb,
 		EventHandler:     func(_ event.StreamEvent) {},
 		RecoveryStrategy: NewToolRecoveryStrategy(nil),
-		ApprovalHandler: func(_ *ToolCallInfo) bool {
+		ApprovalHandlerV2: func(_ *ToolCallInfo) ApprovalDecision {
 			approvalCalled = true
-			return true
+			return ApprovalApproveOnce
 		},
 	})
 	ts.SetHookEngine(hookEngine)
@@ -795,11 +795,13 @@ func TestPostToolUseHook_IncludesSessionID(t *testing.T) {
 	}
 
 	// 失败路径 → PostToolUseFailure
-	// Use an invalid command that will fail
+	// Use a read-only command (ls) on a relative path that does not exist so it
+	// is security-approved (inside workdir) but exits non-zero, triggering
+	// PostToolUseFailure.
 	if _, err := ts.ExecuteParallel(ctx, []ToolToExecute{{
 		ID:         "post-hook-failure",
 		Name:       "run_shell_command",
-		Parameters: map[string]interface{}{"command": "exit 1"},
+		Parameters: map[string]interface{}{"command": "ls nonexistent_subdir_for_posthook_test"},
 	}}); err != nil {
 		// ExecuteParallel doesn't return error, failure is in result
 		_ = err

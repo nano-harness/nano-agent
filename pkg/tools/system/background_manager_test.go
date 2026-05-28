@@ -36,8 +36,14 @@ func TestBackgroundTaskManager_Spawn(t *testing.T) {
 		t.Errorf("Expected command %s, got %s", command, task.Command)
 	}
 
-	// Wait for task to complete
-	time.Sleep(300 * time.Millisecond)
+	// Wait for task to complete (poll up to 3s)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, st, _ := manager.ReadOutput(task.ID, 0, 0, 0); st != BgStatusRunning {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// Read output
 	output, _, status, err := manager.ReadOutput(task.ID, 0, 0, 0)
@@ -217,7 +223,14 @@ func TestBackgroundTaskManager_ExitCode(t *testing.T) {
 
 	// Test successful command (exit 0)
 	task1, _ := manager.Spawn(context.Background(), sessionID, "exit 0", "/tmp")
-	time.Sleep(200 * time.Millisecond)
+	// Wait for task to complete (poll up to 3s)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, st, _ := manager.ReadOutput(task1.ID, 0, 0, 0); st != BgStatusRunning {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	manager.mu.RLock()
 	bgTask1 := manager.tasks[task1.ID]
@@ -233,7 +246,14 @@ func TestBackgroundTaskManager_ExitCode(t *testing.T) {
 
 	// Test failed command (exit 1)
 	task2, _ := manager.Spawn(context.Background(), sessionID, "exit 1", "/tmp")
-	time.Sleep(200 * time.Millisecond)
+	// Wait for task to complete (poll up to 3s)
+	deadline2 := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline2) {
+		if _, _, st, _ := manager.ReadOutput(task2.ID, 0, 0, 0); st != BgStatusRunning {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	manager.mu.RLock()
 	bgTask2 := manager.tasks[task2.ID]

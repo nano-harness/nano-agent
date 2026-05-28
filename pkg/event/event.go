@@ -61,6 +61,9 @@ const (
 	// Mailbox system events
 	EventTypeMailboxSent EventType = "mailbox_sent" // Message sent to agent mailbox
 
+	// Goal evaluator events
+	EventTypeGoalEvaluatorTruncated EventType = "goal_evaluator_truncated" // Goal evaluator transcript was truncated
+
 	// Sandbox audit and observability events
 	EventTypeSandboxDecisionCreated       EventType = "sandbox.decision.created"
 	EventTypeSandboxEnvironmentCreated    EventType = "sandbox.environment.created"
@@ -87,6 +90,7 @@ type StreamEvent struct {
 	Content        string            `json:"content,omitempty"`
 	Reasoning      string            `json:"reasoning,omitempty"`
 	ReasoningDelta string            `json:"reasoning_delta,omitempty"` // Incremental reasoning content fragment
+	ReasoningData  interface{}       `json:"reasoning_data,omitempty"`  // Structured reasoning blocks ([]llm.ReasoningBlock)
 	ToolCalls      []*tools.ToolCall `json:"tool_calls,omitempty"`
 	ToolResult     *tools.ToolResult `json:"tool_result,omitempty"`
 	ToolUse        *ToolUse          `json:"tool_use,omitempty"`

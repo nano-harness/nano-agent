@@ -35,6 +35,13 @@ const (
 	BackendDocker Backend = "docker"
 )
 
+// BuiltinDeniedRelPaths is the hardcoded list of HOME-relative paths that are
+// always denied (read+write) inside the macOS sandbox-exec profile. Operators
+// can extend this list via ExtraDeniedPaths but cannot remove from it.
+var BuiltinDeniedRelPaths = []string{
+	".ssh", ".aws", ".gnupg", ".kube", ".config/gh", ".docker/config.json",
+}
+
 // NetworkPolicy describes whether the sandboxed command receives host network access.
 type NetworkPolicy string
 
@@ -391,6 +398,20 @@ func enforceDefaultBlocklist(absPath, cleanAbs string) error {
 					return fmt.Errorf("sandbox: access denied – path %q is a protected system file. Hint: use run_shell_command if you genuinely need access", absPath)
 				}
 			}
+		}
+	}
+
+	// Block .nano config files in any directory (workspace-level configs owned by orchestrator)
+	// Allow .nano/skills/** for agent use
+	nanoDir := "/.nano/"
+	if strings.Contains(slashPath, nanoDir) || strings.Contains(slashClean, nanoDir) {
+		rel := slashPath
+		if idx := strings.LastIndex(rel, nanoDir); idx >= 0 {
+			rel = rel[idx+len(nanoDir):]
+		}
+		// Allow skills/ subtree
+		if !strings.HasPrefix(rel, "skills/") && rel != "skills" {
+			return fmt.Errorf("sandbox: access denied – path %q is a nano agent config file managed by the orchestrator", absPath)
 		}
 	}
 

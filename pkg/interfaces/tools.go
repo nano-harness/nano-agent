@@ -3,6 +3,8 @@ package interfaces
 
 import (
 	"context"
+
+	"github.com/nano-harness/nano-agent/pkg/policy"
 )
 
 // Tool represents a function or capability that can be executed by the agent
@@ -49,23 +51,13 @@ type ContextualConfirmationTool interface {
 // on its parameters before execution. This enables the tool_scheduler to
 // perform a single security check and propagate the result downstream,
 // avoiding redundant analysis in middleware and tool execution layers.
-//
-// The action return value maps to middleware.Action constants:
-//
-//	0 = ActionAllow   (proceed without confirmation)
-//	1 = ActionConfirm (request user approval)
-//	2 = ActionBlock   (reject immediately)
-//
-// int is used instead of middleware.Action to avoid a circular import between
-// the interfaces and middleware packages.
 type SecurityAnalyzableTool interface {
 	Tool
-	// AnalyzeSecurity examines the parameters and returns a security decision.
+	// AnalyzeSecurityDecision examines the parameters and returns the full
+	// security decision including any hook-proposed parameter modifications.
 	// The provided context allows callers to propagate cancellation, deadlines,
 	// and request-scoped values into the security analysis.
-	// Returns ActionBlock (2) to reject immediately, ActionConfirm (1) to require
-	// user approval, or ActionAllow (0) to proceed without confirmation.
-	AnalyzeSecurity(ctx context.Context, params map[string]interface{}) (action int, reason string, err error)
+	AnalyzeSecurityDecision(ctx context.Context, params map[string]interface{}) (*policy.PermissionDecision, error)
 }
 
 // ToolCategory represents different categories of tools
@@ -116,8 +108,14 @@ type PropertySchema struct {
 	Usage       string          `json:"usage,omitempty"`    // Usage tips and recommendations
 }
 
-// ToolResult represents the result of a tool execution
+// ToolResult represents the result of a tool execution.
+// This is the canonical definition; pkg/tools.ToolResult is an alias.
 type ToolResult struct {
+	// ID is the tool_use ID that correlates this result to the original call.
+	ID string `json:"id,omitempty"`
+	// Content is the raw string content for LLM message passing (wire format).
+	Content string `json:"content,omitempty"`
+
 	Success     bool                   `json:"success"`
 	Data        interface{}            `json:"data,omitempty"`
 	Error       string                 `json:"error,omitempty"`

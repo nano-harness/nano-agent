@@ -22,6 +22,7 @@ func TestInferModelProfile_ExactMatch(t *testing.T) {
 		{"gpt-4.1", 1_047_576, 0.92},
 		{"llama-4-maverick", 1_048_576, 0.92},
 		{"qwen3.6-plus", 1_000_000, 0.92},
+		{"nemotron-3-nano-30b-a3b", 256_000, 0.85},
 	}
 	for _, tc := range cases {
 		p := InferModelProfile(tc.model)
@@ -42,6 +43,7 @@ func TestInferModelProfile_VendorPrefix(t *testing.T) {
 		{"openai/gpt-4o", 128_000},
 		{"anthropic/claude-sonnet-4.6", 1_000_000},
 		{"google/gemini-2.5-pro", 1_048_576},
+		{"nvidia/nemotron-3-nano-30b-a3b", 256_000},
 		{"xai/grok-4.20", 2_000_000},
 		{"meta-llama/llama-4-maverick", 1_048_576},
 	}

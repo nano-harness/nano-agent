@@ -77,15 +77,18 @@ func TestLoadConfig_WithNanoYaml(t *testing.T) {
 	// Change to temp directory
 	_ = os.Chdir(tempDir)
 
-	// Create a .nano.yaml file
+	// Create a .nano/nano.yaml file
 	nanoYamlContent := `api_key: test-key
 model: test-model
 verbose: false
 read_file_max_lines: 500
 `
-	err := os.WriteFile(".nano.yaml", []byte(nanoYamlContent), 0644)
+	if err := os.MkdirAll(".nano", 0755); err != nil {
+		t.Fatalf("Failed to create .nano dir: %v", err)
+	}
+	err := os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(nanoYamlContent), 0644)
 	if err != nil {
-		t.Fatalf("Failed to create .nano.yaml: %v", err)
+		t.Fatalf("Failed to create .nano/nano.yaml: %v", err)
 	}
 
 	// Load config
@@ -94,7 +97,7 @@ read_file_max_lines: 500
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 
-	// Check that values from .nano.yaml are loaded
+	// Check that values from .nano/nano.yaml are loaded
 	if cfg.APIKey != "test-key" {
 		t.Errorf("Expected APIKey 'test-key', got '%s'", cfg.APIKey)
 	}
@@ -128,7 +131,10 @@ func TestLoadConfig_EnvInterpolation(t *testing.T) {
       headers:
         X-Symphony-Token: "${env:SYMPHONY_TOKEN}"
 `
-	if err := os.WriteFile(".nano.yaml", []byte(content), 0644); err != nil {
+	if err := os.MkdirAll(".nano", 0755); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(content), 0644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -150,7 +156,10 @@ func TestLoadConfig_EnvInterpolationMissingVar(t *testing.T) {
 	defer func() { _ = os.Chdir(originalDir) }()
 	_ = os.Chdir(tempDir)
 
-	if err := os.WriteFile(".nano.yaml", []byte(`api_key: "${env:NANO_MISSING_TEST_SECRET}"`), 0644); err != nil {
+	if err := os.MkdirAll(".nano", 0755); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(".nano", "nano.yaml"), []byte(`api_key: "${env:NANO_MISSING_TEST_SECRET}"`), 0644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -283,17 +292,17 @@ func TestGetConfigLocations(t *testing.T) {
 	// Test with empty config file
 	locations := GetConfigLocations("")
 
-	// Should have at least the project location (.nano.yaml)
+	// Should have at least the project location (.nano/nano.yaml)
 	found := false
 	for _, loc := range locations {
-		if loc.Type == "Project" && filepath.Base(loc.Path) == ".nano.yaml" {
+		if loc.Type == "Project" && filepath.Base(loc.Path) == "nano.yaml" {
 			found = true
 			break
 		}
 	}
 
 	if !found {
-		t.Error("Expected to find Project location for .nano.yaml")
+		t.Error("Expected to find Project location for .nano/nano.yaml")
 	}
 
 	// Test with specific config file
@@ -338,10 +347,13 @@ func TestLoadConfig_ImageProviderEnvOverrides(t *testing.T) {
 	defer os.Chdir(originalDir)
 	_ = os.Chdir(tempDir)
 
-	// Create a minimal .nano.yaml to prevent falling back to the user's global config
+	// Create a minimal .nano/nano.yaml to prevent falling back to the user's global config
 	minimalYAML := "api_key: \"test-key\"\nmodel: \"test-model\"\n"
-	if err := os.WriteFile(filepath.Join(tempDir, ".nano.yaml"), []byte(minimalYAML), 0600); err != nil {
-		t.Fatalf("failed to create .nano.yaml: %v", err)
+	if err := os.MkdirAll(filepath.Join(tempDir, ".nano"), 0755); err != nil {
+		t.Fatalf("failed to create .nano dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, ".nano", "nano.yaml"), []byte(minimalYAML), 0600); err != nil {
+		t.Fatalf("failed to create .nano/nano.yaml: %v", err)
 	}
 
 	// Set provider-specific env vars

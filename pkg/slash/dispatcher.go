@@ -263,13 +263,19 @@ func (d *LocalDispatcher) Dispatch(raw string) Result {
 		return d.handleOpsx(lowerHead, args)
 	}
 
-	// Agent profile slash commands ("/reviewer prompt"). Only commands the
-	// registry exposes with Source="agent-profile" are rewritten: this
-	// preserves the built-in > custom command > agent profile priority
-	// because conflicting profile names are skipped at registration time.
+	// Agent profile slash commands ("/reviewer prompt"). Commands registered
+	// with Source="agent-profile" or Source="builtin" are rewritten into an
+	// LLM submission. Conflicting profile names are already skipped at
+	// registration time so priority is preserved.
 	cmdName := strings.TrimPrefix(head, "/")
-	if cmd, ok := d.registry.Find(cmdName); ok && cmd.Source == "agent-profile" {
-		profile, found := agentprofile.NewManager(d.cwd).Find(cmd.Name)
+	if cmd, ok := d.registry.Find(cmdName); ok && (cmd.Source == "agent-profile" || cmd.Source == "builtin") {
+		var profile agentprofile.AgentProfile
+		var found bool
+		if cmd.Source == "builtin" {
+			profile, found = agentprofile.GetBuiltin(cmd.Name)
+		} else {
+			profile, found = agentprofile.NewManager(d.cwd).Find(cmd.Name)
+		}
 		if found && isValidAgentSlashName(profile.Name) {
 			return Result{
 				ShouldSubmit: true,

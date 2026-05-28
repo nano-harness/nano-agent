@@ -168,11 +168,7 @@ func (s *ClientIntegrationSuite) TestClient_EngineInitialization() {
 		WorkingDir:         s.tempDir,
 	}
 
-	approvalHandler := func(info *agent.ToolCallInfo) bool {
-		return true
-	}
-
-	eng, err := engine.New(cfg, approvalHandler)
+	eng, err := engine.New(cfg)
 	s.NoError(err)
 	s.NotNil(eng)
 

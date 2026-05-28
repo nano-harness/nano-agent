@@ -30,7 +30,7 @@ func TestSwarmHookDispatcherFiresLifecycleEvents(t *testing.T) {
 	hooks := []middleware.Hook{
 		{Name: "sub-start", Event: middleware.HookSubagentStart, Pattern: "*", Command: startScript, Enabled: true},
 		{Name: "sub-stop", Event: middleware.HookSubagentStop, Pattern: "*", Command: stopScript, Enabled: true},
-		{Name: "tm-idle", Event: middleware.HookTeammateIdle, Pattern: "*", Command: idleScript, Enabled: true},
+		{Name: "tm-idle", Event: middleware.HookNotification, Pattern: "*", Command: idleScript, Enabled: true},
 	}
 	engine := middleware.NewHookEngine(hooks)
 	d := NewSwarmHookDispatcher(engine)

@@ -156,9 +156,12 @@ func (t *MCPTool) Execute(ctx context.Context, params map[string]interface{}) (*
 	}, nil
 }
 
-// RequiresConfirmation returns whether the tool requires confirmation
+// RequiresConfirmation returns true: MCP tools may perform arbitrary remote
+// operations (database writes, API calls, file modifications) and must always
+// require user confirmation unless explicitly allowed via the session allowlist
+// or a permission mode that waives confirmation.
 func (t *MCPTool) RequiresConfirmation() bool {
-	return false // MCP tools typically don't require confirmation
+	return true
 }
 
 // ConcurrencySafe returns false: MCP tools may have arbitrary remote side effects.

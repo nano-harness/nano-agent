@@ -46,6 +46,10 @@ func resolvePathBestEffort(path, base string) string {
 	if path == "" {
 		return ""
 	}
+	// Expand ~ and common env vars so that paths like ~/.ssh/id_rsa are not
+	// mistakenly treated as relative paths inside the workdir.
+	path = expandTilde(path)
+	path = expandEnvVars(path)
 	if !filepath.IsAbs(path) {
 		if base == "" {
 			if absBase, err := filepath.Abs("."); err == nil {

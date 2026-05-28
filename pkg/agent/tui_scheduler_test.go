@@ -27,8 +27,9 @@ func TestTUIScheduler_ScheduleLoop(t *testing.T) {
 	}
 	defer ts.Stop()
 
-	// Schedule a very frequent task using a direct cron expression
-	task, err := ts.ScheduleCron("* * * * * *", "ping") // every second (6-field with seconds)
+	// Schedule a task using a direct cron expression. The scheduler enforces a
+	// minimum interval of 1 minute, so we trigger execution manually.
+	task, err := ts.ScheduleCron("0 * * * * *", "ping") // once per minute (6-field with seconds)
 	if err != nil {
 		t.Fatalf("ScheduleCron: %v", err)
 	}
@@ -37,14 +38,18 @@ func TestTUIScheduler_ScheduleLoop(t *testing.T) {
 		t.Error("expected non-empty task ID")
 	}
 
-	// Wait for execution (up to 3 seconds)
+	if err := ts.scheduler.RunTaskNow(task.ID); err != nil {
+		t.Fatalf("RunTaskNow: %v", err)
+	}
+
+	// Wait for execution (up to 1 second)
 	select {
 	case cmd := <-executed:
 		if cmd != "ping" {
 			t.Errorf("expected 'ping', got %q", cmd)
 		}
-	case <-time.After(3 * time.Second):
-		t.Error("task did not execute within 3 seconds")
+	case <-time.After(time.Second):
+		t.Error("task did not execute within 1 second")
 	}
 }
 

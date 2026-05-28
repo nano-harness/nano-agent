@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/nano-harness/nano-agent/pkg/config"
 )
 
 // InitializeTeammate performs initialization for a teammate agent
@@ -30,10 +28,6 @@ func InitializeTeammate(ctx context.Context, identity *TeammateIdentity) error {
 	// Apply teammate-specific constraints from the active config layer.
 	// Per-teammate overrides (allowed tools/model/context providers/permission mode)
 	// should already be present on identity (filled by SpawnOptions / agent profiles).
-	cfg := config.Get()
-	if cfg == nil {
-		return nil
-	}
 
 	// Normalize legacy modes to stable values.
 	if identity.PermissionMode != "" {
@@ -43,13 +37,6 @@ func InitializeTeammate(ctx context.Context, identity *TeammateIdentity) error {
 		case "ask":
 			identity.PermissionMode = "default"
 		}
-	}
-
-	// If the mailbox subsystem is disabled, don't apply teammate-specific tool restrictions.
-	// Teammates may still run, but tool allowlists are most meaningful when
-	// team coordination is enabled.
-	if cfg.Mailbox == nil || !cfg.Mailbox.Enabled {
-		identity.AllowedTools = nil
 	}
 
 	return nil

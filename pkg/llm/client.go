@@ -30,13 +30,14 @@ type ImageURL struct {
 
 // Message represents a conversation message
 type Message struct {
-	Role        string             `json:"role"`
-	Content     string             `json:"content"`
-	Contents    []MessageContent   `json:"contents,omitempty"` // Multimodal content support
-	ToolCalls   []tools.ToolCall   `json:"tool_calls,omitempty"`
-	ToolResults []tools.ToolResult `json:"tool_results,omitempty"`
-	ToolCallID  string             `json:"tool_call_id,omitempty"`
-	Reasoning   string             `json:"reasoning,omitempty"` // Reasoning tokens from the model
+	Role            string             `json:"role"`
+	Content         string             `json:"content"`
+	Contents        []MessageContent   `json:"contents,omitempty"` // Multimodal content support
+	ToolCalls       []tools.ToolCall   `json:"tool_calls,omitempty"`
+	ToolResults     []tools.ToolResult `json:"tool_results,omitempty"`
+	ToolCallID      string             `json:"tool_call_id,omitempty"`
+	Reasoning       string             `json:"reasoning,omitempty"`        // Deprecated: use ReasoningBlocks; populated from BlocksToText for display only
+	ReasoningBlocks []ReasoningBlock   `json:"reasoning_blocks,omitempty"` // Structured reasoning blocks (thinking + redacted_thinking)
 }
 
 // StreamClient interface for streaming completions
@@ -861,6 +862,13 @@ func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []
 		contentEvent = contentEvent.WithContent(content)
 		contentEvent.ToolCalls = toolCallPtrs
 		contentEvent.Reasoning = reasoning
+		// Wrap plain-text reasoning into a single ReasoningBlock for OpenAI-compatible providers
+		if reasoning != "" {
+			contentEvent.ReasoningData = []ReasoningBlock{{
+				Type: ReasoningBlockThinking,
+				Text: reasoning,
+			}}
+		}
 		for k, v := range metadata {
 			contentEvent = contentEvent.WithMetadata(k, v)
 		}

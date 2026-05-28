@@ -114,6 +114,12 @@ func runACPServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Resolve permission mode using unified resolver
+	res, warns := ResolvePermission(cfg, PermissionResolveOpts{
+		EnvHintEnabled: true,
+	})
+	LogPermissionResolution("acp", res, warns)
+
 	// Create and start ACP server
 	server, err := acp.NewServer(acp.ServerOptions{
 		Config:      cfg,

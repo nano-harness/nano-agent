@@ -499,6 +499,26 @@ func NewRegistry(cwd string) *Registry {
 		existing[name] = true
 	}
 
+	// Register built-in agent profiles. Filesystem agents and custom commands
+	// take precedence; conflicting built-in profiles are skipped.
+	for _, p := range agentprofile.ListBuiltins() {
+		name := strings.TrimSpace(p.Name)
+		if !isValidAgentSlashName(name) {
+			continue
+		}
+		if existing[name] {
+			continue
+		}
+		r.commands = append(r.commands, Command{
+			Name:        name,
+			Description: firstNonEmpty(p.Description, "Run built-in agent "+name),
+			Usage:       "/" + name + " [prompt]",
+			Category:    CategoryAgent,
+			Source:      "builtin",
+		})
+		existing[name] = true
+	}
+
 	// Re-sort to place any added commands correctly.
 	sort.Slice(r.commands, func(i, j int) bool {
 		ci, cj := r.commands[i], r.commands[j]

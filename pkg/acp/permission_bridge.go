@@ -28,16 +28,7 @@ func NewPermissionBridge(acpSessionID string, transport *Transport) *PermissionB
 	}
 }
 
-// RequestApproval sends a permission request to the ACP client and waits for response
-func (b *PermissionBridge) RequestApproval(ctx context.Context, info *agent.ToolCallInfo) (bool, error) {
-	decision, err := b.RequestApprovalV2(ctx, info)
-	if err != nil {
-		return false, err
-	}
-	return decision != agent.ApprovalReject, nil
-}
-
-// K2.3: RequestApprovalV2 sends a permission request to the ACP client and returns V2 approval decision
+// RequestApprovalV2 sends a permission request to the ACP client and returns V2 approval decision.
 func (b *PermissionBridge) RequestApprovalV2(ctx context.Context, info *agent.ToolCallInfo) (agent.ApprovalDecision, error) {
 	b.mu.Lock()
 	requestID := fmt.Sprintf("perm-%s-%d", b.acpSessionID, b.nextID)

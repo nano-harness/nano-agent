@@ -5,8 +5,10 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
+	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 )
 
@@ -30,6 +32,20 @@ type Manager struct {
 	// - 0.60: Simple unclassified commands
 	// - 0.50: Compound/complex commands
 	confidenceThreshold float64
+
+	denialTracker *DenialTracker
+
+	// lastAutoDecision is best-effort metadata to improve policy-block messages
+	// in headless/daemon flows (ConfirmPolicy=block).
+	lastAutoDecision autoDecision
+}
+
+type autoDecision struct {
+	ToolName    string
+	MatchValue  string
+	ShouldBlock bool
+	Reason      string
+	At          time.Time
 }
 
 // NewManager creates a Manager with the specified initial mode.  Pre-defined
@@ -92,13 +108,15 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 	mode := m.mode
 	workdir := m.workdir
 	classifier := m.classifier
+	denialTracker := m.denialTracker
 	m.mu.RUnlock()
 
-	// M3-3: NANO_AUTO_ACCEPT environment variable globally short-circuits
-	// confirmation prompts. Intended for non-interactive automation contexts
-	// where the operator has already accepted full autonomy.
+	// M3-3: NANO_AUTO_ACCEPT is deprecated. Log a warning and fall through to
+	// the normal permission logic. Use --permission-mode=yolo for headless
+	// automation that intentionally waives all confirmations; that path still
+	// applies the mode-specific hardening that NANO_AUTO_ACCEPT bypassed.
 	if v := os.Getenv("NANO_AUTO_ACCEPT"); v == "1" || strings.EqualFold(v, "true") {
-		return false
+		logger.Warnf("NANO_AUTO_ACCEPT is deprecated and no longer bypasses the permission system. Use --permission-mode=yolo for headless automation.")
 	}
 
 	// 0. Plan mode - block tools that aren't in the read-only whitelist.
@@ -119,7 +137,24 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 
 	// 2. Session allowlist.
 	if m.allowlist.IsAllowed(toolName, params) {
+		if denialTracker != nil {
+			denialTracker.RecordAllow()
+		}
 		return false
+	}
+
+	// 2.5 ModeAuto shell fast-path: allow fully read-only / allowlisted segments
+	// without calling the classifier. Enabled only when a classifier is wired so
+	// ModeAuto remains ModeDefault-compatible when PermissionAuto is absent.
+	if mode == ModeAuto && classifier != nil && isShellToolName(toolName) {
+		if cmd, ok := params["command"].(string); ok {
+			if allowShellFastPath(cmd, m.allowlist) {
+				if denialTracker != nil {
+					denialTracker.RecordAllow()
+				}
+				return false
+			}
+		}
 	}
 
 	// M2-1: Auto mode consults an AI classifier. The classifier is given a
@@ -135,12 +170,19 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 			PermMode: mode,
 		})
 		if err == nil && result != nil {
+			m.storeAutoDecision(toolName, params, result)
+			if denialTracker != nil && !result.ShouldBlock {
+				denialTracker.RecordAllow()
+			}
 			return result.ShouldBlock
 		}
 		// fall through to default behaviour on error
 	}
 
 	if tool == nil {
+		if denialTracker != nil {
+			denialTracker.RecordAllow()
+		}
 		return false
 	}
 
@@ -153,12 +195,18 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 
 	// 4. AcceptEdits – auto-approve non-sensitive file edits.
 	if mode == ModeAcceptEdits && tool != nil && IsEditTool(tool) {
+		if denialTracker != nil {
+			denialTracker.RecordAllow()
+		}
 		return false
 	}
 
 	// 5. Filesystem edit tools inside the trusted workdir are auto-approved.
 	if tool != nil && IsEditTool(tool) && workdir != "" {
 		if path := extractFilesystemPath(toolName, params); path != "" {
+			if denialTracker != nil && middleware.IsPathWithinWorkdir(workdir, path) {
+				denialTracker.RecordAllow()
+			}
 			return !middleware.IsPathWithinWorkdir(workdir, path)
 		}
 	}
@@ -208,4 +256,101 @@ func (m *Manager) GetConfidenceThreshold() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.confidenceThreshold
+}
+
+func (m *Manager) SetDenialTracker(t *DenialTracker) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.denialTracker = t
+}
+
+func (m *Manager) DenialTrackerLockedOut() bool {
+	m.mu.RLock()
+	t := m.denialTracker
+	m.mu.RUnlock()
+	return t != nil && t.LockedOut()
+}
+
+func (m *Manager) DenialTrackerSample() []string {
+	m.mu.RLock()
+	t := m.denialTracker
+	m.mu.RUnlock()
+	if t == nil {
+		return nil
+	}
+	return t.Sample()
+}
+
+// RecordPolicyDeny records a hard policy denial (e.g. ConfirmPolicy=block).
+func (m *Manager) RecordPolicyDeny(cmd string) (lockedOut bool) {
+	m.mu.RLock()
+	t := m.denialTracker
+	m.mu.RUnlock()
+	if t == nil {
+		return false
+	}
+	return t.RecordDeny(cmd)
+}
+
+// PolicyBlockReason returns structured info for BLOCKED_BY_POLICY tool results.
+func (m *Manager) PolicyBlockReason(toolName string, params map[string]interface{}) (layer, reason, suggestedNext string) {
+	layer = "fallback_confirm"
+	reason = "tool requires user confirmation and policy is block"
+
+	if m.DenialTrackerLockedOut() {
+		layer = "denial_limit"
+		reason = "consecutive deny limit reached"
+	} else if r, ok := m.lastClassifierReason(toolName, params); ok {
+		layer = "classifier"
+		reason = r
+	}
+
+	suggestedNext = buildSuggestedNext(toolName, params)
+	return layer, reason, suggestedNext
+}
+
+func (m *Manager) storeAutoDecision(toolName string, params map[string]interface{}, res *ClassifyResult) {
+	if res == nil {
+		return
+	}
+	matchValue := ExtractNormalizedMatchValue(toolName, params)
+	m.mu.Lock()
+	m.lastAutoDecision = autoDecision{
+		ToolName:    toolName,
+		MatchValue:  matchValue,
+		ShouldBlock: res.ShouldBlock,
+		Reason:      res.Reason,
+		At:          time.Now(),
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) lastClassifierReason(toolName string, params map[string]interface{}) (string, bool) {
+	matchValue := ExtractNormalizedMatchValue(toolName, params)
+	m.mu.RLock()
+	dec := m.lastAutoDecision
+	m.mu.RUnlock()
+	if dec.ToolName != toolName || dec.MatchValue != matchValue || !dec.ShouldBlock {
+		return "", false
+	}
+	if strings.TrimSpace(dec.Reason) == "" {
+		return "classifier blocked the call", true
+	}
+	return dec.Reason, true
+}
+
+func buildSuggestedNext(toolName string, params map[string]interface{}) string {
+	const prefix = "this call was rejected before execution; do not retry the same exact command. "
+
+	// Heuristic categorization for suggested-next guidance.
+	if isShellToolName(toolName) {
+		if cmd, _ := params["command"].(string); strings.Contains(cmd, "|") && (strings.Contains(cmd, "bash") || strings.Contains(cmd, "sh")) {
+			return prefix + "Avoid piping network output to a shell. Download to a file, inspect it, then execute a pinned, verified script."
+		}
+		if cmd, _ := params["command"].(string); strings.Contains(cmd, "eval") {
+			return prefix + "Avoid eval. Use direct, explicit commands or a script file checked into the workspace."
+		}
+		return prefix + "Try a more conservative variant of this call, or ask the workflow author to widen permissions explicitly via allow_rules."
+	}
+	return prefix + "Ask the workflow author to widen permissions explicitly via allow_rules for this tool invocation."
 }

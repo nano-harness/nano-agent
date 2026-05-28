@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 )
@@ -22,15 +23,16 @@ type ToolSecurityAnalysis struct {
 	Err       error
 }
 
-type securityDecisionAnalyzableTool interface {
-	AnalyzeSecurityDecision(ctx context.Context, params map[string]interface{}) (*middleware.Decision, error)
-}
-
 type ToolPreflightResult struct {
 	HasAllowPolicy   bool
 	Allowed          bool
 	RequiresApproval bool
-	SecurityAnalysis ToolSecurityAnalysis
+	// ExplicitlyAllowed is true when the permission manager's auto fast-path
+	// (mode=auto + shell fast-path or classifier) already allowed this tool.
+	// It prevents a lower-confidence Security Analyzer ActionConfirm decision
+	// from reinstating RequiresApproval and blocking the tool in headless mode.
+	ExplicitlyAllowed bool
+	SecurityAnalysis  ToolSecurityAnalysis
 }
 
 func (ts *ToolScheduler) policyEngine() ToolPolicyEngine {
@@ -51,6 +53,18 @@ func (pe ToolPolicyEngine) PreflightTool(ctx context.Context, toolName string, p
 	}
 
 	result.RequiresApproval = pe.RequiresApprovalForTool(toolName, params, tool)
+	// Mark as explicitly allowed when auto mode fast-path already approved the
+	// tool so that a lower-confidence Security Analyzer ActionConfirm decision
+	// cannot override the fast-path allow in headless mode.
+	if !result.RequiresApproval {
+		ts := pe.scheduler
+		ts.mutex.RLock()
+		pm := ts.permissionManager
+		ts.mutex.RUnlock()
+		if pm != nil && pm.GetMode() == permission.ModeAuto {
+			result.ExplicitlyAllowed = true
+		}
+	}
 	result.SecurityAnalysis = pe.AnalyzeSecurity(ctx, toolName, params, tool)
 	return result
 }
@@ -98,49 +112,25 @@ func (pe ToolPolicyEngine) RequiresApprovalForTool(toolName string, params map[s
 // AnalyzeSecurity runs optional tool-provided security analysis and validates
 // that the returned action is one of the known middleware actions.
 func (pe ToolPolicyEngine) AnalyzeSecurity(ctx context.Context, toolName string, params map[string]interface{}, tool interfaces.Tool) ToolSecurityAnalysis {
-	if decisionTool, ok := tool.(securityDecisionAnalyzableTool); ok {
-		decision, err := decisionTool.AnalyzeSecurityDecision(ctx, params)
-		if err != nil {
-			return ToolSecurityAnalysis{Supported: true, Err: err}
-		}
-		if decision == nil {
-			return ToolSecurityAnalysis{Supported: true, Err: fmt.Errorf("nil security decision returned by tool %s", toolName)}
-		}
-		switch decision.Action {
-		case middleware.ActionAllow, middleware.ActionConfirm, middleware.ActionBlock:
-			return ToolSecurityAnalysis{Supported: true, Decision: decision}
-		default:
-			return ToolSecurityAnalysis{
-				Supported: true,
-				Err:       fmt.Errorf("invalid security action %d returned by tool %s", decision.Action, toolName),
-			}
-		}
-	}
-
 	secTool, ok := tool.(interfaces.SecurityAnalyzableTool)
 	if !ok {
 		return ToolSecurityAnalysis{}
 	}
 
-	action, reason, err := secTool.AnalyzeSecurity(ctx, params)
+	decision, err := secTool.AnalyzeSecurityDecision(ctx, params)
 	if err != nil {
 		return ToolSecurityAnalysis{Supported: true, Err: err}
 	}
-
-	validatedAction := middleware.Action(action)
-	switch validatedAction {
+	if decision == nil {
+		return ToolSecurityAnalysis{Supported: true, Err: fmt.Errorf("nil security decision returned by tool %s", toolName)}
+	}
+	switch decision.Action {
 	case middleware.ActionAllow, middleware.ActionConfirm, middleware.ActionBlock:
-		return ToolSecurityAnalysis{
-			Supported: true,
-			Decision: &middleware.Decision{
-				Action: validatedAction,
-				Reason: reason,
-			},
-		}
+		return ToolSecurityAnalysis{Supported: true, Decision: decision}
 	default:
 		return ToolSecurityAnalysis{
 			Supported: true,
-			Err:       fmt.Errorf("invalid security action %d returned by tool %s", action, toolName),
+			Err:       fmt.Errorf("invalid security action %d returned by tool %s", decision.Action, toolName),
 		}
 	}
 }

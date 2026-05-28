@@ -95,44 +95,46 @@ func newCronLifecycleEvent(eventType event.EventType, taskID, command, sessionID
 	return ev
 }
 
-// buildCronApprovalHandler creates an approval handler based on the cron permission policy.
-func buildCronApprovalHandler(policy string) func(*agent.ToolCallInfo) bool {
+// buildCronApprovalHandler creates a V2 approval handler based on the cron permission policy.
+func buildCronApprovalHandler(policy string) func(*agent.ToolCallInfo) agent.ApprovalDecision {
 	switch policy {
 	case "auto_approve":
-		return func(*agent.ToolCallInfo) bool {
-			return true // Auto-approve all tools
+		return func(*agent.ToolCallInfo) agent.ApprovalDecision {
+			return agent.ApprovalApproveOnce
 		}
 	case "auto_reject":
-		return func(info *agent.ToolCallInfo) bool {
+		return func(info *agent.ToolCallInfo) agent.ApprovalDecision {
 			logger.Warnf("cron: auto-rejecting tool %s due to auto_reject policy", info.Name)
-			return false // Reject all tools requiring confirmation
+			return agent.ApprovalReject
 		}
 	case "inherit":
 		return nil // Use the global approval handler
 	default:
 		logger.Warnf("cron: unknown permission_policy %q, defaulting to auto_approve", policy)
-		return func(*agent.ToolCallInfo) bool {
-			return true
+		return func(*agent.ToolCallInfo) agent.ApprovalDecision {
+			return agent.ApprovalApproveOnce
 		}
 	}
 }
 
-// New builds an Engine from the provided config and optional approval handler.
-// The approvalHandler may be nil (all tool calls are auto-approved).
-func New(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, opts ...EngineOption) (*Engine, error) {
+// New builds an Engine from the provided config.
+// Approval handlers should be set after construction via Agent.SetApprovalHandlerV2.
+func New(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	parsed := &engineOptions{}
 	for _, opt := range opts {
-		opt(parsed)
+		if opt != nil {
+			opt(parsed)
+		}
 	}
 
-	agentInstance, err := agent.New(cfg, approvalHandler, parsed.agentOpts...)
+	agentInstance, err := agent.New(cfg, parsed.agentOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("engine: create agent: %w", err)
 	}
 
 	// Register standalone agent tools. Team-specific mailbox tools are registered
 	// by NewLeadEngine/NewTeammateEngine once a team mailbox backend exists.
-	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg, agentInstance)
+	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg)
 
 	e := &Engine{
 		Agent:      agentInstance,
@@ -292,13 +294,13 @@ func (e *Engine) attachScheduler(cfg *config.Config, agentInstance *agent.Agent)
 
 // NewLeadEngine creates an Engine for a team-lead agent with swarm capabilities.
 // The lead agent can spawn teammates and coordinate multi-agent tasks.
-func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, teamName string, opts ...agent.Option) (*Engine, error) {
+func NewLeadEngine(cfg *config.Config, teamName string, opts ...agent.Option) (*Engine, error) {
 	if teamName == "" {
 		teamName = "default"
 	}
 
 	// Create agent
-	agentInstance, err := agent.New(cfg, approvalHandler, opts...)
+	agentInstance, err := agent.New(cfg, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("engine: create lead agent: %w", err)
 	}
@@ -313,7 +315,7 @@ func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo)
 		mailboxBackend = nil // Continue without mailbox
 	}
 
-	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg, agentInstance)
+	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg)
 
 	// Register swarm tools (lead mode)
 	agentTools.RegisterSwarmTools(agentInstance.GetToolbox(), cfg, mailboxBackend, nil)
@@ -337,13 +339,13 @@ func NewLeadEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo)
 
 // NewTeammateEngine creates an Engine for a teammate agent spawned by a team-lead.
 // Teammates have restricted capabilities and automatically send idle notifications.
-func NewTeammateEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallInfo) bool, identity *swarm.TeammateIdentity) (*Engine, error) {
+func NewTeammateEngine(cfg *config.Config, identity *swarm.TeammateIdentity) (*Engine, error) {
 	if identity == nil {
 		return nil, fmt.Errorf("engine: teammate identity is required")
 	}
 
 	// Create agent (context will be used internally when needed)
-	agentInstance, err := agent.New(cfg, approvalHandler)
+	agentInstance, err := agent.New(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("engine: create teammate agent: %w", err)
 	}
@@ -358,7 +360,7 @@ func NewTeammateEngine(cfg *config.Config, approvalHandler func(*agent.ToolCallI
 		mailboxBackend = nil // Continue without mailbox
 	}
 
-	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg, agentInstance)
+	agentTools.RegisterAgentTools(agentInstance.GetToolbox(), cfg)
 
 	// Register swarm tools (teammate mode)
 	agentTools.RegisterSwarmTools(agentInstance.GetToolbox(), cfg, mailboxBackend, identity)
