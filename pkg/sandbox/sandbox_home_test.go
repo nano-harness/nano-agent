@@ -19,7 +19,7 @@ func TestSandboxExec_Allows_Read_Anywhere_In_Home(t *testing.T) {
 	t.Setenv("HOME", tempHome)
 
 	// Create test files
-	for _, rel := range []string{".gitconfig", ".npmrc", "Documents/note.txt"} {
+	for _, rel := range []string{".gitconfig", "notes.txt", "Documents/note.txt"} {
 		p := filepath.Join(tempHome, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 			t.Fatal(err)
@@ -34,13 +34,15 @@ func TestSandboxExec_Allows_Read_Anywhere_In_Home(t *testing.T) {
 		Enabled: true, Backend: "native", NetworkAccess: false,
 	}, workdir)
 
-	for _, rel := range []string{".gitconfig", ".npmrc", "Documents/note.txt"} {
+	for _, rel := range []string{".gitconfig", "notes.txt", "Documents/note.txt"} {
 		target := filepath.Join(tempHome, rel)
 		cmd, args, err := sb.WrapCommand(workdir, "/bin/cat", []string{target})
 		if err != nil {
 			t.Fatal(err)
 		}
-		out, err := exec.Command(cmd, args...).CombinedOutput()
+		c := exec.Command(cmd, args...)
+		c.Dir = workdir
+		out, err := c.CombinedOutput()
 		if err != nil {
 			t.Errorf("reading %s should succeed under sandbox, got err=%v out=%q", rel, err, out)
 		}
@@ -195,7 +197,9 @@ func TestSandboxExec_HOME_Passthrough(t *testing.T) {
 	}, workdir)
 
 	cmd, args, _ := sb.WrapCommand(workdir, "/bin/sh", []string{"-c", "echo $HOME"})
-	out, err := exec.Command(cmd, args...).CombinedOutput()
+	c := exec.Command(cmd, args...)
+	c.Dir = workdir
+	out, err := c.CombinedOutput()
 	if err != nil {
 		t.Fatalf("echo $HOME failed: %v, out=%q", err, out)
 	}

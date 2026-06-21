@@ -24,6 +24,10 @@ func cronTestConfig(t *testing.T) *config.Config {
 		LogRetentionDays:   30,
 		LogCleanupInterval: time.Hour,
 	}
+	cfg.Scheduler = &config.SchedulerConfig{
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
+	}
 	return cfg
 }
 

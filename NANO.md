@@ -16,3 +16,39 @@
 | OutputFormat | ❌ | ❌ | ❌ | Agent can correct the prompt/tool format and retry |
 
 Stream responses that end with `finish_reason=length` surface `truncated=true` and `finish_reason=length` in stream event metadata so the agent can request continuation without silently treating the partial output as complete.
+
+---
+
+## Security defaults (changed in this release)
+
+### Sandbox (A2)
+
+The process-level sandbox is now **enabled by default**.
+
+| Platform | Sandbox backend | Effect |
+|---|---|---|
+| macOS | `sandbox-exec` (seatbelt) | Shell commands run under an Apple Sandbox profile |
+| Linux | `bwrap` (bubblewrap) | Shell commands run in a bubblewrap container |
+| Other | Noop (no isolation) | **A prominent warning is printed at startup** |
+
+**Network access inside the sandbox is disabled by default.** Workflows that need outbound network access must enable it explicitly:
+
+```yaml
+# nano config file
+sandbox:
+  enabled: true         # default: true (was false)
+  network_access: true  # default: false (was true)
+```
+
+Or via environment variables:
+```
+NANO_SANDBOX_ENABLED=true
+NANO_SANDBOX_NETWORK_ACCESS=true
+```
+
+To restore the previous (less secure) behavior for a specific run:
+```
+nano --sandbox=off ...
+```
+
+> **CI / headless usage:** If your CI pipeline runs nano-agent non-interactively and does not have `bwrap`/`sandbox-exec` available, set `NANO_SANDBOX_ENABLED=false` explicitly. A warning will appear but the agent will continue. For Linux CI with bubblewrap available, the default sandbox is recommended.

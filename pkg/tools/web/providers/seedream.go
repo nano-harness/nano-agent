@@ -119,7 +119,7 @@ func (p *SeedreamProvider) GenerateImages(ctx context.Context, request *ImageGen
 			// Read error response body for logging
 			if resp != nil && resp.Body != nil {
 				errorBody, _ := io.ReadAll(resp.Body)
-				resp.Body.Close() //nolint:errcheck
+				_ = resp.Body.Close()
 				lastError = fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(errorBody))
 				if attempt < p.config.MaxRetries {
 					fmt.Printf("Seedream API call failed, retrying attempt %d/%d: %s\n",
@@ -275,7 +275,7 @@ func (p *SeedreamProvider) makeAPICall(ctx context.Context, body []byte) (*http.
 
 // parseResponse parses the Seedream API response
 func (p *SeedreamProvider) parseResponse(resp *http.Response, request *ImageGenerationRequest) (*ImageGenerationResult, error) {
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -346,7 +346,7 @@ func (p *SeedreamProvider) downloadImageToBase64(imageURL string) (string, error
 	if err != nil {
 		return "", fmt.Errorf("failed to download image: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to download image: status %d", resp.StatusCode)

@@ -73,6 +73,10 @@ type Agent struct {
 	// so SetTUIScheduler can wire the live scheduler into it.
 	manageRoutineTool *builtin.ManageRoutineTool
 
+	// discoverToolsTool holds a reference to the registered discover_tools tool
+	// so that MCP tools can be re-indexed after async registration.
+	discoverToolsTool *builtin.DiscoverToolsTool
+
 	progressiveDisclosure *ProgressiveDisclosure
 
 	// approvalConfirmFnOverride optionally overrides the default auto-confirm logic.
@@ -258,6 +262,21 @@ func New(cfg *config.Config, opts ...Option) (*Agent, error) {
 	if !cfg.IsSubAgent {
 		agent.registerBuiltinManagementTools(agent.toolbox, cfg, bootstrap.workingDir)
 	}
+
+	// Start toolbox LLM updates with onToolsChanged callback to re-index
+	// MCP tools as they are registered asynchronously.
+	startToolboxLLMUpdates(agent.ctx, agent.toolbox, agent.llmClient, func(tools []interfaces.Tool) {
+		if agent.discoverToolsTool != nil {
+			for _, tool := range tools {
+				category := ""
+				if schema := tool.Schema(); schema != nil {
+					category = string(tool.Category())
+				}
+				agent.discoverToolsTool.IndexTool(tool.Name(), tool.Description(), category, "")
+				agent.progressiveDisclosure.IndexTools([]interfaces.Tool{tool})
+			}
+		}
+	})
 
 	maybeStartAgentMCPClient(cfg, agent.toolbox)
 
@@ -1057,6 +1076,8 @@ func (a *Agent) registerBuiltinManagementTools(tb *tools.Toolbox, cfg *config.Co
 	if err := tb.Register(discoverToolsTool); err != nil {
 		logger.Debugf("discover_tools already registered: %v", err)
 	}
+	// Store a reference so MCP tools can be re-indexed after async registration.
+	a.discoverToolsTool = discoverToolsTool
 
 	// discover_skills: skill search + full instructions lookup
 	discoverSkillsTool := builtin.NewDiscoverSkillsTool(a.skillManager)

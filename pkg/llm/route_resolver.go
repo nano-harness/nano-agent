@@ -184,7 +184,7 @@ func resolveProviderModelRoute(cfg *config.Config, ref, defaultName string, lega
 	if baseURL == "" && providerID == "openai" {
 		baseURL = defaultOpenAIBaseURL
 	}
-	apiKey := resolveProviderAPIKey(providerID, block, preset, hasPreset)
+	apiKey := resolveProviderAPIKey(providerID, block, preset, hasPreset, cfg.APIKey)
 	if legacy != nil {
 		if strings.TrimSpace(legacy.APIKey) != "" {
 			apiKey = strings.TrimSpace(legacy.APIKey)
@@ -209,7 +209,7 @@ func resolveProviderModelRoute(cfg *config.Config, ref, defaultName string, lega
 	}, nil
 }
 
-func resolveProviderAPIKey(providerID string, block config.ProviderBlock, preset ProviderPreset, hasPreset bool) string {
+func resolveProviderAPIKey(providerID string, block config.ProviderBlock, preset ProviderPreset, hasPreset bool, fallbackAPIKey string) string {
 	if strings.TrimSpace(block.APIKey) != "" {
 		return strings.TrimSpace(block.APIKey)
 	}
@@ -220,7 +220,15 @@ func resolveProviderAPIKey(providerID string, block config.ProviderBlock, preset
 		return value
 	}
 	if hasPreset && strings.TrimSpace(preset.APIKeyEnv) != "" {
-		return os.Getenv(strings.TrimSpace(preset.APIKeyEnv))
+		if v := os.Getenv(strings.TrimSpace(preset.APIKeyEnv)); v != "" {
+			return v
+		}
+	}
+	// Fallback to the legacy/global API key (e.g. NANO_API_KEY) when no
+	// provider-specific key is configured. This keeps orchestrator-injected
+	// single keys working even when a providers block is present.
+	if strings.TrimSpace(fallbackAPIKey) != "" {
+		return strings.TrimSpace(fallbackAPIKey)
 	}
 	return ""
 }

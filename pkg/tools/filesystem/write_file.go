@@ -335,7 +335,7 @@ func (t *WriteFileTool) Execute(_ context.Context, params map[string]interface{}
 }
 
 func (t *WriteFileTool) validatePath(path string) (string, error) {
-	return validatePathCommon(t.workingDir, path)
+	return validatePathCommon(t.workingDir, path, t.pathChecker.AllowedPaths())
 }
 
 func (t *WriteFileTool) generateDiff(oldContent, newContent, filePath string, isNewFile bool) string {

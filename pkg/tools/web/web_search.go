@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -422,7 +423,7 @@ func (t *WebSearchTool) searchDuckDuckGo(ctx context.Context, query string, maxR
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
@@ -613,7 +614,7 @@ func (t *WebSearchTool) searchSerper(ctx context.Context, query string, maxResul
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		// Read response body for better error details
@@ -710,7 +711,7 @@ func (t *WebSearchTool) searchTavily(ctx context.Context, query string, maxResul
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		// Read response body for better error details
@@ -800,7 +801,28 @@ func (t *WebSearchTool) fetchFullContent(ctx context.Context, result *WebSearchR
 		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 
-		fetchResult, err := t.webFetchTool.fetchContent(fetchCtx, result.Results[i].URL, "nano/1.0", 100000, true)
+		// Validate the URL before fetching to guard against SSRF.
+		u, err := url.Parse(result.Results[i].URL)
+		if err != nil || validateURLForSSRF(u) != nil {
+			continue
+		}
+
+		// Build a per-request client with SSRF-aware redirect checking.
+		client := &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: t.webFetchTool.client.Transport,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if err := validateURLForSSRF(req.URL); err != nil {
+					return fmt.Errorf("redirect blocked: %w", err)
+				}
+				if len(via) >= 10 {
+					return fmt.Errorf("stopped after 10 redirects")
+				}
+				return nil
+			},
+		}
+
+		fetchResult, err := t.webFetchTool.fetchContentWithClient(fetchCtx, client, result.Results[i].URL, "nano/1.0", 100000, true)
 		if err == nil && fetchResult.Success {
 			result.Results[i].Snippet = fetchResult.Content
 		}

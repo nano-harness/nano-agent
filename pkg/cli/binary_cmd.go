@@ -58,7 +58,12 @@ func newBinaryExecCommand() *cobra.Command {
 		format       string
 		quiet        bool
 		stream       bool
+		// timeoutMS  int   // removed: timeout managed by spawner layer
 		sessionID    string
+		mcpConfigFile      string
+		allowedTools       []string
+		disallowedTools    []string
+		addDirs            []string
 	)
 	c := &cobra.Command{
 		Use:   "exec [prompt...]",
@@ -67,10 +72,21 @@ func newBinaryExecCommand() *cobra.Command {
 and exit. This command may use tools and mutate the workspace, so it is intended
 for orchestrators, scripts, CI, and other non-interactive drivers.
 
-stdout emits a single compact JSON line (AgentResultSummary) matching
+stdout emits a single compact JSON line (binaryResultSummary) matching
 claude -p --output-format json shape. Patch artifacts are written to --output-dir.`,
 		Args: cobra.ArbitraryArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			resultEmitted := false
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "panic recovered in binary exec: %v\n", r)
+					if !resultEmitted {
+						emitPanicResult(cmd.OutOrStdout(), outputDir, r)
+					}
+					err = withExitCode(fmt.Errorf("panic: %v", r), binaryExitAbandoned)
+				}
+			}()
+
 			if outputDir == "" {
 				return fmt.Errorf("--output-dir is required for nano binary exec")
 			}
@@ -99,14 +115,18 @@ claude -p --output-format json shape. Patch artifacts are written to --output-di
 
 			start := time.Now()
 			opts := binaryOptions{
-				OutputDir:      outputDir,
-				Sandbox:        sandboxMode,
-				Goal:           goal,
-				GoalMaxTurns:   goalMaxTurns,
-				SessionID:      sessionID,
-				HookService:    buildBinaryHookService(wd),
-				PermissionMode: permMode,
-				SkipPerms:      skipPerms,
+				OutputDir:       outputDir,
+				Sandbox:         sandboxMode,
+				Goal:            goal,
+				GoalMaxTurns:    goalMaxTurns,
+				SessionID:       sessionID,
+				HookService:     buildBinaryHookService(wd),
+				PermissionMode:  permMode,
+				SkipPerms:       skipPerms,
+				MCPConfigFile:   mcpConfigFile,
+				AllowedTools:    allowedTools,
+				DisallowedTools: disallowedTools,
+				AddDirs:         addDirs,
 			}
 
 			// Handle streaming output
@@ -120,6 +140,7 @@ claude -p --output-format json shape. Patch artifacts are written to --output-di
 			if err != nil {
 				// Still emit summary to stdout and result.json on failure.
 				_ = emitResult(cmd.OutOrStdout(), outputDir, summary, "")
+				resultEmitted = true
 				return withExitCode(err, binaryExitCode(summary.Status))
 			}
 
@@ -133,6 +154,7 @@ claude -p --output-format json shape. Patch artifacts are written to --output-di
 			if err := emitResult(cmd.OutOrStdout(), outputDir, summary, ""); err != nil {
 				return err
 			}
+			resultEmitted = true
 			return nil
 		},
 	}
@@ -145,6 +167,10 @@ claude -p --output-format json shape. Patch artifacts are written to --output-di
 	c.Flags().StringVar(&goal, "goal", "", "goal condition to evaluate across turns")
 	c.Flags().IntVar(&goalMaxTurns, "goal-max-turns", 0, "maximum goal evaluation turns (overrides config when > 0)")
 	c.Flags().StringVar(&sessionID, "session-id", "", "explicit session ID for hook routing (overrides NANO_SESSION_ID and SYMPHONY_ISSUE_ID)")
+	c.Flags().StringVar(&mcpConfigFile, "mcp-config", "", "path to a Claude Code-compatible .mcp.json to register MCP servers for this run")
+	c.Flags().StringArrayVar(&allowedTools, "allowedTools", nil, "repeatable allow-pattern for tools (e.g. mcp__symphony__*, ReadFile, Edit). First prefix match wins.")
+	c.Flags().StringArrayVar(&disallowedTools, "disallowedTools", nil, "repeatable deny-pattern for tools. Overrides --allowedTools for matching prefixes.")
+	c.Flags().StringArrayVar(&addDirs, "add-dir", nil, "additional directories to allow sandbox write access to (repeatable)")
 	_ = c.MarkFlagRequired("output-dir")
 	return c
 }
@@ -348,7 +374,8 @@ func newBinaryListSkillsCommand() *cobra.Command {
 }
 
 func newBinarySWEBenchCommand() *cobra.Command {
-	var outputDir, sandboxMode string
+	var outputDir, sandboxMode, mcpConfigFile string
+	var allowedTools, disallowedTools []string
 	c := &cobra.Command{
 		Use:   "swebench [prompt...]",
 		Short: "SWE-bench-compatible one-shot evaluation",
@@ -359,7 +386,18 @@ This command always generates the patch even when the agent errors (partial
 patches help downstream classifiers decide on retries).
 stdout emits byte-identical JSON to <output-dir>/result.json.`,
 		Args: cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			resultEmitted := false
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "panic recovered in swebench: %v\n", r)
+					if !resultEmitted {
+						emitPanicResult(cmd.OutOrStdout(), outputDir, r)
+					}
+					err = withExitCode(fmt.Errorf("panic: %v", r), binaryExitAbandoned)
+				}
+			}()
+
 			wd, _ := os.Getwd()
 			prompt := strings.Join(args, " ")
 			start := time.Now()
@@ -368,11 +406,14 @@ stdout emits byte-identical JSON to <output-dir>/result.json.`,
 			skipPerms, _ := cmd.Flags().GetBool("dangerously-skip-permissions")
 
 			opts := binaryOptions{
-				OutputDir:      outputDir,
-				Sandbox:        sandboxMode,
-				HookService:    buildBinaryHookService(wd),
-				PermissionMode: permMode,
-				SkipPerms:      skipPerms,
+				OutputDir:       outputDir,
+				Sandbox:         sandboxMode,
+				HookService:     buildBinaryHookService(wd),
+				PermissionMode:  permMode,
+				SkipPerms:       skipPerms,
+				MCPConfigFile:   mcpConfigFile,
+				AllowedTools:    allowedTools,
+				DisallowedTools: disallowedTools,
 			}
 
 			if err := os.MkdirAll(outputDir, 0o755); err != nil {
@@ -409,6 +450,7 @@ stdout emits byte-identical JSON to <output-dir>/result.json.`,
 			if err := emitResult(cmd.OutOrStdout(), outputDir, summary, patchContent); err != nil {
 				return err
 			}
+			resultEmitted = true
 
 			if runErr != nil {
 				return withExitCode(runErr, binaryExitCode(summary.Status))
@@ -418,6 +460,9 @@ stdout emits byte-identical JSON to <output-dir>/result.json.`,
 	}
 	c.Flags().StringVar(&outputDir, "output-dir", "", "directory to write trajectory + patch artifacts (required)")
 	c.Flags().StringVar(&sandboxMode, "sandbox", "auto", "sandbox mode for embedded execution: auto, on, or off")
+	c.Flags().StringVar(&mcpConfigFile, "mcp-config", "", "path to a Claude Code-compatible .mcp.json to register MCP servers for this run")
+	c.Flags().StringArrayVar(&allowedTools, "allowedTools", nil, "repeatable allow-pattern for tools")
+	c.Flags().StringArrayVar(&disallowedTools, "disallowedTools", nil, "repeatable deny-pattern for tools")
 	_ = c.MarkFlagRequired("output-dir")
 	return c
 }

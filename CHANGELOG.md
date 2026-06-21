@@ -5,7 +5,14 @@ All notable changes to nano-agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.8] - 2026-06-16
+
+### Added
+- **Community files**: `AGENTS.md`, `CONTRIBUTING.md`, and `CODE_OF_CONDUCT.md`.
+
+### Changed
+- **Orchestrator coupling removed**: nano-agent no longer hard-codes a `nano-symphony` profile or skill. Auto-activation of orchestrator-specific skills is driven by `NANO_ORCHESTRATOR_PROFILE` (comma-separated skill names).
+- **Contract simplification**: Built-in `nano-symphony` skill removed; agents communicate results through the generic binary result contract and MCP tool naming convention (`mcp_<server>_<tool>`).
 
 ### Fixed
 - **sandbox**: Removed filesystem tools' working directory hard fence; cross-directory read/write no longer falsely rejected

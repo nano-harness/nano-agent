@@ -9,6 +9,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -85,6 +86,66 @@ func setNestedKey(m map[string]interface{}, key string, value string) {
 			current = nextMap
 		}
 	}
+}
+
+// getFieldByPath reads a nested field from a struct using reflection.
+func getFieldByPath(obj interface{}, path string) (interface{}, error) {
+	parts := strings.Split(path, ".")
+	v := reflect.ValueOf(obj)
+	for _, part := range parts {
+		if v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				return nil, fmt.Errorf("path %q: nil pointer", path)
+			}
+			v = v.Elem()
+		}
+		if v.Kind() != reflect.Struct {
+			return nil, fmt.Errorf("path %q: %T is not a struct", path, v.Interface())
+		}
+		field, err := findFieldByName(v, part)
+		if err != nil {
+			return nil, err
+		}
+		v = field
+	}
+	if v.Kind() == reflect.Ptr && !v.IsNil() {
+		v = v.Elem()
+	}
+	return v.Interface(), nil
+}
+
+// findFieldByName searches a struct for a field matching the given name.
+// It checks, in order: field name (case-insensitive), field name without
+// underscores, mapstructure tag, yaml tag.
+func findFieldByName(v reflect.Value, name string) (reflect.Value, error) {
+	nameNorm := strings.ToLower(strings.ReplaceAll(name, "_", ""))
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		// Match by field name (case-insensitive)
+		if strings.EqualFold(field.Name, name) {
+			return v.Field(i), nil
+		}
+		// Match by field name without underscores (case-insensitive)
+		if strings.EqualFold(strings.ReplaceAll(field.Name, "_", ""), nameNorm) {
+			return v.Field(i), nil
+		}
+		// Match by mapstructure tag
+		if tag := field.Tag.Get("mapstructure"); tag != "" {
+			tagName := strings.Split(tag, ",")[0]
+			if tagName != "-" && strings.EqualFold(tagName, name) {
+				return v.Field(i), nil
+			}
+		}
+		// Match by yaml tag
+		if tag := field.Tag.Get("yaml"); tag != "" {
+			tagName := strings.Split(tag, ",")[0]
+			if tagName != "-" && strings.EqualFold(tagName, name) {
+				return v.Field(i), nil
+			}
+		}
+	}
+	return reflect.Value{}, fmt.Errorf("unknown key: %q", name)
 }
 
 // coerceYAMLValue attempts to interpret a string value as a native Go type
@@ -328,24 +389,36 @@ func NewConfigCommand() *cobra.Command {
 	})
 
 	// nano config show
-	configCmd.AddCommand(&cobra.Command{
+	configShowCmd := &cobra.Command{
 		Use:   "show",
 		Short: "Show current configuration",
-		Run: func(_ *cobra.Command, _ []string) {
-			cfg := config.Get()
-			if cfg == nil {
-				fmt.Println("No configuration loaded")
+	}
+	var effective bool
+	configShowCmd.Flags().BoolVar(&effective, "effective", false, "emit full merged config including env overrides and defaults")
+	configShowCmd.Run = func(_ *cobra.Command, _ []string) {
+		cfg := config.Get()
+		if cfg == nil {
+			fmt.Println("No configuration loaded")
+			return
+		}
+		if effective {
+			data, err := yaml.Marshal(cfg)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
 				return
 			}
-			maskedKey := cfg.APIKey
-			if len(maskedKey) > 4 {
-				maskedKey = "sk-****" + maskedKey[len(maskedKey)-4:]
-			} else if maskedKey != "" {
-				maskedKey = "sk-****"
-			}
-			fmt.Printf("api_key: %s\nmodel: %s\nbase_url: %s\n", maskedKey, cfg.Model, cfg.BaseURL)
-		},
-	})
+			fmt.Print(string(data))
+			return
+		}
+		maskedKey := cfg.APIKey
+		if len(maskedKey) > 4 {
+			maskedKey = "sk-****" + maskedKey[len(maskedKey)-4:]
+		} else if maskedKey != "" {
+			maskedKey = "sk-****"
+		}
+		fmt.Printf("api_key: %s\nmodel: %s\nbase_url: %s\n", maskedKey, cfg.Model, cfg.BaseURL)
+	}
+	configCmd.AddCommand(configShowCmd)
 
 	// nano config set <key> <value>
 	configCmd.AddCommand(&cobra.Command{
@@ -382,6 +455,26 @@ func NewConfigCommand() *cobra.Command {
 				return fmt.Errorf("failed to write %s: %w", cfgPath, err)
 			}
 			fmt.Printf("Set %s = %s\n", key, value)
+			return nil
+		},
+	})
+
+	// nano config get <key>
+	configCmd.AddCommand(&cobra.Command{
+		Use:   "get <key>",
+		Short: "Read a configuration key (supports dot-path keys)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			key := args[0]
+			cfg := config.Get()
+			if cfg == nil {
+				return fmt.Errorf("no configuration loaded")
+			}
+			val, err := getFieldByPath(cfg, key)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%v\n", val)
 			return nil
 		},
 	})

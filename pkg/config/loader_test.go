@@ -10,6 +10,10 @@ import (
 )
 
 func TestLoadConfig_DeepMerge_UserAndProject(t *testing.T) {
+	// Isolate from host environment variables
+	t.Setenv("NANO_API_KEY", "")
+	t.Setenv("API_KEY", "")
+
 	// Setup temp directories
 	tempDir := t.TempDir()
 	homeDir := filepath.Join(tempDir, "home")
@@ -68,6 +72,10 @@ mcp:
 }
 
 func TestLoadConfig_DeepMerge_OnlyUserConfig(t *testing.T) {
+	// Isolate from host environment variables
+	t.Setenv("NANO_API_KEY", "")
+	t.Setenv("API_KEY", "")
+
 	// Setup temp directories
 	tempDir := t.TempDir()
 	homeDir := filepath.Join(tempDir, "home")
@@ -100,6 +108,10 @@ api_key: "user-only-key"
 }
 
 func TestLoadConfig_DeepMerge_OnlyProjectConfig(t *testing.T) {
+	// Isolate from host environment variables
+	t.Setenv("NANO_API_KEY", "")
+	t.Setenv("API_KEY", "")
+
 	// Setup temp directory for project
 	projectDir := t.TempDir()
 	originalDir, _ := os.Getwd()
@@ -228,6 +240,10 @@ security:
 }
 
 func TestLoadConfig_LegacyMode(t *testing.T) {
+	// Isolate from host environment variables
+	t.Setenv("NANO_API_KEY", "")
+	t.Setenv("API_KEY", "")
+
 	// Setup temp directories
 	tempDir := t.TempDir()
 	homeDir := filepath.Join(tempDir, "home")

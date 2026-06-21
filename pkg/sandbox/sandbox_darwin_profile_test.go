@@ -148,3 +148,214 @@ func TestBuildProfile_ExtraDeniedPaths_OverrideWorkdir(t *testing.T) {
 		t.Error("ExtraDeniedPaths deny must appear after workdir allow")
 	}
 }
+
+// TestValidateSBPLPath verifies that paths with unsafe characters are rejected.
+func TestValidateSBPLPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{name: "normal path", path: "/Users/alice/project", wantErr: false},
+		{name: "path with spaces", path: "/Users/alice/my project", wantErr: false},
+		{name: "path with quote", path: "/tmp/dir\"inject", wantErr: true},
+		{name: "path with backslash", path: "/tmp/dir\\inject", wantErr: true},
+		{name: "path with newline", path: "/tmp/dir\ninject", wantErr: true},
+		{name: "path with tab", path: "/tmp/dir\tinject", wantErr: true},
+		{name: "path with null byte", path: "/tmp/dir\x00inject", wantErr: true},
+		{name: "empty path", path: "", wantErr: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSBPLPath(tt.path)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateSBPLPath(%q) error = %v, wantErr = %v", tt.path, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestBuildProfile_RejectsUnsafePaths verifies that buildProfile returns an
+// error (not a broken SBPL profile) when ExtraWritablePaths or ExtraDeniedPaths
+// contain characters that would inject into the profile.
+func TestBuildProfile_RejectsUnsafePaths(t *testing.T) {
+	workdir := t.TempDir()
+	t.Setenv("HOME", workdir)
+
+	tests := []struct {
+		name string
+		cfg  *config.SandboxConfig
+	}{
+		{
+			name: "quote in ExtraWritablePaths",
+			cfg: &config.SandboxConfig{
+				Enabled:            true,
+				ExtraWritablePaths: []string{"/tmp/dir\"inject"},
+			},
+		},
+		{
+			name: "newline in ExtraDeniedPaths",
+			cfg: &config.SandboxConfig{
+				Enabled:          true,
+				ExtraDeniedPaths: []string{"/secrets/vault\n(allow network*)"},
+			},
+		},
+		{
+			name: "backslash in ExtraReadOnlyPaths",
+			cfg: &config.SandboxConfig{
+				Enabled:            true,
+				ExtraReadOnlyPaths: []string{"/opt/tools\\ninjected"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sb := NewSandboxExecSandbox(tt.cfg, workdir)
+			_, err := sb.buildProfile(workdir)
+			if err == nil {
+				t.Errorf("buildProfile should have returned an error for unsafe path in %s", tt.name)
+			}
+		})
+	}
+}
+
+// ── A3: environment variable whitelist ────────────────────────────────────────
+
+// TestWrapCommand_EnvWhitelist_BlocksAPIKeys verifies that credential variables
+// (NANO_*_API_KEY, NANO_*_SECRET, etc.) are NOT forwarded to the sandboxed
+// subprocess.  Only the explicitly allowlisted variables must appear in the
+// wrapped command environment.
+func TestWrapCommand_EnvWhitelist_BlocksAPIKeys(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("NANO_OPENAI_API_KEY", "sk-secret-openai")
+	t.Setenv("NANO_ANTHROPIC_API_KEY", "sk-secret-anthropic")
+	t.Setenv("NANO_DEEPSEEK_API_KEY", "sk-secret-deepseek")
+	t.Setenv("NANO_SESSION_ID", "test-session-123")
+
+	workdir := t.TempDir()
+	cfg := &config.SandboxConfig{Enabled: true, Backend: "native", NetworkAccess: false}
+	sb := NewSandboxExecSandbox(cfg, workdir)
+
+	_, args, err := sb.WrapCommand(workdir, "echo", []string{"hello"})
+	if err != nil {
+		t.Fatalf("WrapCommand: %v", err)
+	}
+
+	envSection := extractEnvSection(args)
+
+	// Credential keys must NOT be forwarded.
+	for _, blocked := range []string{"NANO_OPENAI_API_KEY", "NANO_ANTHROPIC_API_KEY", "NANO_DEEPSEEK_API_KEY"} {
+		for _, e := range envSection {
+			if strings.HasPrefix(e, blocked+"=") {
+				t.Errorf("credential variable %q must not be forwarded to sandbox; got %q", blocked, e)
+			}
+		}
+	}
+
+	// PATH and HOME must always be forwarded.
+	mustHavePrefix(t, envSection, "PATH=")
+	mustHavePrefix(t, envSection, "HOME=")
+}
+
+// TestWrapCommand_EnvWhitelist_AllowsSafeNanoVars verifies that the safe NANO_*
+// variables (session ID, workspace, etc.) are forwarded to the sandbox.
+func TestWrapCommand_EnvWhitelist_AllowsSafeNanoVars(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("PATH", "/usr/bin")
+	t.Setenv("NANO_SESSION_ID", "sess-abc")
+	t.Setenv("NANO_WORKSPACE", "/workspace/project")
+	t.Setenv("NANO_ORCHESTRATOR_MODE", "1")
+	t.Setenv("NANO_SANDBOX_MODE", "native")
+
+	workdir := t.TempDir()
+	cfg := &config.SandboxConfig{Enabled: true, Backend: "native", NetworkAccess: false}
+	sb := NewSandboxExecSandbox(cfg, workdir)
+
+	_, args, err := sb.WrapCommand(workdir, "echo", []string{"hi"})
+	if err != nil {
+		t.Fatalf("WrapCommand: %v", err)
+	}
+
+	envSection := extractEnvSection(args)
+
+	// Safe NANO_* vars must be forwarded.
+	for _, safe := range []string{
+		"NANO_SESSION_ID=sess-abc",
+		"NANO_WORKSPACE=/workspace/project",
+		"NANO_ORCHESTRATOR_MODE=1",
+		"NANO_SANDBOX_MODE=native",
+	} {
+		found := false
+		for _, e := range envSection {
+			if e == safe {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("safe variable %q not found in sandbox env; envSection=%v", safe, envSection)
+		}
+	}
+}
+
+// TestWrapCommand_EnvWhitelist_UnknownNanoVarBlocked verifies that an arbitrary
+// NANO_* variable that is not in the allowlist is not forwarded.
+func TestWrapCommand_EnvWhitelist_UnknownNanoVarBlocked(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("PATH", "/usr/bin")
+	t.Setenv("NANO_UNKNOWN_VAR", "should-not-appear")
+
+	workdir := t.TempDir()
+	cfg := &config.SandboxConfig{Enabled: true, Backend: "native", NetworkAccess: false}
+	sb := NewSandboxExecSandbox(cfg, workdir)
+
+	_, args, err := sb.WrapCommand(workdir, "true", nil)
+	if err != nil {
+		t.Fatalf("WrapCommand: %v", err)
+	}
+
+	envSection := extractEnvSection(args)
+	for _, e := range envSection {
+		if strings.HasPrefix(e, "NANO_UNKNOWN_VAR=") {
+			t.Errorf("unknown NANO_ variable must not be forwarded; got %q", e)
+		}
+	}
+}
+
+// extractEnvSection returns the env key=value entries from the wrapped args.
+// WrapCommand returns ("/usr/bin/env", ["-i", "KEY=val", ..., "sandbox-exec", ...]).
+// We extract everything between "-i" and the first "sandbox-exec" entry.
+func extractEnvSection(args []string) []string {
+	var section []string
+	inEnv := false
+	for _, a := range args {
+		if a == "-i" {
+			inEnv = true
+			continue
+		}
+		if a == "sandbox-exec" {
+			break
+		}
+		if inEnv {
+			section = append(section, a)
+		}
+	}
+	return section
+}
+
+// mustHavePrefix asserts that at least one entry in envSection starts with prefix.
+func mustHavePrefix(t *testing.T, envSection []string, prefix string) {
+	t.Helper()
+	for _, e := range envSection {
+		if strings.HasPrefix(e, prefix) {
+			return
+		}
+	}
+	t.Errorf("expected an entry starting with %q in sandbox env; got %v", prefix, envSection)
+}

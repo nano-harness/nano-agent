@@ -85,6 +85,12 @@ func (s *AgentTestSuite) SetupTest() {
 		AutoDetectUserInfo: false,
 	}
 
+	// 将持久化状态文件指向临时目录，避免污染本机 ~/.nano/state.json
+	cfg.Scheduler = &config.SchedulerConfig{
+		Enabled:   true,
+		StateFile: filepath.Join(workDir, "state.json"),
+	}
+
 	// 为避免访问外部网络，将 OSS/MCP/Skills 等高风险集成功能关闭
 	if cfg.OSS != nil {
 		cfg.OSS.Enabled = false

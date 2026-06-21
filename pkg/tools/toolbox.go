@@ -5,15 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
-	"github.com/nano-harness/nano-agent/pkg/logger"
-	"github.com/nano-harness/nano-agent/pkg/middleware"
-
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
+	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/mcp"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/openspec"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
 	"github.com/nano-harness/nano-agent/pkg/toolruntime"
@@ -23,7 +21,10 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/tools/system"
 	"github.com/nano-harness/nano-agent/pkg/tools/web"
 	"github.com/nano-harness/nano-agent/pkg/tools/workspace"
+
 	"github.com/fatih/color"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // ToolboxConfig holds configuration for the toolbox
@@ -448,7 +449,7 @@ func (tb *Toolbox) PrintToolList() {
 
 	// Print tools by category
 	for category, categoryTools := range categories {
-		color.Cyan("\n%s Tools:", strings.Title(string(category))) //nolint:staticcheck
+		color.Cyan("\n%s Tools:", cases.Title(language.English).String(string(category)))
 		for _, tool := range categoryTools {
 			confirmationMark := ""
 			if tool.RequiresConfirmation() {

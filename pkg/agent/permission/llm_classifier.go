@@ -63,8 +63,20 @@ func (c *LLMClassifier) Classify(ctx context.Context, req ClassifyRequest) (*Cla
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	prompt := fmt.Sprintf("%s\n\nClassify this tool invocation:\n\n%s\n\nRespond with JSON only (no markdown fences):",
-		c.SystemPrompt, string(requestJSON))
+	// Build transcript context block when history is available.
+	transcriptBlock := ""
+	if len(req.Transcript) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\n\n<transcript>\n")
+		for _, entry := range req.Transcript {
+			sb.WriteString(fmt.Sprintf("[%s] %s\n", entry.Role, entry.Content))
+		}
+		sb.WriteString("</transcript>")
+		transcriptBlock = sb.String()
+	}
+
+	prompt := fmt.Sprintf("%s\n\nClassify this tool invocation:%s\n\n%s\n\nRespond with JSON only (no markdown fences):",
+		c.SystemPrompt, transcriptBlock, string(requestJSON))
 
 	// Use GenerateContent which returns the text response
 	responseText, err := c.Client.GenerateContent(ctx, prompt)
@@ -114,7 +126,7 @@ func (c *LLMClassifier) Classify(ctx context.Context, req ClassifyRequest) (*Cla
 // Timeout implements the Classifier interface.
 func (c *LLMClassifier) Timeout() time.Duration {
 	if c.Timeout_ <= 0 {
-		return 5 * time.Second
+		return 15 * time.Second
 	}
 	return c.Timeout_
 }

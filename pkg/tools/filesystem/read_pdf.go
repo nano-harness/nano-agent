@@ -82,7 +82,7 @@ func (t *ReadPDFTool) Execute(ctx context.Context, params map[string]interface{}
 		maxChars = int(v)
 	}
 
-	absPath, err := validatePathCommon(t.workingDir, filePath)
+	absPath, err := validatePathCommon(t.workingDir, filePath, t.pathChecker.AllowedPaths())
 	if err != nil {
 		return errResult(fmt.Sprintf("invalid file path: %v", err)), nil
 	}

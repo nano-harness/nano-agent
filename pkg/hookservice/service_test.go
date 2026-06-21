@@ -352,3 +352,58 @@ func TestIsToolEvent(t *testing.T) {
 		t.Fatal("Notification should not be a tool event")
 	}
 }
+
+// TestSanitizeHookEnv verifies that credential-bearing variables are stripped
+// from the environment before hook subprocesses are launched.
+func TestSanitizeHookEnv(t *testing.T) {
+	input := []string{
+		"PATH=/usr/bin:/bin",
+		"HOME=/root",
+		"OPENAI_API_KEY=sk-secret",
+		"NANO_ANTHROPIC_API_KEY=ant-secret",
+		"GITHUB_TOKEN=ghp_secret",
+		"DB_PASSWORD=letmein",
+		"AWS_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE",
+		"MY_CREDENTIALS=top-secret",
+		"MY_PRIVATE_KEY=pem-data",
+		"APP_SECRET=mysecret",
+		"NANO_SESSION_ID=sess-123",
+		"TERM=xterm",
+	}
+
+	result := sanitizeHookEnv(input)
+
+	// Variables that must be preserved.
+	wantPresent := []string{"PATH=/usr/bin:/bin", "HOME=/root", "NANO_SESSION_ID=sess-123", "TERM=xterm"}
+	for _, want := range wantPresent {
+		found := false
+		for _, got := range result {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("sanitizeHookEnv: expected %q to be present", want)
+		}
+	}
+
+	// Variables that must be stripped.
+	wantAbsent := []string{
+		"OPENAI_API_KEY=sk-secret",
+		"NANO_ANTHROPIC_API_KEY=ant-secret",
+		"GITHUB_TOKEN=ghp_secret",
+		"DB_PASSWORD=letmein",
+		"AWS_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE",
+		"MY_CREDENTIALS=top-secret",
+		"MY_PRIVATE_KEY=pem-data",
+		"APP_SECRET=mysecret",
+	}
+	for _, absent := range wantAbsent {
+		for _, got := range result {
+			if got == absent {
+				t.Errorf("sanitizeHookEnv: expected %q to be stripped, but it was present", absent)
+			}
+		}
+	}
+}

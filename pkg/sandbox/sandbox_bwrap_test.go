@@ -163,3 +163,104 @@ func TestBwrap_Strips_Secrets(t *testing.T) {
 		t.Errorf("PATH should be present in sandbox environment")
 	}
 }
+
+// ── A3: bwrap env whitelist unit tests ────────────────────────────────────────
+// These tests inspect the bwrap argument list produced by buildBwrapArgs
+// directly, without requiring bwrap to be installed.
+
+// extractBwrapEnv returns the values set via "--setenv KEY VAL" triples in a
+// bwrap argument list, as "KEY=VAL" strings.
+func extractBwrapEnv(args []string) []string {
+	var result []string
+	for i := 0; i+2 < len(args); i++ {
+		if args[i] == "--setenv" {
+			result = append(result, args[i+1]+"="+args[i+2])
+		}
+	}
+	return result
+}
+
+// TestBwrapBuildArgs_EnvWhitelist_BlocksAPIKeys verifies that credential
+// variables (NANO_*_API_KEY etc.) are NOT forwarded by buildBwrapArgs.
+// A3: the whitelist must be explicit, not prefix-based.
+func TestBwrapBuildArgs_EnvWhitelist_BlocksAPIKeys(t *testing.T) {
+	t.Setenv("NANO_OPENAI_API_KEY", "sk-secret-openai")
+	t.Setenv("NANO_ANTHROPIC_API_KEY", "sk-secret-anthropic")
+	t.Setenv("NANO_DEEPSEEK_API_KEY", "sk-secret-deepseek")
+	t.Setenv("NANO_SESSION_ID", "test-session-123")
+
+	sb := &BwrapSandbox{
+		cfg:        &config.SandboxConfig{Enabled: true, Backend: "native"},
+		workingDir: t.TempDir(),
+		bwrapPath:  "/usr/bin/bwrap",
+	}
+	args := sb.buildBwrapArgs(t.TempDir())
+	envSection := extractBwrapEnv(args)
+
+	for _, blocked := range []string{
+		"NANO_OPENAI_API_KEY",
+		"NANO_ANTHROPIC_API_KEY",
+		"NANO_DEEPSEEK_API_KEY",
+	} {
+		for _, e := range envSection {
+			if strings.HasPrefix(e, blocked+"=") {
+				t.Errorf("credential variable %q must not be forwarded to bwrap sandbox; got %q", blocked, e)
+			}
+		}
+	}
+}
+
+// TestBwrapBuildArgs_EnvWhitelist_AllowsSafeNanoVars verifies that the four
+// explicitly-allowed NANO_* variables are forwarded.
+func TestBwrapBuildArgs_EnvWhitelist_AllowsSafeNanoVars(t *testing.T) {
+	t.Setenv("NANO_SESSION_ID", "sess-abc")
+	t.Setenv("NANO_WORKSPACE", "/workspace/project")
+	t.Setenv("NANO_ORCHESTRATOR_MODE", "1")
+	t.Setenv("NANO_SANDBOX_MODE", "native")
+
+	sb := &BwrapSandbox{
+		cfg:        &config.SandboxConfig{Enabled: true, Backend: "native"},
+		workingDir: t.TempDir(),
+		bwrapPath:  "/usr/bin/bwrap",
+	}
+	args := sb.buildBwrapArgs(t.TempDir())
+	envSection := extractBwrapEnv(args)
+
+	for _, safe := range []string{
+		"NANO_SESSION_ID=sess-abc",
+		"NANO_WORKSPACE=/workspace/project",
+		"NANO_ORCHESTRATOR_MODE=1",
+		"NANO_SANDBOX_MODE=native",
+	} {
+		found := false
+		for _, e := range envSection {
+			if e == safe {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("safe variable %q must be forwarded to bwrap sandbox; env=%v", safe, envSection)
+		}
+	}
+}
+
+// TestBwrapBuildArgs_EnvWhitelist_UnknownNanoVarBlocked verifies that arbitrary
+// NANO_* variables outside the allowlist are not forwarded.
+func TestBwrapBuildArgs_EnvWhitelist_UnknownNanoVarBlocked(t *testing.T) {
+	t.Setenv("NANO_UNKNOWN_VAR", "should-not-appear")
+
+	sb := &BwrapSandbox{
+		cfg:        &config.SandboxConfig{Enabled: true, Backend: "native"},
+		workingDir: t.TempDir(),
+		bwrapPath:  "/usr/bin/bwrap",
+	}
+	args := sb.buildBwrapArgs(t.TempDir())
+	envSection := extractBwrapEnv(args)
+
+	for _, e := range envSection {
+		if strings.HasPrefix(e, "NANO_UNKNOWN_VAR=") {
+			t.Errorf("unknown NANO_* variable must not be forwarded to bwrap sandbox; got %q", e)
+		}
+	}
+}

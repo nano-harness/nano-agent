@@ -38,8 +38,19 @@ const (
 // BuiltinDeniedRelPaths is the hardcoded list of HOME-relative paths that are
 // always denied (read+write) inside the macOS sandbox-exec profile. Operators
 // can extend this list via ExtraDeniedPaths but cannot remove from it.
+//
+// A3: expanded to cover additional well-known credential and session-token paths.
 var BuiltinDeniedRelPaths = []string{
-	".ssh", ".aws", ".gnupg", ".kube", ".config/gh", ".docker/config.json",
+	// Cloud & container credentials
+	".ssh", ".aws", ".gnupg", ".kube", ".docker/config.json",
+	// VCS / package-registry tokens
+	".git-credentials", ".netrc", ".npmrc", ".yarnrc", ".pypirc",
+	// IDE / CLI tokens
+	".config/gh", ".config/git", ".config/gcloud", ".config/op",
+	// Browser session stores
+	".mozilla", ".config/google-chrome", ".config/chromium",
+	// Generic caches (may hold session cookies / OIDC tokens)
+	".cache",
 }
 
 // NetworkPolicy describes whether the sandboxed command receives host network access.
@@ -316,6 +327,16 @@ func (p *PathChecker) IsEnabled() bool {
 	return p.cfg != nil && p.cfg.Enabled
 }
 
+// AllowedPaths returns the list of explicitly allowed paths from the sandbox
+// configuration.  Filesystem tools use this list to permit access to paths
+// that lie outside the working directory.
+func (p *PathChecker) AllowedPaths() []string {
+	if p.cfg == nil {
+		return nil
+	}
+	return p.cfg.AllowedPaths
+}
+
 // expandHome expands ~ to the user's home directory.
 func expandHome(path string) string {
 	if !strings.HasPrefix(path, "~") {
@@ -476,6 +497,43 @@ func (p *PathChecker) Check(path string, op FileOperation) error {
 	return nil
 }
 
+// CheckAndResolve is like Check but also returns the canonical (symlink-resolved)
+// path that was used for the access decision (A8).  Callers that need to open
+// the file after a successful check SHOULD use this resolved path directly
+// rather than the original input, which narrows the TOCTOU window between
+// policy evaluation and file open.
+func (p *PathChecker) CheckAndResolve(path string, op FileOperation) (resolved string, err error) {
+	absPath, err := p.resolve(path)
+	if err != nil {
+		return "", fmt.Errorf("sandbox: invalid path %q: %w", path, err)
+	}
+
+	cleanAbs := filepath.Clean(path)
+	if !filepath.IsAbs(cleanAbs) {
+		if wd, wdErr := os.Getwd(); wdErr == nil {
+			cleanAbs = filepath.Join(wd, cleanAbs)
+		}
+	}
+
+	if err := enforceDefaultBlocklist(absPath, cleanAbs); err != nil {
+		return "", err
+	}
+
+	if p.IsEnabled() {
+		if p.matchesAny(absPath, p.cfg.BlockedPaths) {
+			return "", fmt.Errorf("sandbox: access denied – path %q is blocked", absPath)
+		}
+		if len(p.cfg.AllowedPaths) > 0 && !p.matchesAny(absPath, p.cfg.AllowedPaths) {
+			return "", fmt.Errorf("sandbox: access denied – path %q is not in allowed_paths", absPath)
+		}
+		if op.IsWrite() && p.matchesAny(absPath, p.cfg.ReadOnlyPaths) {
+			return "", fmt.Errorf("sandbox: access denied – path %q is read-only", absPath)
+		}
+	}
+
+	return absPath, nil
+}
+
 // resolve converts a path to a clean absolute path, resolving symlinks to
 // prevent traversal attacks.
 func (p *PathChecker) resolve(path string) (string, error) {
@@ -534,6 +592,9 @@ func (p *PathChecker) matchesAny(path string, patterns []string) bool {
 
 // New returns the appropriate Sandbox implementation for the current platform.
 // When cfg is nil or cfg.Enabled is false a NoopSandbox is returned.
+// If cfg.Enabled is true but the platform or required backend (bwrap, etc.) is
+// not available, New degrades gracefully to a NoopSandbox with a warning.
+// Callers that require strict isolation should use NewOrError instead.
 func New(cfg *config.SandboxConfig, workingDir string) Sandbox {
 	if cfg == nil || !cfg.Enabled {
 		return &NoopSandbox{}
@@ -548,9 +609,38 @@ func New(cfg *config.SandboxConfig, workingDir string) Sandbox {
 	case "darwin":
 		return newSandboxExecSandbox(cfg, workingDir)
 	default:
-		logger.Warnf("sandbox: unsupported platform %q – running without process isolation", runtime.GOOS)
+		logger.Warnf("sandbox: WARNING: sandbox is enabled (Enabled=true) but platform %q does not support process isolation. "+
+			"Shell commands will run WITHOUT sandboxing. Set NANO_SANDBOX_ENABLED=false or sandbox.enabled: false to silence this warning.", runtime.GOOS)
 		return &NoopSandbox{}
 	}
+}
+
+// NewOrError is like New but returns an error when sandbox isolation is
+// explicitly requested (cfg.Enabled==true and backend!="none") yet the
+// platform or required tooling cannot provide it.  Use this instead of New
+// when the caller must fail-closed rather than silently degrading to no
+// isolation.
+func NewOrError(cfg *config.SandboxConfig, workingDir string) (Sandbox, error) {
+	// Reject unknown backends before attempting platform-specific construction.
+	if cfg != nil && cfg.Enabled && !isNoopBackend(cfg.Backend) {
+		backend := strings.ToLower(cfg.Backend)
+		if backend != "native" && backend != "docker" {
+			return nil, fmt.Errorf("sandbox: unknown backend %q (valid: none, native, docker)", cfg.Backend)
+		}
+	}
+
+	sb := New(cfg, workingDir)
+	// If isolation was explicitly requested but New fell back to NoopSandbox,
+	// that means the platform or required tooling cannot provide it — fail-closed.
+	if cfg != nil && cfg.Enabled && !isNoopBackend(cfg.Backend) {
+		if _, isNoop := sb.(*NoopSandbox); isNoop {
+			return nil, fmt.Errorf("sandbox: process isolation was explicitly requested (enabled=true) "+
+				"but no working backend is available on platform %q (backend=%q). "+
+				"Use sandbox.enabled: false or --sandbox=off to run without isolation",
+				runtime.GOOS, cfg.Backend)
+		}
+	}
+	return sb, nil
 }
 
 func isNoopBackend(backend string) bool {

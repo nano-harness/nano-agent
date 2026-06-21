@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/agent"
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/spf13/cobra"
 )
@@ -96,8 +98,16 @@ func TestEmitResultByteParity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read result.json: %v", err)
 	}
-	if !bytes.Equal(stdout.Bytes(), resultJSON) {
-		t.Fatalf("stdout (%d bytes) != result.json (%d bytes)", stdout.Len(), len(resultJSON))
+	// A4 contract: stdout wraps the JSON with leading and trailing newlines for
+	// reliable line-boundary parsing; result.json contains bare JSON (no newlines).
+	stdoutStr := stdout.String()
+	if !strings.HasPrefix(stdoutStr, "\n") || !strings.HasSuffix(stdoutStr, "\n") {
+		t.Fatalf("stdout should be wrapped with newlines, got: %q", stdoutStr)
+	}
+	// The payload between the surrounding newlines must equal result.json.
+	innerPayload := strings.TrimSuffix(strings.TrimPrefix(stdoutStr, "\n"), "\n")
+	if innerPayload != string(resultJSON) {
+		t.Fatalf("stdout inner payload (%d bytes) != result.json (%d bytes)", len(innerPayload), len(resultJSON))
 	}
 	patchBytes, err := os.ReadFile(dir + "/solution.patch")
 	if err != nil {
@@ -105,6 +115,72 @@ func TestEmitResultByteParity(t *testing.T) {
 	}
 	if string(patchBytes) != "diff --git a/f b/f\n" {
 		t.Fatalf("unexpected patch content: %q", patchBytes)
+	}
+	// A5: verify file permissions are 0600.
+	for _, name := range []string{"result.json", "solution.patch"} {
+		info, err := os.Stat(dir + "/" + name)
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s permissions = %04o, want 0600", name, info.Mode().Perm())
+		}
+	}
+}
+
+func TestEmitPanicResultProducesValidJSON(t *testing.T) {
+	dir := t.TempDir()
+	var stdout bytes.Buffer
+	emitPanicResult(&stdout, dir, "something went boom")
+
+	resultJSON, err := os.ReadFile(dir + "/result.json")
+	if err != nil {
+		t.Fatalf("read result.json: %v", err)
+	}
+	var summary binaryResultSummary
+	if err := json.Unmarshal(resultJSON, &summary); err != nil {
+		t.Fatalf("result.json is not valid JSON: %v", err)
+	}
+	if summary.Status != "abandoned" {
+		t.Fatalf("status = %q, want abandoned", summary.Status)
+	}
+	if summary.TerminationCause != "panic" {
+		t.Fatalf("termination_cause = %q, want panic", summary.TerminationCause)
+	}
+	if !strings.Contains(summary.Reason, "something went boom") {
+		t.Fatalf("reason does not contain panic message: %q", summary.Reason)
+	}
+	// stdout must also contain the JSON payload so orchestrators can parse it.
+	if !strings.Contains(stdout.String(), `"status":"abandoned"`) {
+		t.Fatalf("stdout missing abandoned status: %q", stdout.String())
+	}
+}
+
+func TestRecordBinaryPromptCacheKeyPrefersResumeIdentity(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("SYMPHONY_RESUME_IDENTITY", "issue-abc:attempt-2")
+	t.Setenv("NANO_CACHE_KEY", "legacy-key")
+
+	key, err := recordBinaryPromptCacheKey("any prompt")
+	if err != nil {
+		t.Fatalf("recordBinaryPromptCacheKey failed: %v", err)
+	}
+	if key != "issue-abc_attempt-2" {
+		t.Fatalf("cache key = %q, want issue-abc_attempt-2", key)
+	}
+
+	metaPath := filepath.Join(dir, ".cache", "nano", key, "prompt-cache.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read cache meta: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("invalid cache meta JSON: %v", err)
+	}
+	if meta["cache_key"] != "issue-abc:attempt-2" {
+		t.Fatalf("cache_key = %q, want issue-abc:attempt-2", meta["cache_key"])
 	}
 }
 
@@ -288,8 +364,11 @@ func TestBinarySwebenchEmitsResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read result.json: %v", err)
 	}
-	if !bytes.Equal(stdout.Bytes(), resultJSON) {
-		t.Fatalf("stdout (%d bytes) != result.json (%d bytes)", stdout.Len(), len(resultJSON))
+	// A4 contract: stdout wraps JSON with newlines; result.json is bare JSON.
+	stdoutStr := stdout.String()
+	innerPayload := strings.TrimSuffix(strings.TrimPrefix(stdoutStr, "\n"), "\n")
+	if innerPayload != string(resultJSON) {
+		t.Fatalf("stdout inner payload (%d bytes) != result.json (%d bytes)", len(innerPayload), len(resultJSON))
 	}
 	// trajectory.json optional (may be empty if agent never ran any step),
 	// but if the file exists, it must be valid JSON.
@@ -327,3 +406,52 @@ func TestBinarySwebenchUsesEmitResult(t *testing.T) {
 		t.Fatal("swebench not found in binary command tree")
 	}
 }
+
+// TestValidateSandboxRequirement_Auto verifies that auto/off modes never fail.
+func TestValidateSandboxRequirement_Auto(t *testing.T) {
+	for _, mode := range []string{"auto", "off", "", "AUTO", "OFF"} {
+		if err := validateSandboxRequirement(mode, nil, t.TempDir()); err != nil {
+			t.Errorf("mode %q: unexpected error: %v", mode, err)
+		}
+	}
+}
+
+// ── S3: validateSandboxRequirement fail-closed on --sandbox=on ────────────────
+
+// TestValidateSandboxRequirement_OnFailsClosedWhenUnavailable verifies that
+// --sandbox=on (mode="on") returns an error when no working sandbox backend is
+// available, rather than silently falling back to no isolation (fail-closed).
+// On non-Darwin Linux the native backend requires bwrap; in the test environment
+// where bwrap is absent, New() falls back to NoopSandbox and NewOrError should
+// return an error.  We simulate this by passing a SandboxConfig with an
+// explicitly unknown backend that can never succeed.
+func TestValidateSandboxRequirement_OnFailsClosedWhenUnavailable(t *testing.T) {
+	// Use a backend name that will never be available so NewOrError returns an error.
+	cfg := &config.SandboxConfig{
+		Enabled: true,
+		Backend: "nonexistent-backend-xyz",
+	}
+	err := validateSandboxRequirement("on", cfg, t.TempDir())
+	if err == nil {
+		t.Error("expected error when sandbox=on but backend is unavailable; got nil")
+	}
+	if !strings.Contains(err.Error(), "--sandbox=on") {
+		t.Errorf("error message should mention --sandbox=on; got: %v", err)
+	}
+}
+
+// TestValidateSandboxRequirement_OnPassesWhenBackendNone verifies that
+// --sandbox=on with backend=none (explicit noop) does NOT error, because the
+// caller explicitly opted into no isolation by naming the none backend.
+func TestValidateSandboxRequirement_OnPassesWhenBackendNone(t *testing.T) {
+	cfg := &config.SandboxConfig{
+		Enabled: true,
+		Backend: "none",
+	}
+	err := validateSandboxRequirement("on", cfg, t.TempDir())
+	if err != nil {
+		t.Errorf("backend=none should not fail sandbox requirement check; got: %v", err)
+	}
+}
+
+

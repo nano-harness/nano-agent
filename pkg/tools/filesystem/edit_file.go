@@ -525,7 +525,7 @@ func (t *EditTool) executeInsert(path string, params map[string]interface{}) (*i
 }
 
 func (t *EditTool) validatePath(path string) (string, error) {
-	return validatePathCommon(t.workingDir, path)
+	return validatePathCommon(t.workingDir, path, t.pathChecker.AllowedPaths())
 }
 
 func (t *EditTool) performReplacement(content, oldString, newString string, expectedReplacements int, isNewFile bool) (*replacementResult, error) {

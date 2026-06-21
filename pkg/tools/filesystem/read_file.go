@@ -531,7 +531,7 @@ func (t *ReadFileTool) shouldUseCodeSkeleton(content, filePath string, params ma
 }
 
 func (t *ReadFileTool) validatePath(path string) (string, error) {
-	return validatePathCommon(t.workingDir, path)
+	return validatePathCommon(t.workingDir, path, t.pathChecker.AllowedPaths())
 }
 
 // wrapFileContentForLLM wraps file content with isolation tags

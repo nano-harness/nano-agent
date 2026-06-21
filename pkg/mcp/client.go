@@ -643,7 +643,9 @@ func (c *MCPClient) GetAllTools() map[string][]MCPToolInfo {
 				// Handle the case where InputSchema is of type any
 				// Try to marshal and unmarshal to convert to map
 				if schemaBytes, err := json.Marshal(tool.InputSchema); err == nil {
-					json.Unmarshal(schemaBytes, &inputSchema) //nolint:errcheck
+					if err := json.Unmarshal(schemaBytes, &inputSchema); err != nil {
+						logger.Warnf("failed to unmarshal input schema for tool %s: %v", tool.Name, err)
+					}
 				}
 			}
 

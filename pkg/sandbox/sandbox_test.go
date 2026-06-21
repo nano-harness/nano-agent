@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -110,6 +111,145 @@ func TestPathChecker_RelativePath(t *testing.T) {
 	// Relative paths should be resolved (most will be outside /tmp).
 	// We just verify the call doesn't panic.
 	_ = pc.Check("relative/path", OpRead)
+}
+
+// ── A8: PathChecker.CheckAndResolve ──────────────────────────────────────────
+// CheckAndResolve narrows the TOCTOU window by returning the already-resolved
+// (symlink-evaluated) canonical path that was used for the policy check so
+// callers can open that path directly.
+
+// TestCheckAndResolve_AllowedPathReturnsResolved verifies that CheckAndResolve
+// returns the symlink-resolved absolute path on a successful (allowed) check.
+func TestCheckAndResolve_AllowedPathReturnsResolved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink resolution uses Unix paths; skipping on Windows")
+	}
+	c := cfg(true)
+	tmp := t.TempDir()
+	c.AllowedPaths = []string{tmp}
+	pc := NewPathChecker(c)
+
+	target := tmp + "/file.txt"
+	if err := os.WriteFile(target, []byte("data"), 0o600); err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+
+	resolved, err := pc.CheckAndResolve(target, OpRead)
+	if err != nil {
+		t.Fatalf("CheckAndResolve: unexpected error: %v", err)
+	}
+	if resolved == "" {
+		t.Fatal("CheckAndResolve returned empty resolved path")
+	}
+	// The resolved path must be absolute and contain the filename.
+	if !strings.Contains(resolved, "file.txt") {
+		t.Errorf("resolved path %q does not contain filename", resolved)
+	}
+}
+
+// TestCheckAndResolve_SymlinkResolved verifies that CheckAndResolve resolves
+// symlinks and uses the canonical target for the policy decision.
+func TestCheckAndResolve_SymlinkResolved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks require privilege on Windows; skipping")
+	}
+	tmp := t.TempDir()
+	c := cfg(true)
+	c.AllowedPaths = []string{tmp}
+	pc := NewPathChecker(c)
+
+	// Create a real file and a symlink pointing to it.
+	realFile := tmp + "/real.txt"
+	if err := os.WriteFile(realFile, []byte("data"), 0o600); err != nil {
+		t.Fatalf("create real file: %v", err)
+	}
+	link := tmp + "/link.txt"
+	if err := os.Symlink(realFile, link); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	resolved, err := pc.CheckAndResolve(link, OpRead)
+	if err != nil {
+		t.Fatalf("CheckAndResolve on symlink: unexpected error: %v", err)
+	}
+	// The resolved path should point to the real file, not the symlink.
+	if resolved == link {
+		t.Error("CheckAndResolve should resolve symlinks; got the symlink path unchanged")
+	}
+	if !strings.Contains(resolved, "real.txt") {
+		t.Errorf("resolved path %q should reference real.txt", resolved)
+	}
+}
+
+// TestCheckAndResolve_BlockedPathReturnsError verifies that CheckAndResolve
+// propagates a policy denial as an error (same behaviour as Check).
+func TestCheckAndResolve_BlockedPathReturnsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("default blocked paths use Unix-style paths; skipping on Windows")
+	}
+	c := cfg(true)
+	c.BlockedPaths = []string{"/etc"}
+	pc := NewPathChecker(c)
+
+	resolved, err := pc.CheckAndResolve("/etc/hosts", OpRead)
+	if err == nil {
+		t.Fatalf("CheckAndResolve on blocked path must return error; got resolved=%q", resolved)
+	}
+	if resolved != "" {
+		t.Errorf("on error resolved path must be empty; got %q", resolved)
+	}
+}
+
+// TestCheckAndResolve_DefaultBlocklistEnforced verifies that the hardcoded
+// default blocklist (/etc/passwd, /etc/shadow, /etc/master.passwd) is enforced
+// by CheckAndResolve even when the sandbox config has no explicit BlockedPaths.
+func TestCheckAndResolve_DefaultBlocklistEnforced(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("default blocked paths use Unix-style paths; skipping on Windows")
+	}
+	pc := NewPathChecker(cfg(false)) // sandbox disabled — default blocklist still applies
+
+	for _, p := range []string{"/etc/passwd", "/etc/shadow"} {
+		if resolved, err := pc.CheckAndResolve(p, OpRead); err == nil {
+			t.Errorf("CheckAndResolve(%q) should be blocked by default blocklist; got resolved=%q", p, resolved)
+		}
+	}
+}
+
+// TestCheckAndResolve_ReadOnlyPathBlocksWrite verifies that a path in
+// ReadOnlyPaths is allowed for reads but denied for writes.
+func TestCheckAndResolve_ReadOnlyPathBlocksWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix paths; skipping on Windows")
+	}
+	tmp := t.TempDir()
+	c := cfg(true)
+	c.AllowedPaths = []string{tmp}
+	c.ReadOnlyPaths = []string{tmp + "/ro"}
+	pc := NewPathChecker(c)
+
+	roDir := tmp + "/ro"
+	if err := os.MkdirAll(roDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := roDir + "/file.txt"
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+
+	// Read must succeed and return the resolved path.
+	resolved, err := pc.CheckAndResolve(target, OpRead)
+	if err != nil {
+		t.Fatalf("read on read-only path should be allowed: %v", err)
+	}
+	if resolved == "" {
+		t.Fatal("resolved path must not be empty on success")
+	}
+
+	// Write must be denied.
+	if _, err := pc.CheckAndResolve(target, OpWrite); err == nil {
+		t.Error("write on read-only path must be denied")
+	}
 }
 
 // ── NoopSandbox ───────────────────────────────────────────────────────────────

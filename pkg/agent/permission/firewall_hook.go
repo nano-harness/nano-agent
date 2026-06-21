@@ -77,9 +77,12 @@ func (h *FirewallHook) Execute(ctx context.Context, event hookservice.Event, too
 		}, nil
 	}
 
-	// Check if command is in override list
+	// Check if command is in override list.
+	// A9: normalize both sides before comparing so that differences in whitespace
+	// or flag ordering don't silently invalidate override entries.
+	normalizedCmd := normalizeCommandForOverride(command)
 	for _, override := range h.config.Overrides {
-		if override == command {
+		if normalizeCommandForOverride(override) == normalizedCmd {
 			logger.Infof("Command allowed by firewall override: %s", command)
 			return &hookservice.Decision{
 				Action: hookservice.ActionAllow,
@@ -163,4 +166,12 @@ func (h *FirewallHook) checkCommandAgainstRules(command string) (*DangerousComma
 	}
 
 	return nil, false
+}
+
+// normalizeCommandForOverride normalizes a command string for override comparisons
+// by trimming surrounding whitespace and collapsing internal runs of whitespace
+// to a single space.  This ensures that override entries written with varying
+// indentation or spacing still match the command string as received (A9).
+func normalizeCommandForOverride(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }

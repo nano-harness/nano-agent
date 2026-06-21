@@ -3,8 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadConfig_DefaultBehavior(t *testing.T) {
@@ -169,32 +172,28 @@ func TestLoadConfig_EnvInterpolationMissingVar(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_SymphonyProfileInjection(t *testing.T) {
+func TestLoadConfig_OrchestratorProfileAutoActivate(t *testing.T) {
 	tempDir := t.TempDir()
 	originalDir, _ := os.Getwd()
 	defer func() { _ = os.Chdir(originalDir) }()
 	_ = os.Chdir(tempDir)
-	t.Setenv("SYMPHONY_MCP_URL", "http://127.0.0.1:3456/mcp")
-	t.Setenv("SYMPHONY_TOKEN", "secret-token")
+	t.Setenv("NANO_ORCHESTRATOR_PROFILE", "nano-symphony, custom-skill ,nano-symphony")
 
 	cfg, err := LoadConfig("")
 	if err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
-	if !cfg.EnableMCP || len(cfg.MCP.Servers) == 0 {
-		t.Fatalf("expected MCP server injection: %#v", cfg.MCP)
+	if cfg.Skills == nil || !cfg.Skills.Enabled {
+		t.Fatalf("expected skills to be enabled")
 	}
-	if cfg.MCP.Servers[0].Name != "symphony" || cfg.MCP.Servers[0].Transport != "streamable" {
-		t.Fatalf("unexpected server: %#v", cfg.MCP.Servers[0])
+	want := []string{"nano-symphony", "custom-skill"}
+	if len(cfg.Skills.AutoActivate) != len(want) {
+		t.Fatalf("expected auto_activate %v, got %v", want, cfg.Skills.AutoActivate)
 	}
-	found := false
-	for _, name := range cfg.Skills.AutoActivate {
-		if name == "nano-symphony" {
-			found = true
+	for i, name := range want {
+		if cfg.Skills.AutoActivate[i] != name {
+			t.Fatalf("expected auto_activate %v, got %v", want, cfg.Skills.AutoActivate)
 		}
-	}
-	if !found {
-		t.Fatalf("expected nano-symphony auto activation: %#v", cfg.Skills.AutoActivate)
 	}
 }
 
@@ -470,5 +469,64 @@ func TestOverrideImageProviderFromEnv_NoOp(t *testing.T) {
 	}
 	if cfg.Providers[0].Model != "model" {
 		t.Errorf("Expected Model to remain 'model', got %q", cfg.Providers[0].Model)
+	}
+}
+
+func TestLoadConfig_NanoAPIKeyEnvWins(t *testing.T) {
+	t.Setenv("NANO_API_KEY", "sk-from-nano")
+	t.Setenv("API_KEY", "")
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.APIKey != "sk-from-nano" {
+		t.Errorf("Expected APIKey 'sk-from-nano', got %q", cfg.APIKey)
+	}
+}
+
+func TestLoadConfig_FallbackToBareAPIKey(t *testing.T) {
+	t.Setenv("NANO_API_KEY", "")
+	t.Setenv("API_KEY", "sk-from-bare")
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.APIKey != "sk-from-bare" {
+		t.Errorf("Expected APIKey 'sk-from-bare', got %q", cfg.APIKey)
+	}
+}
+
+func TestLoadConfig_NanoPrecedesBare(t *testing.T) {
+	t.Setenv("NANO_API_KEY", "sk-nano")
+	t.Setenv("API_KEY", "sk-bare")
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.APIKey != "sk-nano" {
+		t.Errorf("Expected APIKey 'sk-nano', got %q", cfg.APIKey)
+	}
+}
+
+func TestHooksConfig_MarshalRoundtrip(t *testing.T) {
+	in := HooksConfig{
+		Ralph: RalphLoopConfig{Enabled: true, MaxIterations: 3, HardMaxIterations: 10},
+		Events: map[string][]HookCommand{
+			"SessionStart": {{Matcher: "*", Command: "echo hi", Timeout: 5, Id: "x"}},
+		},
+	}
+	data, err := yaml.Marshal(in)
+	if err != nil {
+		t.Fatalf("yaml.Marshal failed: %v", err)
+	}
+	var out HooksConfig
+	if err := yaml.Unmarshal(data, &out); err != nil {
+		t.Fatalf("yaml.Unmarshal failed: %v", err)
+	}
+	if !reflect.DeepEqual(in.Ralph, out.Ralph) {
+		t.Errorf("Ralph mismatch: expected %+v, got %+v", in.Ralph, out.Ralph)
+	}
+	if !reflect.DeepEqual(in.Events, out.Events) {
+		t.Errorf("Events mismatch: expected %+v, got %+v", in.Events, out.Events)
 	}
 }

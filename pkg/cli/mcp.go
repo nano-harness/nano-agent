@@ -14,7 +14,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	yaml3 "gopkg.in/yaml.v3"
 )
 
 // NewMCPCommand creates a new MCP management command with enhanced functionality
@@ -980,7 +980,7 @@ Examples:
 			cfg.MCP.Servers = append(cfg.MCP.Servers, server)
 
 			// Persist config
-			if err := persistConfig(cfg, configFile); err != nil {
+			if err := persistMCPOnly(configFile, cfg.MCP); err != nil {
 				return fmt.Errorf("save config: %w", err)
 			}
 			fmt.Printf("Added MCP server %q (%s)\n", name, transport)
@@ -1140,7 +1140,7 @@ Examples:
 					}
 				}
 				if updated {
-					if err := persistConfig(cfg, configFile); err != nil {
+					if err := persistMCPOnly(configFile, cfg.MCP); err != nil {
 						fmt.Printf("Warning: failed to save OAuth config to server settings: %v\n", err)
 					} else {
 						fmt.Printf("OAuth configuration saved to server %q settings.\n", serverName)
@@ -1164,7 +1164,10 @@ Examples:
 
 // persistConfig writes the config back to disk (best-effort YAML).
 // Falls back to printing a warning when the config file path is unavailable.
-func persistConfig(cfg *config.Config, configFile string) error {
+// persistMCPOnly updates only the top-level `mcp:` block in configFile,
+// leaving all other keys (including those outside the Config struct,
+// comments, ordering) untouched. Use for surgical mcp add/auth mutations.
+func persistMCPOnly(configFile string, mcpCfg *config.MCPConfig) error {
 	if configFile == "" {
 		home, _ := os.UserHomeDir()
 		configFile = filepath.Join(home, ".nano", "config.yaml")
@@ -1172,11 +1175,45 @@ func persistConfig(cfg *config.Config, configFile string) error {
 	if err := os.MkdirAll(filepath.Dir(configFile), 0o755); err != nil {
 		return err
 	}
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		return err
+	var doc yaml3.Node
+	if data, err := os.ReadFile(configFile); err == nil && len(data) > 0 {
+		if err := yaml3.Unmarshal(data, &doc); err != nil {
+			return fmt.Errorf("parse existing config: %w", err)
+		}
 	}
-	return os.WriteFile(configFile, data, 0o644)
+	if doc.Kind == 0 {
+		doc = yaml3.Node{Kind: yaml3.DocumentNode, Content: []*yaml3.Node{{Kind: yaml3.MappingNode}}}
+	}
+	root := &doc
+	if doc.Kind == yaml3.DocumentNode {
+		if len(doc.Content) == 0 || doc.Content[0].Kind != yaml3.MappingNode {
+			doc.Content = []*yaml3.Node{{Kind: yaml3.MappingNode}}
+		}
+		root = doc.Content[0]
+	}
+	var mcpNode yaml3.Node
+	if err := mcpNode.Encode(mcpCfg); err != nil {
+		return fmt.Errorf("encode mcp: %w", err)
+	}
+	replaced := false
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "mcp" {
+			root.Content[i+1] = &mcpNode
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		root.Content = append(root.Content,
+			&yaml3.Node{Kind: yaml3.ScalarNode, Value: "mcp"},
+			&mcpNode,
+		)
+	}
+	out, err := yaml3.Marshal(&doc)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	return os.WriteFile(configFile, out, 0o600)
 }
 
 // emitAuthSuccessNotification fires the HookNotification with subtype "auth_success"

@@ -65,6 +65,8 @@ var modelCapabilitiesRegistry = map[string]modelCapabilityEntry{ //nolint:gochec
 	"deepseek-chat":          {"deepseek", "DeepSeek Chat", chatCapabilities(capLongContext)},
 	"deepseek-r1":            {"deepseek", "DeepSeek R1", chatCapabilities(capReasoning)},
 	"deepseek-v3.2":          {"deepseek", "DeepSeek V3.2", chatCapabilities(capLongContext)},
+	"deepseek-v4-flash":      {"deepseek", "DeepSeek V4 Flash", chatCapabilities(capReasoning, capLongContext)},
+	"deepseek-v4-pro":        {"deepseek", "DeepSeek V4 Pro", chatCapabilities(capReasoning, capLongContext)},
 	"kimi-k2":                {"moonshot", "Kimi K2", chatCapabilities(capLongContext)},
 	"kimi-k2-0905":           {"moonshot", "Kimi K2 0905", chatCapabilities(capLongContext)},
 	"kimi-k2.5":              {"moonshot", "Kimi K2.5", chatCapabilities(capLongContext)},
@@ -98,9 +100,9 @@ var providerPresetDefinitions = []struct { //nolint:gochecknoglobals
 	{"openai", "OpenAI", defaultOpenAIBaseURL, "OPENAI_API_KEY", []string{"gpt-5.4", "gpt-5", "gpt-4.1", "gpt-4o", "o3", "o4-mini", "text-embedding-3-small", "text-embedding-3-large"}},
 	{"anthropic", "Anthropic", "https://api.anthropic.com", "ANTHROPIC_API_KEY", []string{"claude-opus-4.6", "claude-sonnet-4.6", "claude-sonnet-4.5", "claude-haiku-4.5"}},
 	{"moonshot", "Moonshot / Kimi", "https://api.moonshot.cn/v1", "MOONSHOT_API_KEY", []string{"kimi-k2.5", "kimi-k2-0905", "kimi-k2"}},
-	{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", []string{"deepseek-chat", "deepseek-v3.2", "deepseek-r1"}},
+	{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", []string{"deepseek-chat", "deepseek-v3.2", "deepseek-r1", "deepseek-v4-flash", "deepseek-v4-pro"}},
 	{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY", []string{"gemini-2.5-pro", "gemini-2.5-flash"}},
-	{"ollama", "Ollama", "http://localhost:11434/v1", "", []string{"llama-3.1-8b-instruct", "nomic-embed-text", "qwen3-embedding", "mxbai-embed-large"}},
+	{"ollama", "Ollama", "http://127.0.0.1:11434/v1", "", []string{"llama-3.1-8b-instruct", "nomic-embed-text", "qwen3-embedding", "mxbai-embed-large"}},
 	{"openai-compatible", "OpenAI Compatible", "", "", nil},
 }
 

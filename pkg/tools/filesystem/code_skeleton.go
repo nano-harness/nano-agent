@@ -878,5 +878,5 @@ func (t *CodeSkeletonTool) getElementIcon(elementType string) string {
 }
 
 func (t *CodeSkeletonTool) validatePath(path string) (string, error) {
-	return validatePathCommon(t.workingDir, path)
+	return validatePathCommon(t.workingDir, path, nil)
 }

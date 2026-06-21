@@ -21,25 +21,17 @@ Use daemon mode when the orchestrator needs a long-lived process, shared session
 
 ## Structured result contract
 
-By default, binary commands emit normal human/patch output and then append one machine-readable sentinel line:
+Binary commands emit normal human/patch output and then append one machine-readable JSON line to stdout:
 
 ```text
-<<<NANO_RESULT>>>{"status":"success","tool_calls":12,"duration_ms":45000,"tokens":{"input":3200,"output":850}}
+{"status":"success","tool_calls":12,"duration_ms":45000,"tokens":{"input":3200,"output":850}}
 ```
 
-When a goal is active, the sentinel includes `goal_state` with the current
+When a goal is active, the JSON includes `goal_state` with the current
 condition, evaluation counters, token spend, max turns, last judge reason, and
 `achieved_at` when the judge marks the goal complete. If the goal reaches
 `max_turns` without being achieved, binary mode reports `status=needs_retry`
 so orchestrators can decide whether to retry or abandon.
-
-Set `NANO_BINARY_RESULT_FORMAT` to control this behavior:
-
-| Value | Behavior |
-|---|---|
-| `both` or empty | normal output plus `<<<NANO_RESULT>>>` JSON sentinel |
-| `json` | JSON summary only |
-| `plain`, `none`, `off` | suppress structured summary |
 
 Status values are `success`, `needs_retry`, `abandoned`, and `timeout`.
 
@@ -65,13 +57,26 @@ Exit codes:
 | 30 | timeout |
 | 1 | unclassified failure |
 
-Recommended orchestrator precedence is: explicit MCP completion event if present, stdout sentinel, then exit code.
+Recommended orchestrator precedence is: explicit MCP completion event if present, stdout JSON line, then exit code.
 
 ## MCP and skill registration
 
-When `SYMPHONY_MCP_URL` and `SYMPHONY_TOKEN` are present, nano-agent applies the built-in nano-symphony orchestrator profile. The profile enables MCP, injects a `symphony` streamable MCP server with `X-Symphony-Token`, enables skills, and auto-activates the embedded `nano-symphony` skill.
+`nano-agent` does not embed any orchestrator-specific MCP server profile or skill. Orchestrators can register their own MCP server via `--mcp-config` or by providing a config file, and can request skill auto-activation through `NANO_ORCHESTRATOR_PROFILE`.
 
-Manual configuration remains supported:
+### `NANO_ORCHESTRATOR_PROFILE`
+
+Set this environment variable to a comma-separated list of skill names. At
+config load time each skill is added to `skills.auto_activate` and skills
+support is enabled:
+
+```bash
+NANO_ORCHESTRATOR_PROFILE="nano-symphony" nano binary exec --output-dir ./out "your prompt"
+```
+
+This replaces the previous hard-coded "symphony" orchestrator profile; all MCP
+server configuration is now supplied by the orchestrator or user config.
+
+### Manual MCP configuration
 
 ```yaml
 mcp:
@@ -84,6 +89,19 @@ mcp:
 ```
 
 The legacy MCP transport name `http` is accepted as a deprecated alias for `streamable`. `sse` and `websocket` remain unsupported.
+
+### Tool permissions
+
+When MCP tools are registered, local tool names follow the convention
+`mcp_<server>_<tool>`. Allow/deny patterns must use this form:
+
+```bash
+nano binary exec \
+  --mcp-config ./symphony.mcp.json \
+  --allowedTools 'mcp_symphony_*' \
+  --allowedTools 'ReadFile' \
+  --output-dir ./out "prompt"
+```
 
 ## Environment variable interpolation
 
@@ -101,21 +119,11 @@ For retry-heavy orchestrators, set `NANO_CACHE_KEY` or `SYMPHONY_ISSUE_ID`. Bina
 --sandbox=auto|on|off
 ```
 
-`auto` is the default. It enables sandboxing when an embedded environment is detected, such as `SYMPHONY_WORKSPACE`, `SYMPHONY_MCP_URL`, or `NANO_ORCHESTRATOR_PROFILE`. In embedded mode, writes are restricted to the current project path plus runtime cache/temp exceptions. Use `--sandbox=off` for legacy behavior or config-level sandbox paths for additional allowlists.
-
-## Exit hooks
-
-Use `--on-exit-cmd` or `NANO_ON_EXIT` to run a shell hook after binary execution:
-
-```bash
-nano binary exec --on-exit-cmd 'curl -X POST "$SYMPHONY_MCP_URL/session_completed" -d "$NANO_RESULT_JSON"' < prompt.txt
-```
-
-The hook receives `NANO_RESULT_JSON`, `NANO_RESULT_STATUS`, and `NANO_RESULT_EXIT_CODE` in its environment. Hook failures are logged and do not replace the agent result.
+`auto` is the default. It enables sandboxing when an orchestrator-spawned environment is detected, such as `SYMPHONY_WORKSPACE`, `SYMPHONY_MCP_URL`, or `NANO_ORCHESTRATOR_PROFILE`. In orchestrator-spawned mode, writes are restricted to the current project path plus runtime cache/temp exceptions. Use `--sandbox=off` for legacy behavior or config-level sandbox paths for additional allowlists.
 
 ## Troubleshooting
 
 - Missing `${env:VAR}` values cause config load failure; set the variable or remove the interpolation.
 - If a legacy MCP config uses `http`, update it to `streamable` to silence the deprecation warning.
 - If embedded writes are denied, verify the workspace path and sandbox allowlists, or temporarily run with `--sandbox=off` while debugging.
-- If the sentinel is absent, check `NANO_BINARY_RESULT_FORMAT` and fall back to the process exit code.
+- If the JSON line is absent, check process logs and fall back to the process exit code.

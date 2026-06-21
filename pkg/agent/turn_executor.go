@@ -408,6 +408,12 @@ func (e *turnExecutor) executeTools(ctx context.Context, toolsToExecute []ToolTo
 	if len(toolsToExecute) == 0 {
 		return make(map[string]*interfaces.ToolResult)
 	}
+	// Update the permission manager's transcript snapshot with the current
+	// conversation history so the classifier has up-to-date context for
+	// multi-turn threat detection (prompt injection chains, privilege escalation).
+	if t.ToolScheduler != nil {
+		t.ToolScheduler.SetMessages(t.Messages)
+	}
 	remainingTools, toolResults := e.handleTaskDoneTools(toolsToExecute)
 	if len(remainingTools) == 0 {
 		return toolResults

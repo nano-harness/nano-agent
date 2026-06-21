@@ -491,7 +491,7 @@ func (t *OSSManagerTool) uploadImageURL(ctx context.Context, ossKey, imageURL st
 			LLMContent:  fmt.Sprintf("oss_manager upload failed: download error: %v", err),
 		}, nil
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &interfaces.ToolResult{

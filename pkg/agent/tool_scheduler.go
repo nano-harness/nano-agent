@@ -13,6 +13,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
+	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
@@ -165,6 +166,18 @@ func (ts *ToolScheduler) SetPermissionManager(mgr *permission.Manager) {
 	ts.mutex.Lock()
 	defer ts.mutex.Unlock()
 	ts.permissionManager = mgr
+}
+
+// SetMessages updates the permission manager's transcript snapshot with the
+// current conversation history.  Call this before dispatching each batch of
+// tool calls so the classifier has up-to-date context.
+func (ts *ToolScheduler) SetMessages(messages []llm.Message) {
+	ts.mutex.RLock()
+	pm := ts.permissionManager
+	ts.mutex.RUnlock()
+	if pm != nil {
+		pm.SetTranscript(messages)
+	}
 }
 
 // SetAgentConfig sets the agent config used to check daemon confirm policy.
@@ -1141,9 +1154,40 @@ func (ts *ToolScheduler) Schedule(ctx context.Context, calls []ToolToExecute) er
 							continue
 						}
 					default:
-						// Unknown policy: fail-safe to allow (backward compatibility)
-						logger.Warnf("Unknown daemon confirm policy %s, defaulting to allow", cfg.Daemon.ConfirmPolicy)
-						ts.setStatus(tool.ID, StatusScheduled, nil, nil)
+						// Unknown or unset policy: fail-closed — block tools that require
+						// confirmation. Use daemon.confirm_policy: allow (or env
+						// NANO_DAEMON_CONFIRM_POLICY=allow) to opt in to auto-approve.
+						logger.Warnf("Daemon confirm policy %q unset or unknown; blocking tool %s (fail-closed)", cfg.Daemon.ConfirmPolicy, tool.Name)
+						tr := &interfaces.ToolResult{
+							Success:     false,
+							Error:       "tool requires user confirmation but confirm_policy is unset",
+							Metadata:    map[string]interface{}{"code": "blocked_by_policy", "tool_name": tool.Name},
+							LLMContent:  "BLOCKED_BY_POLICY\nlayer: fallback_confirm\nreason: confirm_policy is unset\nsuggested_next: set daemon.confirm_policy: allow or use --dangerously-skip-permissions to opt in to auto-approve",
+							UserContent: fmt.Sprintf("BLOCKED_BY_POLICY\n工具 '%s' 需要确认但 confirm_policy 未设置，已拒绝。", tool.Name),
+						}
+						if ts.eventHandler != nil {
+							ts.eventHandler(event.StreamEvent{
+								Type: event.EventTypeToolResult,
+								ToolResult: &tools.ToolResult{
+									ID:      toolCall.ID,
+									Content: tr.LLMContent,
+									Error:   tr.Error,
+								},
+							})
+							ts.eventHandler(event.StreamEvent{
+								Type:   event.EventTypeToolUse,
+								Source: "agent_turn",
+								ToolUse: &event.ToolUse{
+									ID:         toolCall.ID,
+									ToolName:   toolCall.Name,
+									Parameters: toolCall.Parameters,
+									Status:     string(StatusError),
+									Result:     tr.UserContent,
+								},
+							})
+						}
+						ts.setStatus(tool.ID, StatusError, tr, fmt.Errorf("confirm_policy unset, blocked by fail-closed default"))
+						continue
 					}
 				} else {
 					// No daemon config: fail-closed — block tools that require

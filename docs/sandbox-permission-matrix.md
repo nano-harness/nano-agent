@@ -35,7 +35,7 @@
 | linux    | `auto`      | `default`          | sandbox only if embedded*; prompts for dangerous tools         | ✅ pass |
 | linux    | `auto`      | `yolo`             | sandbox only if embedded*; all tools auto-approved             | ✅ pass |
 
-*"embedded" = `SYMPHONY_WORKSPACE`, `SYMPHONY_MCP_URL`, or `NANO_ORCHESTRATOR_PROFILE` env set.
+*"embedded" (orchestrator-spawned) = `SYMPHONY_WORKSPACE`, `SYMPHONY_MCP_URL`, or `NANO_ORCHESTRATOR_PROFILE` env set.
 
 ---
 

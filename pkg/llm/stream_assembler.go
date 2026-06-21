@@ -85,7 +85,9 @@ func (a *StreamAssembler) FinalizeToolCalls(toolRequiresParameters func(string) 
 			continue
 		}
 
-		toolCall := tools.ToolCall{ID: builder.ID, Name: builder.Name}
+		// Map the API-safe name back to the original canonical tool name.
+		originalName := ResolveToolName(builder.Name)
+		toolCall := tools.ToolCall{ID: builder.ID, Name: originalName}
 		var args map[string]interface{}
 		argumentsStr := builder.Arguments.String()
 		logger.Debugf("Raw arguments for tool %s: %s", toolCall.Name, argumentsStr)

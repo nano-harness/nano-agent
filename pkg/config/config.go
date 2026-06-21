@@ -195,6 +195,13 @@ type SandboxConfig struct {
 	// "command" uses one-shot docker run --rm, "task" and "session" execute
 	// commands through a named persistent container keyed by sandbox metadata.
 	DockerLifecycle string `mapstructure:"docker_lifecycle" yaml:"docker_lifecycle"`
+
+	// NetworkAllowlist is a reserved placeholder for future per-host/port
+	// network filtering.  When non-empty, only the listed hostnames or
+	// "host:port" pairs will be permitted; all other network traffic will be
+	// denied even when NetworkAccess is true.
+	// TODO: implement allow-list enforcement in the bwrap and sandbox-exec backends.
+	NetworkAllowlist []string `mapstructure:"network_allowlist" yaml:"network_allowlist,omitempty"`
 }
 
 // HookCommand is a single command hook definition.
@@ -265,6 +272,21 @@ func (h *HooksConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		h.Events[key] = cmds
 	}
 	return nil
+}
+
+// MarshalYAML emits hooks in the same flat-event shape that UnmarshalYAML
+// reads back. Without this, default struct serialization produces
+// `{ralph, events}` nested layout that HooksConfig can't itself parse,
+// so any yaml.Marshal(*Config) writeback would be unloadable.
+func (h HooksConfig) MarshalYAML() (interface{}, error) {
+	out := make(map[string]interface{}, len(h.Events)+1)
+	if h.Ralph.Enabled || h.Ralph.MaxIterations != 0 || h.Ralph.HardMaxIterations != 0 {
+		out["ralph"] = h.Ralph
+	}
+	for ev, cmds := range h.Events {
+		out[ev] = cmds
+	}
+	return out, nil
 }
 
 // SecurityConfig configures the CommandGuard four-layer security system.
@@ -968,6 +990,10 @@ type MCPConfig struct {
 	EnableHealthCheck   bool              `mapstructure:"enable_health_check" yaml:"enable_health_check"`
 	HealthCheckInterval time.Duration     `mapstructure:"health_check_interval" yaml:"health_check_interval"`
 	HealthCheckTimeout  time.Duration     `mapstructure:"health_check_timeout" yaml:"health_check_timeout"`
+
+	// Tool filtering for binary exec and daemon modes
+	AllowedTools    []string `mapstructure:"allowed_tools" yaml:"allowed_tools"`
+	DisallowedTools []string `mapstructure:"disallowed_tools" yaml:"disallowed_tools"`
 }
 
 // MCPServerConfig defines configuration for connecting to an MCP server
@@ -1262,11 +1288,11 @@ func DefaultConfig() *Config {
 		EnablePprof: false,
 		PprofPort:   0,
 
-		// Sandbox defaults: disabled; network allowed by default when sandbox is on.
+		// Sandbox defaults: enabled; network access denied by default when sandbox is on.
 		Sandbox: &SandboxConfig{
-			Enabled:            false,
+			Enabled:            true,
 			Backend:            "",
-			NetworkAccess:      true,
+			NetworkAccess:      false,
 			AllowedPaths:       []string{},
 			BlockedPaths:       []string{"/etc", "/sys", "/proc", "/dev"},
 			ReadOnlyPaths:      []string{},
@@ -1323,18 +1349,30 @@ func DefaultConfig() *Config {
 			AuditMaxAgeDays: 28,
 			AuditCompress:   true,
 		},
+
+		Policy: &PolicyConfig{
+			Classifier: &ClassifierConfig{
+				FailClosed: true,
+			},
+		},
 	}
 }
 
 // LoadConfig loads configuration from file and environment
 func LoadConfig(configPath string) (*Config, error) {
-	// Load .env file from the project root
-	if err := godotenv.Load(); err != nil {
-		// Ignore if .env file doesn't exist
-		if !os.IsNotExist(err) {
-			// Use logger instead of fmt.Printf to prevent TUI interference
-			logger.Warnf("Failed to load .env file: %v", err)
+	// Load .env file from the project root. Environment variables already set
+	// by the parent process (e.g. an orchestrator such as nano-symphony) take
+	// precedence over values declared in .env, so we only inject keys that are
+	// not already present in the environment.
+	if envMap, err := godotenv.Read(".env"); err == nil {
+		for key, value := range envMap {
+			if os.Getenv(key) == "" {
+				_ = os.Setenv(key, value)
+			}
 		}
+	} else if !os.IsNotExist(err) {
+		// Use logger instead of fmt.Printf to prevent TUI interference
+		logger.Warnf("Failed to load .env file: %v", err)
 	}
 
 	// Load config with deep merge (or legacy mode if flag is set)
@@ -1344,15 +1382,16 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, err
 	}
 
-	// Override with API keys from environment
-	if apiKey := os.Getenv("API_KEY"); apiKey != "" {
-		cfg.APIKey = apiKey
+	// Override with API config from environment. Prefer NANO_* (canonical),
+	// fall back to bare names for backward compat with existing scripts.
+	if v := firstEnv("NANO_API_KEY", "API_KEY"); v != "" {
+		cfg.APIKey = v
 	}
-	if baseURL := os.Getenv("BASE_URL"); baseURL != "" {
-		cfg.BaseURL = baseURL
+	if v := firstEnv("NANO_BASE_URL", "BASE_URL"); v != "" {
+		cfg.BaseURL = v
 	}
-	if model := os.Getenv("MODEL"); model != "" {
-		cfg.Model = model
+	if v := firstEnv("NANO_MODEL", "MODEL"); v != "" {
+		cfg.Model = v
 	}
 	if serperAPIKey := os.Getenv("SERPER_API_KEY"); serperAPIKey != "" {
 		cfg.WebSearchAPIKeys.Serper = serperAPIKey
@@ -1486,17 +1525,17 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	// Override Daemon configuration from environment
 	if cfg.Daemon == nil {
-		cfg.Daemon = &DaemonConfig{
-			ConfirmPolicy: ConfirmPolicyAllow, // Default to allow for backward compatibility
-		}
+		cfg.Daemon = &DaemonConfig{}
 	}
-	// Set default confirm policy if not specified
-	if cfg.Daemon.ConfirmPolicy == "" {
-		cfg.Daemon.ConfirmPolicy = ConfirmPolicyAllow
-	}
+	// ConfirmPolicy intentionally has no hard-coded default here.
+	// An empty value is treated as "unset"; callers apply context-appropriate
+	// defaults (binary exec → block; interactive daemon → allow).
 	// Numeric and string overrides
 	overrideIntFromEnv(&cfg.Daemon.Port, "NANO_DAEMON_PORT")
 	overrideStringFromEnv(&cfg.Daemon.Host, "NANO_DAEMON_HOST")
+	// Allow explicit env-var opt-in to the legacy auto-approve behaviour for
+	// headless callers that cannot set --dangerously-skip-permissions.
+	overrideStringFromEnv((*string)(&cfg.Daemon.ConfirmPolicy), "NANO_DAEMON_CONFIRM_POLICY")
 	overrideDaemonFilePathFromEnvIfWritable(&cfg.Daemon.PidFile, "NANO_DAEMON_PID_FILE")
 	overrideDaemonFilePathFromEnvIfWritable(&cfg.Daemon.LogFile, "NANO_DAEMON_LOG_FILE")
 	// Booleans
@@ -1592,7 +1631,32 @@ func LoadConfig(configPath string) (*Config, error) {
 		}
 	}
 
-	applyOrchestratorProfiles(cfg)
+	// Optional orchestrator profile: NANO_ORCHESTRATOR_PROFILE is treated as a
+	// comma-separated list of skill names to auto-activate. This lets an external
+	// orchestrator spawn nano-agent with a generic hint without hard-coding any
+	// orchestrator-specific configuration in nano-agent itself.
+	if v := strings.TrimSpace(os.Getenv("NANO_ORCHESTRATOR_PROFILE")); v != "" {
+		if cfg.Skills == nil {
+			cfg.Skills = &SkillsConfig{}
+		}
+		cfg.Skills.Enabled = true
+		for _, name := range strings.Split(v, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			found := false
+			for _, existing := range cfg.Skills.AutoActivate {
+				if existing == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				cfg.Skills.AutoActivate = append(cfg.Skills.AutoActivate, name)
+			}
+		}
+	}
 
 	// Override sandbox configuration from environment
 	if cfg.Sandbox == nil {
@@ -2371,4 +2435,14 @@ func GetConfigLocations(configFile string) []ConfigLocation {
 	}
 
 	return locations
+}
+
+// firstEnv returns the first non-empty environment variable among the given keys.
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }

@@ -123,14 +123,14 @@ func TestCommandGuard_BlockDestructive(t *testing.T) {
 
 func TestCommandGuard_ConfirmUnclassified(t *testing.T) {
 	guard := NewCommandGuard(nil, nil, nil)
-	// Simple unclassified commands now require confirmation (not auto-allowed)
-	// to prevent tools like kubectl, curl, nc from being silently approved.
+	// Simple single-statement commands that pass all security checkers are
+	// auto-allowed. Dangerous patterns are explicitly blocked/confirmed above.
 	d, err := guard.Analyze(context.Background(), "curl http://example.com")
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
-	if d.Action != ActionConfirm {
-		t.Errorf("curl: expected ActionConfirm (simple unclassified command), got %s", d.Action)
+	if d.Action != ActionAllow {
+		t.Errorf("curl: expected ActionAllow (simple unclassified command), got %s", d.Action)
 	}
 	if d.Confidence != 0.6 {
 		t.Errorf("curl: expected confidence 0.6, got %f", d.Confidence)
@@ -728,14 +728,15 @@ func TestSafeWriteAutoApprover_UnsafeNotApproved(t *testing.T) {
 
 func TestSimpleCommandAutoAllow(t *testing.T) {
 	analyzer := DefaultSemanticAnalyzer()
-	// A simple unclassified command now requires confirmation instead of being
-	// auto-allowed, to prevent tools like kubectl/curl/nc from running silently.
+	// A simple single-statement command that passes all security checkers is
+	// auto-allowed. Dangerous patterns are blocked/confirmed explicitly above;
+	// requiring confirmation for every unclassified command breaks normal use.
 	decision, err := analyzer.Analyze("mycustomcommand --flag")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if decision.Action != ActionConfirm {
-		t.Errorf("expected ActionConfirm for simple unclassified command, got %v", decision.Action)
+	if decision.Action != ActionAllow {
+		t.Errorf("expected ActionAllow for simple unclassified command, got %v", decision.Action)
 	}
 	if decision.Rule != "SimpleCommandAutoAllow" {
 		t.Errorf("expected rule SimpleCommandAutoAllow, got %s", decision.Rule)

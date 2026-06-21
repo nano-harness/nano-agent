@@ -3,11 +3,13 @@ package permission
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
+	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 )
@@ -21,6 +23,15 @@ type Manager struct {
 	workdir   string
 	// classifier (optional) implements ModeAuto. nil → ModeAuto behaves like ModeDefault.
 	classifier Classifier
+	// failClosed controls ShouldConfirm behavior when the classifier errors or
+	// times out.  true (default) → fail-closed (return true = require confirm);
+	// false → fail-open (return false = auto-approve). Set fail-open only for
+	// deployment observation / audit phases; not recommended for production.
+	failClosed bool
+	// transcript holds the latest compact projection of the conversation history.
+	// It is set via SetTranscript and forwarded to each ClassifyRequest so the
+	// classifier can detect multi-turn threats.
+	transcript []TranscriptEntry
 	// ConfidenceThreshold is the minimum confidence level for auto-approval.
 	// Decisions with confidence >= threshold are auto-approved without user confirmation.
 	// Range: 0.0 (strictest, require confirmation for everything) to 1.0 (most permissive).
@@ -61,6 +72,7 @@ func NewManagerWithWorkdir(mode PermissionMode, initialRules []PermissionRule, w
 		allowlist:           NewSessionAllowlist(),
 		workdir:             workdir,
 		confidenceThreshold: 0.8,
+		failClosed:          true, // safe default: classifier errors are treated as blocks
 	}
 	for _, r := range initialRules {
 		m.allowlist.AddRule(r)
@@ -92,13 +104,16 @@ func (m *Manager) GetSessionAllowlist() *SessionAllowlist {
 // explicit approval before executing the tool.
 //
 // Decision order:
+//  0. Plan mode → only allow read-only tools.
 //  1. YOLO mode → never confirm.
 //  2. Session allowlist match → never confirm.
+//     2.5 ModeAuto + shell fast-path → never confirm for safe read-only shells.
+//     2.6 ModeAuto + IsAutoSafeTool() → never confirm (zero-latency allowlist).
+//     2.7 ModeAuto + IsAutoSafeMCPTool() → never confirm (known safe MCP tools).
+//     2.8 ModeAuto + IsEditTool() + non-sensitive + path within workdir → never confirm.
+//     M2-1 ModeAuto + classifier (two-stage) → use classifier verdict.
 //  3. ContextualConfirmationTool.RequiresConfirmationForParams → confirm when
-//     the tool marks the specific parameters as sensitive. Filesystem write,
-//     edit, and delete tools define this for protected names such as .env,
-//     package manifests, lock files, config files, and paths outside the
-//     trusted workspace.
+//     the tool marks the specific parameters as sensitive.
 //  4. AcceptEdits mode + non-sensitive edit tool → never confirm.
 //  5. Filesystem edit tool path inside trusted workdir → never confirm.
 //  6. Tool.RequiresConfirmation → use that.
@@ -108,7 +123,9 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 	mode := m.mode
 	workdir := m.workdir
 	classifier := m.classifier
+	failClosed := m.failClosed
 	denialTracker := m.denialTracker
+	transcript := m.transcript
 	m.mu.RUnlock()
 
 	// M3-3: NANO_AUTO_ACCEPT is deprecated. Log a warning and fall through to
@@ -157,17 +174,63 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 		}
 	}
 
+	// 2.6 ModeAuto safe-tool fast-path: read-only tools skip the classifier
+	// entirely, providing zero latency for the most common benign operations.
+	if mode == ModeAuto && classifier != nil && IsAutoSafeTool(toolName) {
+		if denialTracker != nil {
+			denialTracker.RecordAllow()
+		}
+		return false
+	}
+
+	// 2.7 ModeAuto MCP safe-tool fast-path: known side-effect-free MCP
+	// notification tools skip the classifier.
+	if mode == ModeAuto && classifier != nil && IsAutoSafeMCPTool(toolName) {
+		if denialTracker != nil {
+			denialTracker.RecordAllow()
+		}
+		return false
+	}
+
+	// 2.8 ModeAuto workdir-edit fast-path: file edits within the trusted
+	// working directory and without sensitive parameters skip the classifier.
+	// P0 security: use filepath.EvalSymlinks to resolve symlinks before the
+	// workdir check, preventing SymJack-style attacks (CVE-2025-59536) where
+	// a symlink inside the workdir points to a sensitive path outside it.
+	if mode == ModeAuto && classifier != nil && tool != nil && IsEditTool(tool) && workdir != "" {
+		sensitive := false
+		if ct, ok := tool.(interfaces.ContextualConfirmationTool); ok && ct.RequiresConfirmationForParams(params) {
+			sensitive = true
+		}
+		if !sensitive {
+			if rawPath := extractFilesystemPath(toolName, params); rawPath != "" {
+				resolvedPath := rawPath
+				if rp, err := filepath.EvalSymlinks(rawPath); err == nil {
+					resolvedPath = rp
+				}
+				if middleware.IsPathWithinWorkdir(workdir, resolvedPath) {
+					if denialTracker != nil {
+						denialTracker.RecordAllow()
+					}
+					return false
+				}
+			}
+		}
+	}
+
 	// M2-1: Auto mode consults an AI classifier. The classifier is given a
-	// bounded timeout; on error or timeout we keep the conservative default
-	// of asking the user (fail-closed).
+	// bounded timeout; on error or timeout the behaviour is governed by
+	// failClosed: true → fail-closed (require confirmation); false → fail-open
+	// (auto-approve). Fail-open is for audit/observation deployments only.
 	if mode == ModeAuto && classifier != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), classifier.Timeout())
 		defer cancel()
 		result, err := classifier.Classify(ctx, ClassifyRequest{
-			ToolName: toolName,
-			Params:   params,
-			WorkDir:  workdir,
-			PermMode: mode,
+			ToolName:   toolName,
+			Params:     params,
+			WorkDir:    workdir,
+			PermMode:   mode,
+			Transcript: transcript,
 		})
 		if err == nil && result != nil {
 			m.storeAutoDecision(toolName, params, result)
@@ -176,7 +239,15 @@ func (m *Manager) ShouldConfirm(toolName string, params map[string]interface{}, 
 			}
 			return result.ShouldBlock
 		}
-		// fall through to default behaviour on error
+		// Classifier error / timeout: apply configurable fail mode.
+		if !failClosed {
+			logger.Warnf("permission: classifier error (fail-open): %v", err)
+			if denialTracker != nil {
+				denialTracker.RecordAllow()
+			}
+			return false
+		}
+		// fail-closed: fall through to default confirmation logic
 	}
 
 	if tool == nil {
@@ -242,6 +313,28 @@ func (m *Manager) Classifier() Classifier {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.classifier
+}
+
+// SetFailClosed controls the classifier error/timeout fallback.
+// true (default) means fail-closed: classifier errors cause ShouldConfirm=true.
+// false means fail-open: classifier errors cause ShouldConfirm=false.
+// Fail-open is intended only for audit/observation deployments.
+func (m *Manager) SetFailClosed(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failClosed = v
+}
+
+// SetTranscript stores a compact projection of the conversation history.
+// The transcript is forwarded to the classifier in every ClassifyRequest so
+// multi-turn threat patterns can be detected.
+// Safe to call concurrently; the caller retains ownership of messages —
+// the Manager takes a snapshot via BuildCompactTranscript.
+func (m *Manager) SetTranscript(messages []llm.Message) {
+	entries := BuildCompactTranscript(messages, 0)
+	m.mu.Lock()
+	m.transcript = entries
+	m.mu.Unlock()
 }
 
 // SetConfidenceThreshold sets the minimum confidence for auto-approval.

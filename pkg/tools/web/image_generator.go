@@ -292,7 +292,7 @@ func (t *ImageGenerateTool) downloadImageFromURL(ctx context.Context, imageURL s
 	if err != nil {
 		return nil, fmt.Errorf("failed to download image: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to download image, status code: %d", resp.StatusCode)

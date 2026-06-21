@@ -1036,14 +1036,15 @@ func (a *SemanticAnalyzer) Analyze(command string) (*Decision, error) {
 			return d, nil
 		}
 	}
-	// Default: for simple commands (no compound statements, no substitutions),
-	// require confirmation with low confidence. Complex/compound commands also
-	// require confirmation. Unclassified commands should not be silently allowed
-	// since they may include tools like kubectl, curl, nc, or pip install.
+	// Default: simple single-statement commands that passed all security checks are
+	// auto-allowed. Dangerous patterns are handled explicitly by the checkers above;
+	// blocking every unclassified command would break normal interactive use.
+	// Compound or complex commands (multiple statements, substitutions) still require
+	// confirmation because their combined effect cannot be fully classified.
 	if pc != nil && len(pc.Statements) == 1 && len(pc.Substitutions) == 0 {
 		return &Decision{
-			Action:     ActionConfirm,
-			Reason:     "simple unclassified command requires confirmation",
+			Action:     ActionAllow,
+			Reason:     "simple unclassified command auto-allowed",
 			Rule:       "SimpleCommandAutoAllow",
 			Layer:      LayerAnalyzer,
 			Confidence: 0.6,

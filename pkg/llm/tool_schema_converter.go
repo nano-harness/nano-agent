@@ -2,11 +2,41 @@ package llm
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/shared"
 )
+
+// apiNameToOriginal maps sanitized API-safe tool names back to their original
+// canonical names. Some LLM providers (e.g. DeepSeek) reject function names
+// that contain dots or other characters outside ^[a-zA-Z0-9_-]+$.
+var (
+	apiNameToOriginal = map[string]string{}
+	apiNameMu         sync.RWMutex
+)
+
+// sanitizeToolName replaces characters that are rejected by strict OpenAI-
+// compatible providers (DeepSeek, etc.) with underscores.
+func sanitizeToolName(name string) string {
+	return strings.NewReplacer(
+		".", "_",
+		" ", "_",
+	).Replace(name)
+}
+
+// ResolveToolName maps an API-facing tool name back to the original canonical
+// name used by the tool registry. If no mapping exists the input is returned
+// unchanged.
+func ResolveToolName(apiName string) string {
+	apiNameMu.RLock()
+	defer apiNameMu.RUnlock()
+	if orig, ok := apiNameToOriginal[apiName]; ok {
+		return orig
+	}
+	return apiName
+}
 
 type ToolSchemaConverter struct{}
 
@@ -39,9 +69,17 @@ func (ToolSchemaConverter) ConvertTools(tools []interfaces.Tool) []openai.ChatCo
 			}
 		}
 
+		originalName := tool.Name()
+		apiName := sanitizeToolName(originalName)
+		if apiName != originalName {
+			apiNameMu.Lock()
+			apiNameToOriginal[apiName] = originalName
+			apiNameMu.Unlock()
+		}
+
 		out = append(out, openai.ChatCompletionFunctionTool(
 			shared.FunctionDefinitionParam{
-				Name:        tool.Name(),
+				Name:        apiName,
 				Description: openai.String(tool.Description()),
 				Parameters:  parameters,
 			},

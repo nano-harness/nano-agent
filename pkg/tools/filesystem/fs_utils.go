@@ -14,16 +14,17 @@ import (
 )
 
 // validatePathCommon validates a given path and returns its absolute, cleaned,
-// symlink-resolved path. Path access control is delegated to sandbox.PathChecker;
-// this function blocks relative path traversal outside the working directory and
-// normalizes the path for subsequent sandbox checks.
-func validatePathCommon(workingDir, path string) (string, error) {
+// symlink-resolved path. Path containment is enforced for both relative and
+// absolute inputs: the resolved real path must lie within workingDir unless it
+// is explicitly listed in allowedPaths. Pass nil (or an empty slice) for
+// allowedPaths when no extra paths are permitted.
+func validatePathCommon(workingDir, path string, allowedPaths []string) (string, error) {
 	cleaned := filepath.Clean(strings.TrimSpace(path))
 	if cleaned == "" || cleaned == "." {
 		return "", fmt.Errorf("path is empty")
 	}
 
-	// Resolve working dir to an absolute, symlink-free base for relative path validation.
+	// Resolve working dir to an absolute, symlink-free base.
 	base, err := filepath.Abs(workingDir)
 	if err != nil {
 		return "", fmt.Errorf("failed to get absolute working directory: %v", err)
@@ -56,15 +57,32 @@ func validatePathCommon(workingDir, path string) (string, error) {
 		}
 	}
 
-	// If the caller provided a relative path, ensure the resolved realPath is still
-	// within the working directory (covers symlink escape via existing parents).
-	if !filepath.IsAbs(cleaned) {
-		if rel, err := filepath.Rel(baseReal, realPath); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("path escapes working directory via symlink resolution: %q", path)
+	// Enforce containment for ALL paths (absolute and relative) after symlink
+	// resolution.  A resolved path outside the working directory is only
+	// permitted when it is explicitly listed in allowedPaths.
+	if rel, err := filepath.Rel(baseReal, realPath); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		if !isInAllowedPaths(realPath, allowedPaths) {
+			return "", fmt.Errorf("path escapes working directory: %q", path)
 		}
 	}
 
 	return realPath, nil
+}
+
+// isInAllowedPaths returns true when realPath is exactly one of the allowed
+// paths or is nested inside one of them.  Symlinks in the allowed path entries
+// are resolved for consistent matching (e.g. /tmp → /private/tmp on macOS).
+func isInAllowedPaths(realPath string, allowedPaths []string) bool {
+	for _, ap := range allowedPaths {
+		resolved, err := filepath.EvalSymlinks(ap)
+		if err != nil {
+			resolved = filepath.Clean(ap)
+		}
+		if realPath == resolved || strings.HasPrefix(realPath, resolved+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveNonExistentPath walks up the directory tree until it finds an existing

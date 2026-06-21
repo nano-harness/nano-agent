@@ -37,8 +37,7 @@ type PermissionResolution struct {
 //
 // Side effects:
 //   - yolo mode with no sandbox backend → sets cfg.Sandbox.Backend = "docker"
-//   - auto mode with empty/allow ConfirmPolicy → sets cfg.Daemon.ConfirmPolicy = "block"
-//   - auto mode without PermissionAuto config → generates warning
+//   - auto mode without PermissionAuto/AllowedRules config → emits diagnostic log
 func ResolvePermission(cfg *config.Config, opts PermissionResolveOpts) (PermissionResolution, []string) {
 	var warnings []string
 	res := PermissionResolution{}
@@ -90,21 +89,15 @@ func ResolvePermission(cfg *config.Config, opts PermissionResolveOpts) (Permissi
 		res.SandboxBackend = cfg.Sandbox.Backend
 	}
 
-	// Side effect 2: auto mode flips ConfirmPolicy to block for fail-closed behavior
-	if res.Mode == permission.ModeAuto {
-		if cfg.Daemon == nil {
-			cfg.Daemon = &config.DaemonConfig{}
+	// Diagnostic: warn if auto mode has no permission/allow configuration.
+	if res.Mode == permission.ModeAuto && cfg.PermissionAuto == nil && len(cfg.AllowedRules) == 0 {
+		var confirmPolicy config.ConfirmPolicy
+		if cfg.Daemon != nil {
+			confirmPolicy = cfg.Daemon.ConfirmPolicy
 		}
-		// Only override if not explicitly set by user or set to allow
-		if cfg.Daemon.ConfirmPolicy == "" || cfg.Daemon.ConfirmPolicy == config.ConfirmPolicyAllow {
-			cfg.Daemon.ConfirmPolicy = config.ConfirmPolicyBlock
-			logger.Debugf("permission_mode=auto: setting daemon ConfirmPolicy to block for fail-closed behavior")
-		}
-
-		// Generate warning if PermissionAuto config is missing
-		if cfg.PermissionAuto == nil {
-			warnings = append(warnings, "permission_mode=auto set but no permission_auto configuration provided; will fall back to default mode behavior")
-		}
+		logger.Infof("permission_mode=auto selected but no permissions/permission_auto block configured; "+
+			"auto mode behaves like default. Daemon.ConfirmPolicy=%q controls headless fallback.",
+			confirmPolicy)
 	}
 
 	// Capture the resolved confirm policy

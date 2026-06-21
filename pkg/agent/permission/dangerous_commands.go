@@ -1,6 +1,7 @@
 package permission
 
 import (
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -128,6 +129,69 @@ var BuiltinDangerousRules = []DangerousCommandRule{
 		Severity: SeverityLow,
 		Category: "package",
 	},
+
+	// === High Severity: System Shutdown/Restart ===
+	{
+		Pattern:  regexp.MustCompile(`\b(reboot|halt|poweroff)\b`),
+		Reason:   "system shutdown or restart",
+		Severity: SeverityHigh,
+		Category: "system",
+	},
+	{
+		Pattern:  regexp.MustCompile(`\bshutdown\b`),
+		Reason:   "system shutdown",
+		Severity: SeverityHigh,
+		Category: "system",
+	},
+	{
+		Pattern:  regexp.MustCompile(`\binit\s+(0|6)\b`),
+		Reason:   "system runlevel change (shutdown/reboot)",
+		Severity: SeverityHigh,
+		Category: "system",
+	},
+
+	// === High Severity: Broadcast Process Termination ===
+	{
+		Pattern:  regexp.MustCompile(`\bkill\s+.*-9\s+-1\b`),
+		Reason:   "kill all processes (kill -9 -1)",
+		Severity: SeverityHigh,
+		Category: "destructive",
+	},
+
+	// === Medium Severity: Mass Process Termination ===
+	{
+		Pattern:  regexp.MustCompile(`\bkillall\b`),
+		Reason:   "kill all matching processes",
+		Severity: SeverityMedium,
+		Category: "destructive",
+	},
+
+	// === High Severity: Pipe Download to Shell ===
+	{
+		Pattern:  regexp.MustCompile(`\b(curl|wget)\b[^|]*\|\s*(sh|bash|zsh|fish)\b`),
+		Reason:   "piping downloaded content directly to shell",
+		Severity: SeverityHigh,
+		Category: "security",
+	},
+
+	// === High Severity: Remove All Permissions ===
+	{
+		Pattern:  regexp.MustCompile(`\bchmod\s+(-R\s+)?000\b`),
+		Reason:   "removing all permissions (chmod 000)",
+		Severity: SeverityHigh,
+		Category: "destructive",
+	},
+
+	// === Medium Severity: find write-action flags ===
+	// -delete, -fprint/-fprintf/-fls write to the filesystem; -ok/-okdir execute
+	// commands interactively; all are write-class operations that must not bypass
+	// the auto-approve fast-path.
+	{
+		Pattern:  regexp.MustCompile(`\bfind\b.*\s(-delete|-fprintf|-fprint|-fls|-ok|-okdir)\b`),
+		Reason:   "find with write-action flag (-delete/-fprintf/-fprint/-fls/-ok/-okdir)",
+		Severity: SeverityMedium,
+		Category: "destructive",
+	},
 }
 
 // SensitiveFilePatterns contains glob patterns for sensitive files that should
@@ -169,32 +233,36 @@ func CheckCommand(command string) (*DangerousCommandRule, bool) {
 }
 
 // IsSensitiveFile checks if a file path matches any sensitive file patterns.
+// It uses filepath.Match on the basename for glob patterns and path-segment
+// matching for patterns that contain a path separator.
 func IsSensitiveFile(path string) bool {
-	// Convert path to lowercase for case-insensitive matching
-	lowerPath := strings.ToLower(path)
-	baseName := lowerPath
-	if idx := strings.LastIndex(lowerPath, "/"); idx >= 0 {
-		baseName = lowerPath[idx+1:]
-	}
+	base := strings.ToLower(filepath.Base(path))
+	lowerPath := strings.ToLower(filepath.ToSlash(path))
 
 	for _, pattern := range SensitiveFilePatterns {
-		// Remove leading wildcard for substring matching
-		cleanPattern := strings.TrimPrefix(strings.ToLower(pattern), "*")
-		cleanPattern = strings.TrimSuffix(cleanPattern, "*")
-
-		// Check if the pattern matches anywhere in the path or basename
-		if strings.Contains(lowerPath, cleanPattern) || strings.Contains(baseName, cleanPattern) {
+		p := strings.ToLower(pattern)
+		// Patterns with a path separator: match progressively shorter path suffixes
+		// so that e.g. ".ssh/*" matches "/home/user/.ssh/config".
+		if strings.ContainsRune(p, '/') {
+			remaining := strings.TrimPrefix(lowerPath, "/")
+			for remaining != "" {
+				matched, err := filepath.Match(p, remaining)
+				if err == nil && matched {
+					return true
+				}
+				idx := strings.IndexByte(remaining, '/')
+				if idx == -1 {
+					break
+				}
+				remaining = remaining[idx+1:]
+			}
+			continue
+		}
+		// Basename glob matching.
+		matched, err := filepath.Match(p, base)
+		if err == nil && matched {
 			return true
 		}
-
-		// Special check for exact extensions
-		if strings.HasPrefix(pattern, "*.") {
-			ext := strings.TrimPrefix(pattern, "*")
-			if strings.HasSuffix(lowerPath, strings.ToLower(ext)) {
-				return true
-			}
-		}
 	}
-
 	return false
 }

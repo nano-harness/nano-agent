@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -16,10 +17,16 @@ import (
 	. "github.com/nano-harness/nano-agent/pkg/tools/filesystem" //nolint:revive,staticcheck
 )
 
+// defaultMaxResponseBody is the default upper bound on response body size (10 MiB).
+// It can be overridden per-request via the max_content_length parameter or
+// via the web_max_content_size config key.
+const defaultMaxResponseBody int64 = 10 * 1024 * 1024
+
 // WebFetchTool implements HTTP content retrieval and processing
 type WebFetchTool struct { //nolint:revive
-	config map[string]interface{}
-	client *http.Client
+	config           map[string]interface{}
+	client           *http.Client
+	ssrfAllowedHosts []string // hosts exempt from SSRF validation (e.g. internal test servers)
 }
 
 // NewWebFetchTool creates a new WebFetchTool instance
@@ -43,10 +50,108 @@ func NewWebFetchTool(config map[string]interface{}) *WebFetchTool {
 		},
 	}
 
-	return &WebFetchTool{
-		config: config,
-		client: client,
+	// Read explicit SSRF allowlist from config (web_ssrf_allowed_hosts: ["host:port",...]).
+	var allowedHosts []string
+	if raw, ok := config["web_ssrf_allowed_hosts"]; ok {
+		switch v := raw.(type) {
+		case []string:
+			allowedHosts = v
+		case []interface{}:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					allowedHosts = append(allowedHosts, s)
+				}
+			}
+		}
 	}
+
+	return &WebFetchTool{
+		config:           config,
+		client:           client,
+		ssrfAllowedHosts: allowedHosts,
+	}
+}
+
+// isSSRFAllowed returns true when the URL's host (including port) is in the
+// explicitly configured ssrfAllowedHosts list.  This provides an escape hatch
+// for environments that legitimately need to reach internal services.
+func (t *WebFetchTool) isSSRFAllowed(u *url.URL) bool {
+	host := u.Host // includes port, e.g. "127.0.0.1:8080"
+	for _, allowed := range t.ssrfAllowedHosts {
+		if host == allowed || u.Hostname() == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// validateURLForSSRF returns an error when the URL's resolved host is a
+// loopback, private, link-local, or cloud-metadata address.  It resolves
+// hostnames via DNS and checks every returned IP to guard against SSRF.
+func validateURLForSSRF(u *url.URL) error {
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("URL has no host")
+	}
+
+	// If the host is already an IP address check it directly.
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("requests to %s are not allowed (blocked address)", host)
+		}
+		return nil
+	}
+
+	// Resolve the hostname and check every returned IP.
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		// Treat unresolvable hosts as potentially unsafe.
+		return fmt.Errorf("could not resolve host %q: %w", host, err)
+	}
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if isBlockedIP(ip) {
+			return fmt.Errorf("requests to %s (%s) are not allowed (blocked address)", host, addr)
+		}
+	}
+	return nil
+}
+
+// isBlockedIP returns true when ip is a loopback, private, link-local,
+// unspecified, or cloud-metadata address that must not be reached via
+// web_fetch / web_search.
+func isBlockedIP(ip net.IP) bool {
+	if ip.IsLoopback() {
+		return true
+	}
+	if ip.IsPrivate() {
+		return true
+	}
+	if ip.IsLinkLocalUnicast() {
+		return true
+	}
+	if ip.IsLinkLocalMulticast() {
+		return true
+	}
+	if ip.IsUnspecified() {
+		return true
+	}
+	// Block cloud instance metadata endpoints (169.254.169.254 and fd00:ec2::254).
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] == 169 && ip4[1] == 254 && ip4[2] == 169 && ip4[3] == 254 {
+			return true
+		}
+	}
+	// Block IPv6 ULA (fc00::/7).
+	if ip16 := ip.To16(); ip16 != nil && ip.To4() == nil {
+		if ip16[0]&0xfe == 0xfc {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *WebFetchTool) Name() string { //nolint:revive
@@ -167,6 +272,17 @@ func (t *WebFetchTool) Execute(ctx context.Context, params map[string]interface{
 		}, nil
 	}
 
+	// SSRF guard: reject requests to loopback, private, link-local, and
+	// cloud-metadata addresses on the initial URL (unless explicitly allowlisted).
+	if !t.isSSRFAllowed(parsedURL) {
+		if err := validateURLForSSRF(parsedURL); err != nil {
+			return &interfaces.ToolResult{
+				Success: false,
+				Error:   fmt.Sprintf("URL blocked for security reasons: %v", err),
+			}, nil
+		}
+	}
+
 	// Get optional parameters
 
 	followRedirects := true
@@ -183,13 +299,13 @@ func (t *WebFetchTool) Execute(ctx context.Context, params map[string]interface{
 		userAgent = uaParam
 	}
 
-	// Get max content length from config
-	var maxContentLength int64
-	if maxConfig, ok := t.config["web_max_content_size"].(int); ok {
+	// Get max content length from config; fall back to the built-in default.
+	maxContentLength := defaultMaxResponseBody
+	if maxConfig, ok := t.config["web_max_content_size"].(int); ok && maxConfig > 0 {
 		maxContentLength = int64(maxConfig)
 	}
 	if maxParam, ok := params["max_content_length"]; ok {
-		if maxFloat, ok := maxParam.(float64); ok {
+		if maxFloat, ok := maxParam.(float64); ok && maxFloat > 0 {
 			maxContentLength = int64(maxFloat)
 		}
 	}
@@ -212,15 +328,31 @@ func (t *WebFetchTool) Execute(ctx context.Context, params map[string]interface{
 		prompt = promptParam
 	}
 
-	// Configure client for redirects
-	if !followRedirects {
-		t.client.CheckRedirect = func(req *http.Request, via []*http.Request) error { //nolint:revive
-			return http.ErrUseLastResponse
-		}
+	// Build a per-request client so that CheckRedirect logic (SSRF re-check +
+	// follow policy) does not mutate the shared t.client.
+	reqClient := &http.Client{
+		Timeout:   t.client.Timeout,
+		Transport: t.client.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Always re-validate redirect targets against the SSRF blocklist
+			// unless the target is explicitly allowlisted.
+			if !t.isSSRFAllowed(req.URL) {
+				if err := validateURLForSSRF(req.URL); err != nil {
+					return fmt.Errorf("redirect blocked for security reasons: %w", err)
+				}
+			}
+			if !followRedirects {
+				return http.ErrUseLastResponse
+			}
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return nil
+		},
 	}
 
 	// Perform web fetch
-	result, err := t.fetchContent(ctx, urlStr, userAgent, maxContentLength, extractTextOnly)
+	result, err := t.fetchContentWithClient(ctx, reqClient, urlStr, userAgent, maxContentLength, extractTextOnly)
 	if err != nil {
 		return &interfaces.ToolResult{
 			Success: false,
@@ -270,7 +402,7 @@ func (t *WebFetchTool) Execute(ctx context.Context, params map[string]interface{
 	}, nil
 }
 
-func (t *WebFetchTool) fetchContent(ctx context.Context, urlStr, userAgent string, maxContentLength int64, extractTextOnly bool) (*WebFetchResult, error) {
+func (t *WebFetchTool) fetchContentWithClient(ctx context.Context, client *http.Client, urlStr, userAgent string, maxContentLength int64, extractTextOnly bool) (*WebFetchResult, error) {
 	result := &WebFetchResult{
 		URL:           urlStr,
 		Headers:       make(map[string]string),
@@ -291,13 +423,13 @@ func (t *WebFetchTool) fetchContent(ctx context.Context, urlStr, userAgent strin
 	req.Header.Set("Accept-Encoding", "gzip, deflate")
 	req.Header.Set("Connection", "keep-alive")
 
-	// Perform request
-	resp, err := t.client.Do(req)
+	// Perform request using the supplied client (which carries SSRF + redirect checks).
+	resp, err := client.Do(req)
 	if err != nil {
 		result.Error = fmt.Sprintf("HTTP request failed: %v", err)
 		return result, nil
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() { _ = resp.Body.Close() }()
 
 	// Populate result metadata
 	result.StatusCode = resp.StatusCode
@@ -317,11 +449,8 @@ func (t *WebFetchTool) fetchContent(ctx context.Context, urlStr, userAgent strin
 		return result, nil
 	}
 
-	// Read content with size limit
-	var reader io.Reader = resp.Body
-	if maxContentLength > 0 {
-		reader = io.LimitReader(resp.Body, maxContentLength)
-	}
+	// Read content with size limit (maxContentLength is always > 0 here).
+	reader := io.LimitReader(resp.Body, maxContentLength)
 	content, err := io.ReadAll(reader)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to read response body: %v", err)

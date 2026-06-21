@@ -59,6 +59,69 @@ func IsEditTool(t interfaces.Tool) bool {
 	return editCategories[t.Category()]
 }
 
+// autoSafeTools lists tools that are unconditionally safe in ModeAuto and may
+// skip the classifier entirely. All entries must be read-only or side-effect-free.
+//
+// Security note: shell execution tools (run_shell_command, bash, …) must NEVER
+// appear in this list. Shell commands require the allowShellFastPath or
+// classifier evaluation to prevent environment pollution and command injection.
+var autoSafeTools = map[string]bool{
+	// File system read operations
+	"read_file":      true,
+	"list_directory": true,
+	"search_files":   true,
+	"file_grep":      true,
+	"glob_files":     true,
+
+	// Code analysis
+	"codebase_search": true,
+	"search_code":     true,
+	"view_code":       true,
+
+	// Web operations (read-only)
+	"web_search": true,
+	"web_fetch":  true,
+
+	// Planning tools
+	"create_plan":  true,
+	"analyze_task": true,
+
+	// Memory/context queries
+	"search_memory": true,
+	"list_memories": true,
+
+	// MCP introspection (always read-only)
+	"mcp_list_tools":     true,
+	"mcp_list_resources": true,
+}
+
+// IsAutoSafeTool reports whether toolName is unconditionally safe in ModeAuto
+// and may skip the classifier. Returns false for all shell tools.
+func IsAutoSafeTool(toolName string) bool {
+	return autoSafeTools[toolName]
+}
+
+// autoSafeMCPTools lists MCP tools that are pure notification/status operations
+// with no side effects. These tools are eligible for the ModeAuto fast-path.
+//
+// Security note: this list is hardcoded in source and is NOT read from SKILL.md
+// or remote MCP server metadata, to prevent a malicious MCP server from
+// registering these names with destructive implementations and bypassing the
+// classifier. A tool named "report_event" registered by an untrusted MCP server
+// will NOT be fast-pathed unless its server is explicitly trusted via config.
+var autoSafeMCPTools = map[string]bool{
+	"report_event":  true,
+	"update_status": true,
+	"get_status":    true,
+	"list_tasks":    true,
+}
+
+// IsAutoSafeMCPTool reports whether toolName is a known safe MCP notification
+// tool that may skip the classifier in ModeAuto.
+func IsAutoSafeMCPTool(toolName string) bool {
+	return autoSafeMCPTools[toolName]
+}
+
 // readOnlyToolNames lists tools that are allowed in Plan mode.
 // These tools perform read-only operations without side effects.
 var readOnlyToolNames = map[string]bool{
@@ -146,18 +209,29 @@ func IsReadOnlyTool(toolName string, params map[string]interface{}) bool {
 }
 
 // isReadOnlyShellCommand checks if a shell command is read-only.
+// It parses the command into individual statements and verifies that every
+// statement is read-only.  Commands with dangerous syntax (redirects, command
+// substitutions, eval, …) are never considered read-only.  A parse failure is
+// treated conservatively: the command is not read-only.
 func isReadOnlyShellCommand(cmd string) bool {
-	// Trim whitespace and convert to lowercase for comparison
-	cmd = strings.TrimSpace(strings.ToLower(cmd))
-
-	// Check against known read-only command prefixes
-	for _, prefix := range readOnlyShellCommands {
-		if strings.HasPrefix(cmd, prefix) {
-			return true
+	if strings.TrimSpace(cmd) == "" {
+		return false
+	}
+	// Dangerous syntax (redirections, $(), eval, …) → never read-only.
+	if hasDangerousSyntax(cmd) {
+		return false
+	}
+	pc, err := middleware.ParseCommand(cmd)
+	if err != nil || pc == nil || len(pc.Statements) == 0 {
+		return false
+	}
+	for _, stmt := range pc.Statements {
+		stmt = stripWrappers(stmt)
+		if !isReadOnlyShellStatement(stmt) {
+			return false
 		}
 	}
-
-	return false
+	return true
 }
 
 func isShellToolName(toolName string) bool {
@@ -384,7 +458,11 @@ func callHasDangerousBuiltin(call *syntax.CallExpr) bool {
 	if name == "find" {
 		for _, w := range call.Args[1:] {
 			arg := strings.TrimSpace(wordToString(w))
-			if arg == "-exec" || arg == "-execdir" {
+			switch arg {
+			case "-exec", "-execdir",
+				"-delete",
+				"-fprintf", "-fprint", "-fls",
+				"-ok", "-okdir":
 				return true
 			}
 		}

@@ -121,20 +121,32 @@ func (b *BwrapSandbox) buildBwrapArgs(workingDir string) []string {
 	}
 
 	// ── Environment isolation ────────────────────────────────────────────────
-	// Clear all environment variables and only pass through a safe whitelist.
+	// A3: Clear all environment variables and only pass through a safe whitelist.
 	// This prevents leaking secrets like OPENAI_API_KEY, AWS_*, GITHUB_TOKEN,
-	// SSH_AUTH_SOCK, and SYMPHONY_TOKEN into the sandboxed environment.
+	// SSH_AUTH_SOCK, NANO_*_API_KEY and similar credentials into the sandboxed
+	// environment.  The NANO_* allowlist is explicit rather than prefix-based so
+	// that new NANO_* credentials added in future cannot accidentally leak.
 	a = append(a, "--clearenv")
+	// Explicit allowlist of NANO_* variables that are safe to forward.
+	// API key / secret variables are intentionally excluded.
+	allowedNanoVars := map[string]struct{}{
+		"NANO_SESSION_ID":        {},
+		"NANO_WORKSPACE":         {},
+		"NANO_ORCHESTRATOR_MODE": {},
+		"NANO_SANDBOX_MODE":      {},
+	}
 	for _, e := range os.Environ() {
 		k, v, ok := strings.Cut(e, "=")
 		if !ok {
 			continue
 		}
-		// Only pass through NANO_* prefixed variables and essential runtime vars
-		switch {
-		case strings.HasPrefix(k, "NANO_"),
-			k == "PATH", k == "TERM", k == "LANG", k == "LC_ALL":
+		switch k {
+		case "PATH", "TERM", "LANG", "LC_ALL":
 			a = append(a, "--setenv", k, v)
+		default:
+			if _, allowed := allowedNanoVars[k]; allowed {
+				a = append(a, "--setenv", k, v)
+			}
 		}
 	}
 

@@ -10,16 +10,20 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/agent"
+	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/hookservice"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/sandbox"
 )
 
 var unsafeCacheKeyChars = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
@@ -49,6 +53,10 @@ type binaryOptions struct {
 	HookService    *hookservice.Service
 	PermissionMode string // --permission-mode flag value
 	SkipPerms      bool   // --dangerously-skip-permissions flag value
+	MCPConfigFile  string // --mcp-config: path to Claude Code-compatible .mcp.json
+	AllowedTools   []string // --allowedTools: repeatable allow-pattern (first entry wins for a given prefix)
+	DisallowedTools []string // --disallowedTools: repeatable deny-pattern (overrides allow)
+	AddDirs        []string // --add-dir: additional directories to allow sandbox write access to (repeatable)
 }
 
 type binaryResultTokens struct {
@@ -84,93 +92,132 @@ type binaryExecution struct {
 	BlockedCommandsSample []string
 }
 
-// emitResult writes byte-identical JSON to both stdout and <outputDir>/result.json.
-// If patch is non-empty it is also written to <outputDir>/solution.patch.
+// emitResult writes JSON to <outputDir>/result.json (atomic, 0600) and to
+// stdout with surrounding newlines for reliable line-boundary parsing.
+// The file payload is bare JSON; the stdout payload is wrapped with "\n…\n".
+// If patch is non-empty it is also written atomically to <outputDir>/solution.patch.
 func emitResult(stdout io.Writer, outputDir string, summary binaryResultSummary, patch string) error {
+	if err := validateSummary(&summary); err != nil {
+		// Contract violation: rewrite as abandoned so orchestrators can still parse.
+		summary = binaryResultSummary{
+			Status:             "abandoned",
+			Reason:             fmt.Sprintf("invalid result summary: %v", err),
+			TerminationCause:   "contract_violation",
+			BlockerFingerprint: "contract_violation",
+		}
+	}
 	payload, err := json.Marshal(summary)
 	if err != nil {
 		return fmt.Errorf("marshal result: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(outputDir, "result.json"), payload, 0o644); err != nil {
+	// A5: atomic write + 0600 so partial writes / crashes leave no truncated file.
+	if err := writeFileAtomic(filepath.Join(outputDir, "result.json"), payload, 0o600); err != nil {
 		return fmt.Errorf("write result.json: %w", err)
 	}
 	if patch != "" {
-		if err := os.WriteFile(filepath.Join(outputDir, "solution.patch"), []byte(patch), 0o644); err != nil {
+		if err := writeFileAtomic(filepath.Join(outputDir, "solution.patch"), []byte(patch), 0o600); err != nil {
 			return fmt.Errorf("write solution.patch: %w", err)
 		}
 	}
+	// A4: surround the JSON with newlines so the payload is unambiguously
+	// line-delimited on stdout even if prior output did not end with a newline.
+	// The file copy above remains bare JSON (no surrounding newlines).
+	if _, err := stdout.Write([]byte("\n")); err != nil {
+		return fmt.Errorf("write stdout: %w", err)
+	}
 	if _, err := stdout.Write(payload); err != nil {
+		return fmt.Errorf("write stdout: %w", err)
+	}
+	if _, err := stdout.Write([]byte("\n")); err != nil {
 		return fmt.Errorf("write stdout: %w", err)
 	}
 	return nil
 }
 
-func saveTrajectory(trajectory []trajectoryEvent, path string) error {
-	f, err := os.Create(path)
+// emitPanicResult writes a valid abandoned JSON summary to stdout (and to
+// <outputDir>/result.json when outputDir is non-empty). It is used by defer/recover
+// in binary subcommands so an unhandled panic never leaves stdout without a
+// parseable result line for orchestrators.
+func emitPanicResult(stdout io.Writer, outputDir string, r any) {
+	summary := binaryResultSummary{
+		Status:             "abandoned",
+		Reason:             fmt.Sprintf("panic: %v", r),
+		TerminationCause:   "panic",
+		BlockerFingerprint: "panic",
+	}
+	_ = emitResult(stdout, outputDir, summary, "")
+}
+
+// writeFileAtomic writes data to path atomically: it creates a sibling temp
+// file, fsyncs it, then renames it over the target.  This ensures readers
+// always observe a complete file, never a partial write.  perm is applied to
+// the temp file before the rename so the final file has the requested mode.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
 	if err != nil {
-		return err
+		return fmt.Errorf("create temp file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(trajectory)
-}
-
-// trajectoryEvent captures a simplified event for trajectory logging
-type trajectoryEvent struct {
-	Type       string                   `json:"type"`
-	Content    string                   `json:"content,omitempty"`
-	ToolCalls  []map[string]interface{} `json:"tool_calls,omitempty"`
-	ToolResult map[string]interface{}   `json:"tool_result,omitempty"`
-	TokenStats map[string]interface{}   `json:"token_stats,omitempty"`
-	Error      string                   `json:"error,omitempty"`
-	Meta       map[string]interface{}   `json:"meta,omitempty"`
-	Timestamp  int64                    `json:"timestamp,omitempty"`
-}
-
-// trajectoryOptimizer handles trajectory compression and optimization
-type trajectoryOptimizer struct {
-	compressionEnabled bool
-}
-
-// newTrajectoryOptimizer creates a new trajectory optimizer
-func newTrajectoryOptimizer() *trajectoryOptimizer {
-	return &trajectoryOptimizer{
-		compressionEnabled: true,
+	tmpName := tmp.Name()
+	// Remove the temp file on any failure path; no-op after a successful rename.
+	success := false
+	defer func() {
+		_ = tmp.Close()
+		if !success {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write temp file: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("fsync temp file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	success = true
+	return nil
 }
 
-// shouldRecordEvent determines if an event should be recorded in trajectory
-func (to *trajectoryOptimizer) shouldRecordEvent(eventType event.EventType) bool {
-	if !to.compressionEnabled {
-		return true
+func saveTrajectory(trajectory []trajectoryEvent, path string) error {
+	data, err := json.MarshalIndent(trajectory, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal trajectory: %w", err)
 	}
-
-	// 只记录关键事件，移除流内容相关事件
-	switch eventType {
-	case event.EventTypeStreamContent:
-		return false // 完全移除流内容记录
-	case event.EventTypeContent:
-		return true // 保留最终内容
-	case event.EventTypeToolCall, event.EventTypeToolResult:
-		return true // 保留工具调用和结果
-	case event.EventTypeError:
-		return true // 保留错误信息
-	case event.EventTypeCompression:
-		return true // 保留压缩信息
-	case event.EventTypeDebug:
-		return true // 保留上下文统计信息
-	case event.EventTypeTokenStats:
-		return false // 去除中间过程的令牌统计事件，最终一次在完成时收敛输出
-	case event.EventTypeFinalSummary:
-		return true // 保留最终摘要
-	default:
-		return false // 其他事件类型默认不记录
-	}
+	// A5: use atomic write so a partial trajectory is never visible to readers,
+	// and 0600 because trajectory may contain sensitive tool outputs.
+	return writeFileAtomic(path, data, 0o600)
 }
 
-// resolveBinarySessionID picks a stable session id for binary exec hooks/lifecycle.
-// Priority: --session-id flag → NANO_SESSION_ID env → SYMPHONY_ISSUE_ID env → fresh session_<hex>
+// applyMCPOverrides applies MCP config file and tool permission flags to
+// a Config copy. Used by both the streaming and non-streaming binary paths.
+func applyMCPOverrides(cfg *config.Config, opts binaryOptions) error {
+	if opts.MCPConfigFile != "" {
+		servers, err := config.LoadMCPConfigFile(opts.MCPConfigFile)
+		if err != nil {
+			return fmt.Errorf("load MCP config file %s: %w", opts.MCPConfigFile, err)
+		}
+		cfg.MCP.Servers = append(cfg.MCP.Servers, servers...)
+		if len(servers) > 0 {
+			cfg.EnableMCP = true
+		}
+	}
+	if len(opts.AllowedTools) > 0 {
+		cfg.MCP.AllowedTools = opts.AllowedTools
+	}
+	if len(opts.DisallowedTools) > 0 {
+		cfg.MCP.DisallowedTools = opts.DisallowedTools
+	}
+	return nil
+}
+
 func resolveBinarySessionID(opts binaryOptions) string {
 	// 1. Explicit flag (highest priority)
 	if strings.TrimSpace(opts.SessionID) != "" {
@@ -180,7 +227,7 @@ func resolveBinarySessionID(opts binaryOptions) string {
 	if env := strings.TrimSpace(os.Getenv("NANO_SESSION_ID")); env != "" {
 		return env
 	}
-	// 3. SYMPHONY_ISSUE_ID environment variable (fallback for symphony integration)
+	// 3. SYMPHONY_ISSUE_ID environment variable (orchestrator-spawned fallback)
 	if env := strings.TrimSpace(os.Getenv("SYMPHONY_ISSUE_ID")); env != "" {
 		return env
 	}
@@ -188,25 +235,39 @@ func resolveBinarySessionID(opts binaryOptions) string {
 	return agent.NewSession().ID
 }
 
-func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions) (binaryExecution, error) {
-	execRes := binaryExecution{}
+type binaryAgentContext struct {
+	agentInstance *agent.Agent
+	cfgCopy       config.Config
+	sessionID     string
+	goalCtx       *agent.GoalContext
+	projectPath   string
+	cleanup       func()
+}
+
+// prepareBinaryAgent performs the shared setup for both streaming and
+// non-streaming binary execution paths: config copy, MCP/permission/sandbox
+// resolution, directory change, agent creation, session/goal setup.
+// Callers must invoke cleanup() when done.
+func prepareBinaryAgent(prompt, projectPath string, opts binaryOptions, mode string) (*binaryAgentContext, error) {
 	prompt, goalCondition, goalFromPrompt := prepareBinaryGoal(prompt, opts)
 	cfg := config.Get()
 	if cfg == nil {
-		return execRes, fmt.Errorf("configuration not initialized")
+		return nil, fmt.Errorf("configuration not initialized")
 	}
 
 	// Configure logger based on verbose setting from config
 	logger.SetVerbose(cfg.Verbose)
 
 	cfgCopy := *cfg
-	// Embedded execution (under symphony or other orchestrators) needs MCP to
-	// call back to the orchestrator. Standalone binary mode (SWE-bench style)
-	// should not auto-connect to user-configured MCP servers like
-	// chrome-devtools that they have in their global ~/.config/nano/config.yaml.
+	// Orchestrator-spawned execution (e.g. from nano-symphony) needs MCP to call
+	// back to the orchestrator. Standalone binary mode (SWE-bench style) should
+	// not auto-connect to user-configured MCP servers like chrome-devtools that
+	// they have in their global ~/.config/nano/config.yaml.
 	//
-	// Detection mirrors applyBinarySandboxMode below: SYMPHONY_* /
-	// NANO_ORCHESTRATOR_PROFILE env vars indicate embedded mode.
+	// Detection mirrors applyBinarySandboxMode below: SYMPHONY_WORKSPACE,
+	// SYMPHONY_MCP_URL, or NANO_ORCHESTRATOR_PROFILE env vars indicate
+	// orchestrator-spawned mode. These env var keys are part of the documented
+	// CLI contract and must not change.
 	if !isEmbeddedBinaryExecution() {
 		cfgCopy.EnableMCP = false
 	}
@@ -225,36 +286,52 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 		cfgCopy.Goal.MaxTurns = opts.GoalMaxTurns
 	}
 
+	// MCP + tool permissions from binary exec flags
+	if err := applyMCPOverrides(&cfgCopy, opts); err != nil {
+		return nil, err
+	}
+
 	// Resolve permission mode using unified resolver (includes env var resolution)
 	res, warns := ResolvePermission(&cfgCopy, PermissionResolveOpts{
 		FlagMode:       opts.PermissionMode,
 		SkipPerms:      opts.SkipPerms,
 		EnvHintEnabled: true,
 	})
-	LogPermissionResolution("binary", res, warns)
+	LogPermissionResolution(mode, res, warns)
 
-	applyBinarySandboxMode(&cfgCopy, opts.Sandbox, projectPath)
+	// When auto mode has no escape hatch, gracefully degrade to default mode
+	// rather than failing hard. This matches the documented behavior that
+	// "ModeAuto behaves like ModeDefault when no classifier is wired."
+	if res.Mode == permission.ModeAuto && !hasModeAutoEscape(&cfgCopy) {
+		logger.Warnf("binary exec: permission_mode=auto has no classifier/escape configured; degrading to default mode")
+		cfgCopy.PermissionMode = string(permission.ModeDefault)
+	}
+
+	applyBinarySandboxMode(&cfgCopy, opts.Sandbox, projectPath, opts.AddDirs)
+	// S3: fail-closed when sandbox=on but no working backend is available.
+	if err := validateSandboxRequirement(opts.Sandbox, cfgCopy.Sandbox, projectPath); err != nil {
+		return nil, err
+	}
 
 	// Change to project directory
 	oldDir, err := os.Getwd()
 	if err != nil {
-		return execRes, fmt.Errorf("failed to get current directory: %v", err)
+		return nil, fmt.Errorf("failed to get current directory: %v", err)
 	}
-	defer func() { _ = os.Chdir(oldDir) }()
-
 	if err := os.Chdir(projectPath); err != nil {
-		return execRes, fmt.Errorf("failed to change to project directory: %v", err)
+		_ = os.Chdir(oldDir)
+		return nil, fmt.Errorf("failed to change to project directory: %v", err)
 	}
 
 	// Create agent instance
 	agentInstance, err := agent.New(&cfgCopy, nil)
 	if err != nil {
-		return execRes, fmt.Errorf("failed to create agent: %v", err)
+		_ = os.Chdir(oldDir)
+		return nil, fmt.Errorf("failed to create agent: %v", err)
 	}
 
 	// Resolve and set session ID before accessing session
 	sessionID := resolveBinarySessionID(opts)
-	execRes.SessionID = sessionID
 	agentInstance.SetActiveSessionID(sessionID)
 
 	if strings.TrimSpace(opts.OutputDir) != "" {
@@ -265,7 +342,8 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 	goalCtx.Configure(&cfgCopy)
 	if goalCondition != "" {
 		if err := goalCtx.SetGoal(goalCondition); err != nil {
-			return execRes, err
+			_ = os.Chdir(oldDir)
+			return nil, err
 		}
 		if goalFromPrompt {
 			logger.Infof("Binary mode enabled /goal from prompt: %s", goalCondition)
@@ -274,8 +352,35 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 		}
 	}
 
+	return &binaryAgentContext{
+		agentInstance: agentInstance,
+		cfgCopy:       cfgCopy,
+		sessionID:     sessionID,
+		goalCtx:       goalCtx,
+		projectPath:   projectPath,
+		cleanup:       func() { _ = os.Chdir(oldDir) },
+	}, nil
+}
+
+func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions) (binaryExecution, error) {
+	execRes := binaryExecution{}
+
+	ctxAgent, err := prepareBinaryAgent(prompt, projectPath, opts, "binary")
+	if err != nil {
+		return execRes, err
+	}
+	defer ctxAgent.cleanup()
+	execRes.SessionID = ctxAgent.sessionID
+
+	agentInstance := ctxAgent.agentInstance
+	goalCtx := ctxAgent.goalCtx
+	cfgCopy := ctxAgent.cfgCopy
+	execProjectPath := ctxAgent.projectPath
+
 	// Process the prompt using ProcessStream
-	ctx := context.Background()
+	// A6: build a context with optional deadline and signal-aware cancellation.
+	ctx, ctxCancel := buildBinaryExecContext()
+	defer ctxCancel()
 	var contentResult strings.Builder
 	var streamResult strings.Builder
 	var traj []trajectoryEvent
@@ -443,8 +548,8 @@ func executeBinaryModeWithOptions(prompt, projectPath string, opts binaryOptions
 		_, err := opts.HookService.Dispatch(ctx, hookservice.EventSessionStart, "", hookservice.Input{
 			Event:         hookservice.EventSessionStart,
 			HookEventName: "SessionStart",
-			SessionID:     sessionID,
-			Cwd:           projectPath,
+			SessionID:     ctxAgent.sessionID,
+			Cwd:           execProjectPath,
 			Source:        "startup",
 		})
 		if err != nil {
@@ -627,8 +732,29 @@ func binaryExitCode(status string) int {
 	}
 }
 
+// validStatuses are the contract-compliant values for binaryResultSummary.status.
+var validStatuses = map[string]struct{}{
+	"success":     {},
+	"needs_retry": {},
+	"abandoned":   {},
+	"timeout":     {},
+}
+
+// validateSummary ensures a result summary conforms to the cross-project stdout
+// contract before it is emitted. Invalid statuses are replaced with "abandoned"
+// so orchestrators always receive a parseable payload.
+func validateSummary(summary *binaryResultSummary) error {
+	if summary == nil {
+		return fmt.Errorf("summary is nil")
+	}
+	if _, ok := validStatuses[summary.Status]; !ok {
+		return fmt.Errorf("invalid status %q", summary.Status)
+	}
+	return nil
+}
+
 // dispatchBinaryStopHook is removed — per-run result delivery now uses clean
-// stdout JSON (AgentResultSummary). The hook layer no longer transports aggregated
+// stdout JSON (binaryResultSummary). The hook layer no longer transports aggregated
 // run summaries; this matches Claude Code's design.
 
 func prepareBinaryGoal(prompt string, opts binaryOptions) (string, string, bool) {
@@ -676,8 +802,8 @@ func goalSnapshotPtr(goalCtx *agent.GoalContext) *agent.GoalState {
 
 // applyBinarySandboxMode applies binary --sandbox=auto|on|off to a config copy.
 // auto preserves standalone behavior but enables path/process isolation when an
-// embedding orchestrator environment is detected; on always enables it; off disables it.
-func applyBinarySandboxMode(cfg *config.Config, mode, projectPath string) {
+// orchestrator-spawned environment is detected; on always enables it; off disables it.
+func applyBinarySandboxMode(cfg *config.Config, mode, projectPath string, addDirs []string) {
 	mode = strings.ToLower(strings.TrimSpace(firstNonEmpty(mode, "auto")))
 	if mode == "off" {
 		if cfg.Sandbox != nil {
@@ -722,6 +848,11 @@ func applyBinarySandboxMode(cfg *config.Config, mode, projectPath string) {
 			cfg.Sandbox.ExtraWritablePaths = append(cfg.Sandbox.ExtraWritablePaths, p)
 		}
 	}
+	for _, d := range addDirs {
+		if d != "" && !stringSliceContains(cfg.Sandbox.ExtraWritablePaths, d) {
+			cfg.Sandbox.ExtraWritablePaths = append(cfg.Sandbox.ExtraWritablePaths, d)
+		}
+	}
 }
 
 func isEmbeddedBinaryExecution() bool {
@@ -744,12 +875,31 @@ func binarySandboxWritableDefaults() []string {
 	return out
 }
 
+// validateSandboxRequirement checks whether the sandbox mode requested by the
+// caller can be satisfied on the current platform.  When mode is "on" (explicit)
+// and the platform or required tooling cannot provide process isolation, this
+// function returns an error so the caller fails-closed rather than silently
+// running without any sandbox.  For mode "auto" or "off" no error is returned.
+func validateSandboxRequirement(mode string, sandboxCfg *config.SandboxConfig, workingDir string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "on" {
+		return nil
+	}
+	if _, err := sandbox.NewOrError(sandboxCfg, workingDir); err != nil {
+		return fmt.Errorf("--sandbox=on: %w", err)
+	}
+	return nil
+}
+
 // recordBinaryPromptCacheKey stores non-secret metadata for NANO_CACHE_KEY or
 // SYMPHONY_ISSUE_ID under ~/.cache/nano/<key>/prompt-cache.json. It returns the
 // sanitized key used on disk so result summaries can correlate retries without
 // writing prompt contents or secrets to cache metadata.
 func recordBinaryPromptCacheKey(prompt string) (string, error) {
-	key := firstNonEmpty(os.Getenv("NANO_CACHE_KEY"), os.Getenv("SYMPHONY_ISSUE_ID"))
+	// Prefer the explicit resume identity from the orchestrator, then legacy cache
+	// key env vars. The key is now stable and no longer depends on the prompt
+	// content, so prompt tweaks don't break retry correlation.
+	key := firstNonEmpty(os.Getenv("SYMPHONY_RESUME_IDENTITY"), os.Getenv("NANO_CACHE_KEY"), os.Getenv("SYMPHONY_ISSUE_ID"))
 	if strings.TrimSpace(key) == "" {
 		return "", nil
 	}
@@ -790,56 +940,19 @@ func runBinaryExecStreaming(cmd interface {
 	OutOrStdout() io.Writer
 	ErrOrStderr() io.Writer
 }, prompt, projectPath string, opts binaryOptions, format string, quiet bool) error {
-	cfg := config.Get()
-	if cfg == nil {
-		return fmt.Errorf("configuration not initialized")
-	}
-
-	cfgCopy := *cfg
-	if !isEmbeddedBinaryExecution() {
-		cfgCopy.EnableMCP = false
-	}
-	if cfg.OSS != nil {
-		ossCopy := *cfg.OSS
-		ossCopy.Enabled = false
-		cfgCopy.OSS = &ossCopy
-	}
-	if opts.GoalMaxTurns > 0 {
-		if cfgCopy.Goal == nil {
-			cfgCopy.Goal = &config.GoalConfig{}
-		} else {
-			goalCopy := *cfgCopy.Goal
-			cfgCopy.Goal = &goalCopy
-		}
-		cfgCopy.Goal.MaxTurns = opts.GoalMaxTurns
-	}
-	applyBinarySandboxMode(&cfgCopy, opts.Sandbox, projectPath)
-
-	// Change to project directory
-	oldDir, err := os.Getwd()
+	ctxAgent, err := prepareBinaryAgent(prompt, projectPath, opts, "binary-stream")
 	if err != nil {
-		return fmt.Errorf("failed to get current directory: %v", err)
+		return err
 	}
-	defer func() { _ = os.Chdir(oldDir) }()
+	defer ctxAgent.cleanup()
 
-	if err := os.Chdir(projectPath); err != nil {
-		return fmt.Errorf("failed to change to project directory: %v", err)
-	}
-
-	// Create agent instance
-	agentInstance, err := agent.New(&cfgCopy, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create agent: %v", err)
-	}
-
-	// Resolve and set session ID before accessing session
-	sessionID := resolveBinarySessionID(opts)
-	agentInstance.SetActiveSessionID(sessionID)
-	agentInstance.GetSessionManager().GetOrCreateSession(sessionID)
+	agentInstance := ctxAgent.agentInstance
 
 	// Create encoder for streaming output
 	enc := json.NewEncoder(cmd.OutOrStdout())
-	ctx := context.Background()
+	// A6: use a cancellable context with optional timeout, same as the non-stream path.
+	ctx, ctxCancel := buildBinaryExecContext()
+	defer ctxCancel()
 
 	// Stream events as NDJSON
 	eventHandler := func(streamEvent event.StreamEvent) {
@@ -923,4 +1036,37 @@ func stringSliceContains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// hasModeAutoEscape reports whether cfg contains at least one configuration
+// escape hatch that allows --permission-mode=auto to make meaningful progress
+// (i.e. some tool calls will be approved rather than blocked unconditionally).
+func hasModeAutoEscape(cfg *config.Config) bool {
+	return cfg.PermissionAuto != nil ||
+		len(cfg.AllowedRules) > 0 ||
+		(cfg.Daemon != nil && cfg.Daemon.ConfirmPolicy == config.ConfirmPolicyAllow) ||
+		(cfg.Daemon != nil && len(cfg.Daemon.AllowlistedTools) > 0)
+}
+
+// buildBinaryExecContext creates the execution context for a binary exec run.
+// It registers SIGTERM/SIGINT handlers so the agent can shut down gracefully
+// and still emit a partial result. Timeout is managed by the spawner layer.
+func buildBinaryExecContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Register SIGTERM / SIGINT so an operator kill translates into an orderly
+	// context cancellation, letting ProcessStream flush what it has.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			logger.Infof("binary exec: received signal %s; cancelling execution context", sig)
+			cancel()
+		case <-ctx.Done():
+		}
+		signal.Stop(sigCh)
+	}()
+
+	return ctx, cancel
 }

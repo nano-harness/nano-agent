@@ -26,6 +26,10 @@ type ClassifyRequest struct {
 	Params   map[string]interface{}
 	WorkDir  string
 	PermMode PermissionMode
+	// Transcript is a compact projection of the recent conversation history,
+	// used to detect multi-turn threats (prompt injection chains, gradual
+	// privilege escalation). May be nil when history is unavailable.
+	Transcript []TranscriptEntry
 }
 
 // ClassifyResult is the classifier's verdict.
@@ -40,11 +44,12 @@ type ClassifyResult struct {
 // CacheKey returns a stable cache key for the request.
 func (r ClassifyRequest) CacheKey() string {
 	payload := struct {
-		Tool   string                 `json:"tool"`
-		Params map[string]interface{} `json:"params"`
-		Mode   string                 `json:"mode"`
-		Cwd    string                 `json:"cwd"`
-	}{r.ToolName, r.Params, string(r.PermMode), r.WorkDir}
+		Tool       string                 `json:"tool"`
+		Params     map[string]interface{} `json:"params"`
+		Mode       string                 `json:"mode"`
+		Cwd        string                 `json:"cwd"`
+		Transcript []TranscriptEntry      `json:"transcript,omitempty"`
+	}{r.ToolName, r.Params, string(r.PermMode), r.WorkDir, r.Transcript}
 	b, _ := json.Marshal(payload)
 	sum := sha1.Sum(b)
 	return hex.EncodeToString(sum[:])
@@ -70,7 +75,7 @@ func (c *FailClosedClassifier) Classify(_ context.Context, _ ClassifyRequest) (*
 // Timeout implements Classifier.
 func (c *FailClosedClassifier) Timeout() time.Duration {
 	if c.Timeout_ <= 0 {
-		return 5 * time.Second
+		return 15 * time.Second
 	}
 	return c.Timeout_
 }
@@ -113,7 +118,7 @@ func (c *CachingClassifier) Classify(ctx context.Context, req ClassifyRequest) (
 // Timeout delegates.
 func (c *CachingClassifier) Timeout() time.Duration {
 	if c == nil || c.Delegate == nil {
-		return 5 * time.Second
+		return 15 * time.Second
 	}
 	return c.Delegate.Timeout()
 }

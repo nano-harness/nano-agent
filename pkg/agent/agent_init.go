@@ -12,6 +12,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/hookservice"
+	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/memory"
@@ -55,7 +56,6 @@ func buildAgentBootstrap(cfg *config.Config) (*agentBootstrap, error) {
 	toolbox := newAgentToolbox(cfg, workingDir)
 	llmClient := newAgentLLMClient(cfg, toolbox)
 	agentCtx, agentCancel := context.WithCancel(context.Background())
-	startToolboxLLMUpdates(agentCtx, toolbox, llmClient)
 
 	memoryManager := newAgentMemoryManager(cfg, workingDir)
 	toolScheduler := newAgentToolScheduler(cfg, toolbox)
@@ -201,7 +201,7 @@ func newAgentToolScheduler(cfg *config.Config, toolbox *tools.Toolbox) *ToolSche
 	return toolScheduler
 }
 
-func startToolboxLLMUpdates(ctx context.Context, toolbox *tools.Toolbox, client llm.LLMClient) {
+func startToolboxLLMUpdates(ctx context.Context, toolbox *tools.Toolbox, client llm.LLMClient, onToolsChanged func([]interfaces.Tool)) {
 	go func() {
 		ch := toolbox.GetToolsUpdateChannel()
 		for {
@@ -213,6 +213,9 @@ func startToolboxLLMUpdates(ctx context.Context, toolbox *tools.Toolbox, client 
 				logger.Debugf("Received tools update event: %s", event.Type)
 				client.UpdateTools(event.Tools)
 				logger.Infof("Updated LLM client with %d tools after MCP registration", len(event.Tools))
+				if onToolsChanged != nil {
+					onToolsChanged(event.Tools)
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -350,6 +353,10 @@ func newAgentPermissionManager(cfg *config.Config, workingDir string) *permissio
 				pm.SetConfidenceThreshold(cfg.PermissionAuto.ConfidenceThreshold)
 			}
 		}
+		// Apply fail-closed setting from policy.classifier if present.
+		if cfg.Policy != nil && cfg.Policy.Classifier != nil {
+			pm.SetFailClosed(cfg.Policy.Classifier.FailClosed)
+		}
 
 		maxConsecutive := cfg.PermissionAuto.DenialMaxConsecutive
 		maxTotal := cfg.PermissionAuto.DenialMaxTotal
@@ -366,6 +373,8 @@ func newAgentPermissionManager(cfg *config.Config, workingDir string) *permissio
 }
 
 // wirePermissionClassifier constructs a Classifier based on cfg.PermissionAuto settings.
+// When cfg.Policy.Classifier is enabled with two-stage configuration, a
+// TwoStageClassifier (Fast→Deep) is returned instead of a single LLMClassifier.
 func wirePermissionClassifier(cfg *config.Config) permission.Classifier {
 	if cfg.PermissionAuto == nil {
 		return nil
@@ -378,7 +387,7 @@ func wirePermissionClassifier(cfg *config.Config) permission.Classifier {
 
 	switch backend {
 	case "fail_closed":
-		timeout := 5 * time.Second
+		timeout := 15 * time.Second
 		if cfg.PermissionAuto.TimeoutSeconds > 0 {
 			timeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
 		}
@@ -388,34 +397,103 @@ func wirePermissionClassifier(cfg *config.Config) permission.Classifier {
 		}
 
 	case "llm":
-		// Use existing LLM client infrastructure
-		model := cfg.PermissionAuto.Model
-		if model == "" {
-			model = cfg.Model // fallback to main model
+		// Check for two-stage classifier configuration under policy.classifier.
+		if cfg.Policy != nil && cfg.Policy.Classifier != nil && cfg.Policy.Classifier.Enabled {
+			return wireTwoStageClassifier(cfg)
 		}
-
-		timeout := 5 * time.Second
-		if cfg.PermissionAuto.TimeoutSeconds > 0 {
-			timeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
-		}
-
-		llmClassifier := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, model, timeout)
-
-		// Wrap with caching layer
-		cacheTTL := 30 * time.Minute
-		if cfg.PermissionAuto.CacheTTLMinutes > 0 {
-			cacheTTL = time.Duration(cfg.PermissionAuto.CacheTTLMinutes) * time.Minute
-		}
-
-		return &permission.CachingClassifier{
-			Delegate: llmClassifier,
-			TTL:      cacheTTL,
-			MaxSize:  512,
-		}
+		return wireSingleStageClassifier(cfg)
 
 	default:
 		logger.Warnf("Unknown permission_auto backend %q, falling back to nil classifier", backend)
 		return nil
+	}
+}
+
+// wireSingleStageClassifier builds a single LLMClassifier wrapped with caching.
+func wireSingleStageClassifier(cfg *config.Config) permission.Classifier {
+	model := cfg.PermissionAuto.Model
+	if model == "" {
+		model = cfg.Model
+	}
+
+	timeout := 15 * time.Second
+	if cfg.PermissionAuto.TimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
+	}
+
+	llmClassifier := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, model, timeout)
+
+	cacheTTL := 30 * time.Minute
+	if cfg.PermissionAuto.CacheTTLMinutes > 0 {
+		cacheTTL = time.Duration(cfg.PermissionAuto.CacheTTLMinutes) * time.Minute
+	}
+
+	return &permission.CachingClassifier{
+		Delegate: llmClassifier,
+		TTL:      cacheTTL,
+		MaxSize:  512,
+	}
+}
+
+// wireTwoStageClassifier builds a TwoStageClassifier from policy.classifier config.
+func wireTwoStageClassifier(cfg *config.Config) permission.Classifier {
+	cc := cfg.Policy.Classifier
+
+	// Stage 1 (fast) timeout — configurable; default 15s.
+	fastTimeout := 15 * time.Second
+	if cc.Timeout > 0 {
+		fastTimeout = cc.Timeout
+	} else if cfg.PermissionAuto.TimeoutSeconds > 0 {
+		fastTimeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
+	}
+
+	// Stage 2 (deep) timeout — 2× Stage 1, minimum 15s.
+	deepTimeout := fastTimeout * 2
+	if deepTimeout < 15*time.Second {
+		deepTimeout = 15 * time.Second
+	}
+
+	// Stage 1 model: fast_model → permission_auto.model → main model.
+	fastModel := cc.FastModel
+	if fastModel == "" {
+		fastModel = cfg.PermissionAuto.Model
+	}
+	if fastModel == "" {
+		fastModel = cfg.Model
+	}
+
+	// Stage 2 model: think_model → same as fast model (degraded but functional).
+	deepModel := cc.ThinkModel
+	if deepModel == "" {
+		deepModel = fastModel
+	}
+
+	fast := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, fastModel, fastTimeout)
+	deep := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, deepModel, deepTimeout)
+
+	twoStage := &permission.TwoStageClassifier{
+		Fast:       fast,
+		Deep:       deep,
+		FailClosed: cc.FailClosed,
+	}
+
+	// Wrap with caching so identical (tool, params) pairs skip both stages.
+	cacheTTL := 30 * time.Minute
+	if cfg.PermissionAuto.CacheTTLMinutes > 0 {
+		cacheTTL = time.Duration(cfg.PermissionAuto.CacheTTLMinutes) * time.Minute
+	}
+	if cc.CacheTTL > 0 {
+		cacheTTL = cc.CacheTTL
+	}
+	cacheSize := 512
+	if cc.CacheSize > 0 {
+		cacheSize = cc.CacheSize
+	}
+
+	return &permission.CachingClassifier{
+		Delegate: twoStage,
+		TTL:      cacheTTL,
+		MaxSize:  cacheSize,
 	}
 }
 

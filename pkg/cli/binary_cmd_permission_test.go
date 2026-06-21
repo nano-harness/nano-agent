@@ -3,6 +3,7 @@ package cli
 import (
 	"testing"
 
+	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -71,6 +72,69 @@ func TestBinaryExecPermissionFlagValues(t *testing.T) {
 	}
 	if !capturedSkipPerms {
 		t.Fatal("dangerously-skip-permissions should be true")
+	}
+}
+
+// ── ModeAuto startup validation ────────────────────────────────────────────────
+
+// TestAutoModeValidationEscapeHatches verifies the logic of hasModeAutoEscape
+// used by both binary exec paths.
+func TestAutoModeValidationEscapeHatches(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       config.Config
+		wantEsc   bool
+	}{
+		{
+			name:    "no escape – empty config",
+			cfg:     config.Config{},
+			wantEsc: false,
+		},
+		{
+			name: "escape via PermissionAuto",
+			cfg: config.Config{
+				PermissionAuto: &config.PermissionAutoConfig{Backend: "llm"},
+			},
+			wantEsc: true,
+		},
+		{
+			name: "escape via AllowedRules",
+			cfg: config.Config{
+				AllowedRules: []string{"read_file"},
+			},
+			wantEsc: true,
+		},
+		{
+			name: "escape via daemon confirm_policy=allow",
+			cfg: config.Config{
+				Daemon: &config.DaemonConfig{ConfirmPolicy: config.ConfirmPolicyAllow},
+			},
+			wantEsc: true,
+		},
+		{
+			name: "escape via daemon allowlisted_tools",
+			cfg: config.Config{
+				Daemon: &config.DaemonConfig{AllowlistedTools: []string{"read_file"}},
+			},
+			wantEsc: true,
+		},
+		{
+			name: "daemon block policy is not an escape",
+			cfg: config.Config{
+				Daemon: &config.DaemonConfig{ConfirmPolicy: config.ConfirmPolicyBlock},
+			},
+			wantEsc: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			got := hasModeAutoEscape(&cfg)
+			if got != tc.wantEsc {
+				t.Errorf("hasModeAutoEscape = %v, want %v", got, tc.wantEsc)
+			}
+		})
 	}
 }
 

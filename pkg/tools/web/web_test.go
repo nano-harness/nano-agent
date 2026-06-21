@@ -2,8 +2,11 @@ package web
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -52,7 +55,19 @@ func TestWebFetchTool(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tool := NewWebFetchTool(nil)
+	// Parse the test server's host:port so it can be added to the SSRF allowlist.
+	serverHostPort, _ := func() (string, error) {
+		u, err := url.Parse(server.URL)
+		if err != nil {
+			return "", err
+		}
+		return u.Host, nil
+	}()
+
+	tool := NewWebFetchTool(map[string]interface{}{
+		// Allowlist the loopback test server so SSRF guard doesn't block it.
+		"web_ssrf_allowed_hosts": []string{serverHostPort},
+	})
 
 	tests := []struct {
 		name     string
@@ -528,5 +543,103 @@ func TestWebToolsSchema(t *testing.T) {
 	}
 	if !webSearchTool.RequiresConfirmation() {
 		t.Error("WebSearchTool should require confirmation")
+	}
+}
+
+// -- A3: SSRF protection tests
+
+func TestIsBlockedIP(t *testing.T) {
+	blockedAddrs := []string{
+		"127.0.0.1",
+		"::1",
+		"10.0.0.1",
+		"172.16.0.1",
+		"192.168.1.1",
+		"169.254.169.254",
+		"0.0.0.0",
+	}
+	for _, addr := range blockedAddrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			t.Errorf("net.ParseIP(%q) returned nil", addr)
+			continue
+		}
+		if !isBlockedIP(ip) {
+			t.Errorf("isBlockedIP(%q) = false, want true", addr)
+		}
+	}
+}
+
+func TestValidateURLForSSRF_BlocksPrivate(t *testing.T) {
+	blockedURLs := []string{
+		"http://127.0.0.1/",
+		"http://localhost/",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://10.0.0.1/",
+		"http://192.168.1.1/",
+		"http://[::1]/",
+	}
+	for _, rawURL := range blockedURLs {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			t.Errorf("url.Parse(%q) error: %v", rawURL, err)
+			continue
+		}
+		if err := validateURLForSSRF(u); err == nil {
+			t.Errorf("validateURLForSSRF(%q) = nil, want error (should be blocked)", rawURL)
+		}
+	}
+}
+
+func TestWebFetchTool_BlocksSSRF(t *testing.T) {
+	tool := NewWebFetchTool(nil)
+
+	// A test server bound to 127.0.0.1 should be blocked by the SSRF guard.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, "secret data")
+	}))
+	defer server.Close()
+
+	result, err := tool.Execute(context.Background(), map[string]interface{}{
+		"url": server.URL + "/secret",
+	})
+	if err != nil {
+		t.Fatalf("Execute returned unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("Execute should fail for loopback address (SSRF blocked)")
+	}
+	if result.Error == "" || (!strings.Contains(result.Error, "blocked") && !strings.Contains(result.Error, "security")) {
+		t.Errorf("Error message should mention blocking, got: %q", result.Error)
+	}
+}
+
+func TestWebFetchTool_BlocksRedirectToPrivate(t *testing.T) {
+	tool := NewWebFetchTool(nil)
+
+	// Server on loopback that would be the redirect target.
+	privateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, "private data")
+	}))
+	defer privateServer.Close()
+
+	// A redirect server also on loopback – both blocked, but this tests the
+	// redirect-validation path specifically.
+	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, privateServer.URL, http.StatusFound)
+	}))
+	defer redirectServer.Close()
+
+	result, err := tool.Execute(context.Background(), map[string]interface{}{
+		"url": redirectServer.URL + "/",
+	})
+	if err != nil {
+		t.Fatalf("Execute returned unexpected error: %v", err)
+	}
+	// Both initial URL and redirect target are loopback – must be blocked.
+	if result.Success {
+		t.Error("Execute should fail when both origin and redirect target are private addresses")
 	}
 }

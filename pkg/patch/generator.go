@@ -31,7 +31,7 @@ func (g *Generator) GenerateGitDiff() (string, error) {
 	}
 
 	defer func() {
-		os.Chdir(originalDir) //nolint:errcheck
+		_ = os.Chdir(originalDir)
 	}()
 
 	if err := os.Chdir(g.projectPath); err != nil {
@@ -77,7 +77,7 @@ func (g *Generator) GenerateUnifiedDiff(files []string) (string, error) {
 	}
 
 	defer func() {
-		os.Chdir(originalDir) //nolint:errcheck
+		_ = os.Chdir(originalDir)
 	}()
 
 	if err := os.Chdir(g.projectPath); err != nil {
@@ -142,7 +142,7 @@ func (g *Generator) GetChangedFiles() ([]string, error) {
 	}
 
 	defer func() {
-		os.Chdir(originalDir) //nolint:errcheck
+		_ = os.Chdir(originalDir)
 	}()
 
 	if err := os.Chdir(g.projectPath); err != nil {
@@ -203,7 +203,7 @@ func (g *Generator) GetGitStatus() (string, error) {
 	}
 
 	defer func() {
-		os.Chdir(originalDir) //nolint:errcheck
+		_ = os.Chdir(originalDir)
 	}()
 
 	if err := os.Chdir(g.projectPath); err != nil {
@@ -228,7 +228,7 @@ func (g *Generator) StageAllChanges() error {
 	}
 
 	defer func() {
-		os.Chdir(originalDir) //nolint:errcheck
+		_ = os.Chdir(originalDir)
 	}()
 
 	if err := os.Chdir(g.projectPath); err != nil {

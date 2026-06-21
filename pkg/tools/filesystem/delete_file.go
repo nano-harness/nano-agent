@@ -318,7 +318,7 @@ func (t *DeleteFileTool) Execute(ctx context.Context, params map[string]interfac
 }
 
 func (t *DeleteFileTool) validatePath(path string) (string, error) {
-	return validatePathCommon(t.workingDir, path)
+	return validatePathCommon(t.workingDir, path, t.pathChecker.AllowedPaths())
 }
 
 // previewItems collects items that would be affected by deletion

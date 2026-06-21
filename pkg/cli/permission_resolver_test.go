@@ -108,8 +108,9 @@ func TestResolvePermission_SkipPermsWins(t *testing.T) {
 	}
 }
 
-// TestResolvePermission_AutoFlipsConfirmPolicy verifies auto mode sets confirm_policy=block.
-func TestResolvePermission_AutoFlipsConfirmPolicy(t *testing.T) {
+// TestResolvePermission_AutoNoSideEffect verifies auto mode no longer mutates
+// cfg.Daemon.ConfirmPolicy and produces no warnings (diagnostic is logged instead).
+func TestResolvePermission_AutoNoSideEffect(t *testing.T) {
 	cfg := &config.Config{PermissionMode: "auto"}
 	opts := PermissionResolveOpts{}
 
@@ -118,14 +119,12 @@ func TestResolvePermission_AutoFlipsConfirmPolicy(t *testing.T) {
 	if res.Mode != permission.ModeAuto {
 		t.Errorf("expected mode=auto, got mode=%s", res.Mode)
 	}
-	if res.ConfirmPolicy != config.ConfirmPolicyBlock {
-		t.Errorf("expected confirm_policy=block, got %s", res.ConfirmPolicy)
+	// No side effect: ConfirmPolicy must not be mutated.
+	if cfg.Daemon != nil && cfg.Daemon.ConfirmPolicy == config.ConfirmPolicyBlock {
+		t.Error("auto mode must not set cfg.Daemon.ConfirmPolicy to block")
 	}
-	if cfg.Daemon == nil || cfg.Daemon.ConfirmPolicy != config.ConfirmPolicyBlock {
-		t.Errorf("expected cfg.Daemon.ConfirmPolicy=block, got nil or wrong value")
-	}
-	if len(warns) != 1 {
-		t.Errorf("expected 1 warning (no PermissionAuto config), got %v", warns)
+	if len(warns) != 0 {
+		t.Errorf("expected no warnings (diagnostic is logged, not warned), got %v", warns)
 	}
 }
 

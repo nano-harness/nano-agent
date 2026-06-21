@@ -408,7 +408,7 @@ func (s *Service) runCommandHook(ctx context.Context, h *Hook, input Input) (*De
 	command := "sh"
 	args := []string{"-c", h.Command}
 	workingDir := s.options.WorkingDir
-	env := os.Environ()
+	env := sanitizeHookEnv(os.Environ())
 
 	var sandboxEnv *sandbox.SandboxEnvironment
 	if s.options.SandboxRuntime != nil {
@@ -488,13 +488,13 @@ func (s *Service) runCommandHook(ctx context.Context, h *Hook, input Input) (*De
 	waitErr := cmd.Wait()
 	wg.Wait()
 
+	// A broken-pipe stdin write error is expected when the hook process exits
+	// before reading all its input (e.g. `exit 2` runs immediately). Log it as
+	// a debug note but let the exit code take precedence.
+	var stdinWarning string
 	if writeErr != nil {
-		return &Decision{
-			Action:   ActionAllow,
-			Reason:   "hook warning",
-			Rule:     h.Name,
-			Warnings: []string{fmt.Sprintf("hook %q stdin write failed: %v", h.Name, writeErr)},
-		}, nil
+		stdinWarning = fmt.Sprintf("hook %q stdin write failed: %v", h.Name, writeErr)
+		logger.Debugf("%s", stdinWarning)
 	}
 
 	stdoutText := strings.TrimSpace(string(outBytes))
@@ -506,7 +506,11 @@ func (s *Service) runCommandHook(ctx context.Context, h *Hook, input Input) (*De
 
 	// Exit-code protocol: 0=allow, 2=block, others=warn+allow.
 	if waitErr == nil {
-		return &Decision{Action: ActionAllow, Reason: "hook " + h.Name + " allowed", Rule: h.Name}, nil
+		d := &Decision{Action: ActionAllow, Reason: "hook " + h.Name + " allowed", Rule: h.Name}
+		if stdinWarning != "" {
+			d.Warnings = append(d.Warnings, stdinWarning)
+		}
+		return d, nil
 	}
 	if exitErr, ok := waitErr.(*exec.ExitError); ok {
 		switch exitErr.ExitCode() {
@@ -717,4 +721,42 @@ func firstNonEmpty(v ...string) string {
 		}
 	}
 	return ""
+}
+
+// sensitiveEnvSuffixes lists case-insensitive variable name suffixes that are
+// considered credential-bearing and must never be forwarded to hook subprocesses.
+var sensitiveEnvSuffixes = []string{
+	"_API_KEY",
+	"_SECRET",
+	"_TOKEN",
+	"_PASSWORD",
+	"_CREDENTIALS",
+	"_ACCESS_KEY",
+	"_PRIVATE_KEY",
+}
+
+// sanitizeHookEnv removes credential-bearing environment variables from environ
+// before they are passed to a hook subprocess.  This prevents hook scripts from
+// exfiltrating secrets regardless of whether a sandbox runtime is configured.
+func sanitizeHookEnv(environ []string) []string {
+	result := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			result = append(result, entry)
+			continue
+		}
+		upper := strings.ToUpper(key)
+		sensitive := false
+		for _, suffix := range sensitiveEnvSuffixes {
+			if strings.HasSuffix(upper, suffix) {
+				sensitive = true
+				break
+			}
+		}
+		if !sensitive {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
