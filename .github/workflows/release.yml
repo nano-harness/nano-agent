@@ -100,6 +100,7 @@ jobs:
 
       - name: Setup ossutil
         run: |
+          if [ -z "${{ secrets.RELEASE_OSS_ACCESS_KEY_ID }}" ]; then echo "OSS secrets not configured; skipping step"; exit 0; fi
           curl -sSL https://gosspublic.alicdn.com/ossutil/v2/2.2.1/ossutil-2.2.1-linux-amd64.zip -o ossutil.zip
           unzip ossutil.zip
           sudo mv ossutil-2.2.1-linux-amd64/ossutil /usr/local/bin/ossutil
@@ -109,6 +110,7 @@ jobs:
           OSS_ACCESS_KEY_ID: ${{ secrets.RELEASE_OSS_ACCESS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.RELEASE_OSS_ACCESS_KEY_SECRET }}
         run: |
+          if [ -z "${{ secrets.RELEASE_OSS_ACCESS_KEY_ID }}" ]; then echo "OSS secrets not configured; skipping step"; exit 0; fi
           TAG=${{ github.ref_name }}
           ossutil cp dist/nano-linux-amd64         oss://binary-releases/nano/releases/${TAG}/nano-linux-amd64         --force --region cn-hangzhou
           ossutil cp dist/nano-linux-amd64.sha256  oss://binary-releases/nano/releases/${TAG}/nano-linux-amd64.sha256  --force --region cn-hangzhou
@@ -126,6 +128,7 @@ jobs:
           OSS_ACCESS_KEY_ID: ${{ secrets.RELEASE_OSS_ACCESS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.RELEASE_OSS_ACCESS_KEY_SECRET }}
         run: |
+          if [ -z "${{ secrets.RELEASE_OSS_ACCESS_KEY_ID }}" ]; then echo "OSS secrets not configured; skipping step"; exit 0; fi
           TAG=${{ github.ref_name }}
           echo "${TAG}" > version.txt
           ossutil cp dist/nano-linux-amd64         oss://binary-releases/nano/latest/nano-linux-amd64         --force --region cn-hangzhou
