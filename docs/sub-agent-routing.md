@@ -1,5 +1,7 @@
 # Sub-agent model routing
 
+[中文](./sub-agent-routing.zh-CN.md)
+
 Sub-agents reuse the lead agent's multi-provider routing configuration from `.nano.yaml`: `providers`, top-level `fallbacks`, and `model_routing`.
 
 ## Resolution rules

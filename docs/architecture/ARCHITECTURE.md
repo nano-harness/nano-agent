@@ -1,5 +1,7 @@
 # Architecture
 
+[中文](./ARCHITECTURE.zh-CN.md)
+
 This document summarizes the refactored nano-agent architecture and points to the detailed subsystem documents.
 
 ## Layering

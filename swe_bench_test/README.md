@@ -1,6 +1,6 @@
 # SWE-bench Evaluation for Nano-Agent
 
-English | [中文版本](README_zh.md)
+[中文](./README.zh-CN.md)
 
 This is an optimized SWE-bench evaluation script that supports using pre-built Docker images and binary mode execution for nano-agent tasks.
 
@@ -240,7 +240,7 @@ swe_bench_test/
 ├── run_swe_bench.py     # Main test script (simplified configuration)
 ├── requirements.txt     # Python dependencies
 ├── README.md           # Documentation (English)
-├── README_zh.md        # Documentation (Chinese)
+├── README.zh-CN.md     # Documentation (Chinese)
 ├── config_templates/    # Configuration template directory
 │   └── swebench_config.yaml  # Simplified configuration template
 ├── SWE-bench/          # SWE-bench repository (auto-cloned)

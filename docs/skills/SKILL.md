@@ -5,6 +5,8 @@ description: Use when configuring nano-agent startup modes (TUI, binary, ACP, da
 
 # Nano-Agent Startup Modes Configuration Guide
 
+[中文](./SKILL.zh-CN.md)
+
 ## Overview
 
 nano-agent supports four operational modes, each optimized for different use cases:

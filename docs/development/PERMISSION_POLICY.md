@@ -1,5 +1,7 @@
 # Permission Policy
 
+[中文](./PERMISSION_POLICY.zh-CN.md)
+
 This document records the refactor-era permission and approval model.
 
 ## Permission sources

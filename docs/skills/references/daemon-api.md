@@ -1,5 +1,7 @@
 # Daemon Mode API Reference
 
+[中文](./daemon-api.zh-CN.md)
+
 Complete API documentation for nano-agent daemon mode HTTP endpoints and WebSocket streaming.
 
 ## Base Configuration

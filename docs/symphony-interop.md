@@ -1,5 +1,7 @@
 # nano-agent Binary Execution Contract
 
+[中文](./symphony-interop.zh-CN.md)
+
 > This document codifies the stable interface contract for `nano-agent` binary
 > execution (`nano binary exec`, `nano binary swebench`). Orchestrators such as
 > `nano-symphony` rely on these invariants. Any breaking change to the items

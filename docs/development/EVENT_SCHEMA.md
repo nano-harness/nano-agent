@@ -1,5 +1,7 @@
 # Event Schema
 
+[中文](./EVENT_SCHEMA.zh-CN.md)
+
 This document summarizes public event, replay, and audit schema contracts. Field-level examples are maintained in `docs/EXTENSION_EVENT_SCHEMA.md`.
 
 ## Public stream events

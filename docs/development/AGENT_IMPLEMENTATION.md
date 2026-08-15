@@ -1,10 +1,12 @@
-# nano-agent 当前 Agent 实现逻辑
+# nano-agent Current Agent Implementation Logic
 
-本文聚焦当前仓库里 `pkg/agent` 的主实现，说明一个请求是如何从 `Agent` 初始化一路走到 LLM 调用、工具执行、上下文压缩、会话管理以及子代理分发的。
+[中文](./AGENT_IMPLEMENTATION.zh-CN.md)
 
-## 1. 入口与核心对象
+This document focuses on the main implementation under `pkg/agent` in the current repository, explaining how a request flows from `Agent` initialization all the way through LLM calls, tool execution, context compression, session management, and subagent dispatch.
 
-当前 agent 的主入口在：
+## 1. Entry Points and Core Objects
+
+The main entry points of the current agent are:
 
 - `pkg/agent/agent.go`
 - `pkg/agent/turn.go`
@@ -13,166 +15,166 @@
 - `pkg/agent/session.go`
 - `pkg/agent/context_compression.go`
 
-其中最核心的两个对象是：
+The two most central objects are:
 
-1. `Agent`：负责初始化运行环境、维护 toolbox / llm client / session manager / sub-agent 配置，并作为外部请求入口。
-2. `Turn`：负责一次具体的执行回合（turn），内部包含 LLM 调用循环、工具调用、终止条件判断和上下文压缩逻辑。
-
----
-
-## 2. Agent 初始化流程
-
-`pkg/agent/agent.go` 中的 `New(cfg, approvalHandler)` 会完成主 agent 的初始化。
-
-### 2.1 初始化阶段做了什么
-
-1. 读取当前工作目录，构造 `tools.ToolboxConfig`
-2. 创建 `sandbox.Middleware`（如果配置启用）
-3. 创建 `tools.Toolbox`
-4. 用 `toolbox.List()` 初始化 `llm.Client`
-5. 启动一个 goroutine 监听 MCP 工具更新，并同步给 `llmClient.UpdateTools(...)`
-6. 创建 `memory.Manager`
-7. 创建 `ToolRecoveryStrategy` 和 `ToolScheduler`
-8. 创建 `SessionManager`
-9. 注册主代理、配置里的静态子代理、`unified_agent` 工具
-10. 如果当前不是子代理，再注册 `spawn_sub_agents` 工具
-11. 如果启用了 MCP，则异步启动 MCP client
-
-### 2.2 初始化后的关键成员
-
-`Agent` 实例里几个最重要的字段：
-
-- `toolbox`：统一的工具注册表
-- `llmClient`：负责流式 LLM 调用
-- `toolScheduler`：负责并行工具调度、审批、重试与状态事件
-- `memoryManager`：内存管理入口
-- `sessionManager`：多 session 会话隔离
-- `subAgents`：来自配置文件的静态子代理定义
-- `loopDetector`：用于回合内循环检测
+1. `Agent`: responsible for initializing the runtime environment, maintaining the toolbox / llm client / session manager / sub-agent configuration, and serving as the entry point for external requests.
+2. `Turn`: responsible for one concrete execution turn, internally containing the LLM call loop, tool invocation, termination-condition checks, and context compression logic.
 
 ---
 
-## 3. 请求处理主路径
+## 2. Agent Initialization Flow
 
-对外常用入口最终都会走到：
+`New(cfg, approvalHandler)` in `pkg/agent/agent.go` performs the initialization of the main agent.
+
+### 2.1 What Initialization Does
+
+1. Reads the current working directory and builds a `tools.ToolboxConfig`
+2. Creates the `sandbox.Middleware` (if enabled in the configuration)
+3. Creates the `tools.Toolbox`
+4. Initializes the `llm.Client` using `toolbox.List()`
+5. Starts a goroutine that listens for MCP tool updates and syncs them via `llmClient.UpdateTools(...)`
+6. Creates the `memory.Manager`
+7. Creates the `ToolRecoveryStrategy` and the `ToolScheduler`
+8. Creates the `SessionManager`
+9. Registers the main agent, the static subagents from the configuration, and the `unified_agent` tool
+10. If the current agent is not a subagent, also registers the `spawn_sub_agents` tool
+11. If MCP is enabled, starts the MCP client asynchronously
+
+### 2.2 Key Members After Initialization
+
+The most important fields on an `Agent` instance:
+
+- `toolbox`: the unified tool registry
+- `llmClient`: handles streaming LLM calls
+- `toolScheduler`: handles parallel tool scheduling, approval, retries, and status events
+- `memoryManager`: entry point for memory management
+- `sessionManager`: multi-session conversation isolation
+- `subAgents`: static subagent definitions from the config file
+- `loopDetector`: used for loop detection within a turn
+
+---
+
+## 3. Main Request-Handling Path
+
+The commonly used external entry points all eventually funnel into:
 
 - `ProcessStream(...)`
 - `ProcessStreamWithMultimodal(...)`
 - `ProcessStreamWithMultimodalAndSession(...)`
 
-真正核心的是 `ProcessStreamWithMultimodalAndSession()`。
+The true core is `ProcessStreamWithMultimodalAndSession()`.
 
-### 3.1 Session 先行
+### 3.1 Session First
 
-在 `pkg/agent/agent.go` 中：
+In `pkg/agent/agent.go`:
 
-1. 先通过 `sessionManager.GetOrCreateSession(sessionID)` 获取或创建会话
-2. 发送 `session_info` 事件
-3. 再调用 `processStreamWithSessionInternal(...)`
+1. First, get or create the session via `sessionManager.GetOrCreateSession(sessionID)`
+2. Send the `session_info` event
+3. Then call `processStreamWithSessionInternal(...)`
 
-这意味着 nano-agent 的多轮对话上下文不是直接挂在 `Agent` 上，而是挂在 `Session` 上。
+This means nano-agent's multi-turn conversation context is not attached directly to the `Agent`, but to the `Session`.
 
-### 3.2 processStreamWithSessionInternal 的职责
+### 3.2 Responsibilities of processStreamWithSessionInternal
 
-这个方法是主路由函数，主要做 5 件事：
+This method is the main routing function. It mainly does five things:
 
-1. 解析 slash command，并根据命令定义临时限制本轮允许使用的工具
-2. 检测是否显式触发子代理，或者是否应该走子代理选择器
-3. 如果命中了子代理，则走统一代理工具或兼容旧的子代理执行路径
-4. 如果没有命中子代理，则继续走主 agent 的 turn 执行
-5. 从当前 session 取出历史消息，构造 `TurnConfig`，再创建并执行 `Turn`
+1. Parses slash commands and temporarily restricts the tools allowed in this turn according to the command definition
+2. Detects whether a subagent was explicitly triggered, or whether the subagent selector should be consulted
+3. If a subagent is matched, goes through the unified agent tool or falls back to the legacy subagent execution path
+4. If no subagent is matched, continues with the main agent's turn execution
+5. Retrieves the history messages from the current session, builds a `TurnConfig`, then creates and executes a `Turn`
 
 ---
 
-## 4. 子代理路由逻辑
+## 4. Subagent Routing Logic
 
-### 4.1 触发检测
+### 4.1 Trigger Detection
 
-当前主逻辑里分成两层：
+The current main logic has two layers:
 
 1. `detectTriggeredSubAgents(userInput)`
-   - 解析显式触发模式，例如 `@agentName`、`使用[agentName]`、`with:agentName`
+   - Parses explicit trigger patterns, e.g. `@agentName`, `使用[agentName]`, `with:agentName`
 2. `shouldUseSubAgent(userInput)`
-   - 调用 `subAgentSelector.SelectSubAgent(...)`
-   - 用于做非显式但策略驱动的子代理选择
+   - Calls `subAgentSelector.SelectSubAgent(...)`
+   - Used for non-explicit but policy-driven subagent selection
 
-如果两层都没有命中，就直接用主 agent 继续执行，不额外让 LLM 先做一次编排判断。
+If neither layer matches, execution simply continues with the main agent, without asking the LLM to make an extra orchestration decision first.
 
-### 4.2 命中子代理后的执行路径
+### 4.2 Execution Path After a Subagent Match
 
-如果 toolbox 里注册了 `unified_agent` 工具，则优先走：
+If the `unified_agent` tool is registered in the toolbox, the preferred path is:
 
 - `processWithUnifiedTool(...)`
 
-否则回退到旧路径：
+Otherwise it falls back to the legacy paths:
 
-- 单个子代理：`processWithSubAgent(...)`
-- 多个子代理：`processWithMultipleSubAgents(...)`
+- Single subagent: `processWithSubAgent(...)`
+- Multiple subagents: `processWithMultipleSubAgents(...)`
 
-### 4.3 多子代理模式
+### 4.3 Multiple-Subagent Mode
 
-`processWithMultipleSubAgents(...)` 会：
+`processWithMultipleSubAgents(...)` will:
 
-1. 并发启动多个子代理
-2. 给每个子代理的输出加上前缀
-3. 收集所有子代理的有效输出
-4. 等所有子代理完成后，再由主 agent 统一做聚合总结
+1. Start multiple subagents concurrently
+2. Prefix each subagent's output
+3. Collect the valid output from all subagents
+4. After all subagents finish, have the main agent produce a unified aggregated summary
 
-因此它本质上是“并发执行 + 主代理汇总”的模式。
+So it is essentially a "concurrent execution + main-agent aggregation" pattern.
 
-### 4.4 单子代理模式
+### 4.4 Single-Subagent Mode
 
-`processWithSubAgent(...)` 会：
+`processWithSubAgent(...)` will:
 
-1. 根据 `agentName` 找到配置项
-2. 如果配置 `UseIPC=true`，转走 `processWithSubAgentIPC(...)`
-3. 否则在当前进程里克隆一份配置，创建短生命周期子 agent
-4. 把 `SubAgents` 清空，避免递归继续委派
-5. 根据 `AllowedTools` 过滤子代理可见工具
-6. 如果内存功能启用，再补注册 memory tools
-7. 重新调用 `subAgent.llmClient.UpdateTools(allowedTools)`
-8. 最后让这个子 agent 自己执行 `ProcessStream(...)`
+1. Find the configuration entry by `agentName`
+2. If the config has `UseIPC=true`, hand off to `processWithSubAgentIPC(...)`
+3. Otherwise clone a copy of the configuration in the current process and create a short-lived child agent
+4. Clear `SubAgents` to prevent recursive further delegation
+5. Filter the tools visible to the subagent according to `AllowedTools`
+6. If the memory feature is enabled, additionally register the memory tools
+7. Re-invoke `subAgent.llmClient.UpdateTools(allowedTools)`
+8. Finally, let this child agent run `ProcessStream(...)` itself
 
-### 4.5 IPC 子代理模式
+### 4.5 IPC Subagent Mode
 
-`processWithSubAgentIPC(...)` 是另一个隔离层次：
+`processWithSubAgentIPC(...)` is another level of isolation:
 
-1. 启动本地临时 HTTP 子进程
-2. 随机分配本地端口和 API key
-3. 用健康检查等待服务 ready
-4. 再通过本地 IPC client 把任务转给子代理
+1. Starts a local temporary HTTP subprocess
+2. Randomly assigns a local port and API key
+3. Waits for the service to become ready via a health check
+4. Then forwards the task to the subagent through the local IPC client
 
-这个模式适合更强隔离，但成本也更高。
+This mode is suitable for stronger isolation, but it also costs more.
 
-### 4.6 动态子代理
+### 4.6 Dynamic Subagents
 
-除了配置文件里的静态子代理，当前实现还支持运行时动态创建子代理：
+Besides the static subagents from the config file, the current implementation also supports creating subagents dynamically at runtime:
 
-- 工具入口：`pkg/agent/spawn_subagents_tool.go`
-- 运行实体：`pkg/agent/dynamic_subagent.go`
+- Tool entry point: `pkg/agent/spawn_subagents_tool.go`
+- Runtime entity: `pkg/agent/dynamic_subagent.go`
 
-主 agent 会在自身初始化时注册 `spawn_sub_agents`，但只注册给顶层主 agent，不注册给子代理。  
-这样主 agent 可以在执行过程中临时创建 `DynamicSubAgent`，而子代理不会无限递归继续生成新的子代理。
+The main agent registers `spawn_sub_agents` during its own initialization, but only for the top-level main agent, not for subagents.  
+This way the main agent can create a `DynamicSubAgent` on the fly during execution, while subagents cannot recursively keep spawning new subagents indefinitely.
 
-`DynamicSubAgent` 的执行方式和静态 in-process 子代理类似：
+A `DynamicSubAgent` executes similarly to a static in-process subagent:
 
-1. 继承父 agent 的基础配置与 toolbox
-2. 使用传入的 `systemPrompt` 定制角色
-3. 清空 `SubAgents`
-4. 设置 `IsSubAgent=true`
-5. 创建一个短生命周期的派生 agent 执行任务
+1. Inherits the parent agent's base configuration and toolbox
+2. Uses the passed-in `systemPrompt` to customize the role
+3. Clears `SubAgents`
+4. Sets `IsSubAgent=true`
+5. Creates a short-lived derived agent to execute the task
 
-### 4.7 AgentProfile 与 team-lead teammate
+### 4.7 AgentProfile and team-lead teammate
 
-PR 12 的配置化 multi-agent 入口使用项目目录下的 `.nano/agents`：
+The configurable multi-agent entry from PR 12 uses `.nano/agents` under the project directory:
 
-- `pkg/agentprofile` 负责发现 `.nano/agents/*.yaml|*.yml|*.json|*.md`。
-- profile 字段包括 `name`、`description`、`initial_prompt`、`permission_mode`、`allowed_tools`、`model`、`kind`、`color`。
-- `@agent-name <task>` 已弃用：自定义 agent profile 现在通过 `/agent-name <task>` 触发（dispatcher 会改写为 `spawn_teammate` 调用指引）。
-- `spawn_teammate` 会读取同名 profile，缺省填充 `initial_prompt`、`permission_mode`、`kind` 与 `color`。
-- teammate runner 会复制父配置并为子 agent 单独设置 profile 中声明的 permission mode，避免修改父 agent 权限。
+- `pkg/agentprofile` is responsible for discovering `.nano/agents/*.yaml|*.yml|*.json|*.md`.
+- Profile fields include `name`, `description`, `initial_prompt`, `permission_mode`, `allowed_tools`, `model`, `kind`, and `color`.
+- `@agent-name <task>` is deprecated: custom agent profiles are now triggered via `/agent-name <task>` (the dispatcher rewrites it into guidance for a `spawn_teammate` call).
+- `spawn_teammate` reads the profile of the same name, filling in defaults for `initial_prompt`, `permission_mode`, `kind`, and `color` when missing.
+- The teammate runner copies the parent configuration and separately sets the permission mode declared in the profile for the child agent, avoiding modifying the parent agent's permissions.
 
-示例：
+Example:
 
 ```yaml
 # .nano/agents/reviewer.yaml
@@ -186,171 +188,171 @@ color: "#00ff00"
 
 ---
 
-## 5. Turn 执行循环
+## 5. Turn Execution Loop
 
-主 agent 没有走子代理时，会创建 `Turn` 并调用 `Turn.Execute(ctx)`。  
-这部分是当前 agent 的核心闭环。
+When the main agent does not route to a subagent, it creates a `Turn` and calls `Turn.Execute(ctx)`.  
+This part is the core closed loop of the current agent.
 
-### 5.1 Turn 初始化
+### 5.1 Turn Initialization
 
-`NewTurnWithMultimodal(...)` 会把以下内容打包进 turn：
+`NewTurnWithMultimodal(...)` packs the following into the turn:
 
-- 当前工作目录
-- toolbox
-- llm client
-- memory manager
-- tool scheduler
-- 当前 session 的历史消息
-- 系统提示词构建器 `SystemPromptBuilder`
-- 上下文压缩策略 `CompressionStrategy`
-- 完成条件 `CompletionCriteria`
+- The current working directory
+- The toolbox
+- The llm client
+- The memory manager
+- The tool scheduler
+- The history messages of the current session
+- The system prompt builder `SystemPromptBuilder`
+- The context compression strategy `CompressionStrategy`
+- The completion conditions `CompletionCriteria`
 
-### 5.2 Execute 主循环
+### 5.2 Execute Main Loop
 
-`Turn.Execute()` 的主循环大致如下：
+The main loop of `Turn.Execute()` is roughly:
 
-1. 发送 planner / executor 状态事件
-2. 判断是否满足终止条件
-3. 调用 `requestOpenAIAPI(ctx)`
-4. 获取 LLM 的文本输出和工具调用列表
-5. 若没有工具调用，检查是否违反了必须调用 `task_done` 的协议
-6. 若有工具调用，则并行执行工具
-7. 把工具结果追加回消息上下文
-8. 检查是否完成
-9. 循环进入下一轮
+1. Send planner / executor status events
+2. Check whether the termination conditions are met
+3. Call `requestOpenAIAPI(ctx)`
+4. Get the LLM's text output and tool-call list
+5. If there are no tool calls, check whether the protocol requiring a `task_done` call was violated
+6. If there are tool calls, execute the tools in parallel
+7. Append the tool results back into the message context
+8. Check whether the task is complete
+9. Loop into the next round
 
-结束时还会尝试保存会话记忆，并关闭 turn。
-
----
-
-## 6. LLM 调用前后发生了什么
-
-`Turn.requestOpenAIAPI(ctx)` 里关键步骤很清晰：
-
-1. `ensureSystemPrompt()`：确保 system prompt 已经插入消息列表
-2. `ensureUserMessage()`：确保当前用户输入只追加一次
-3. `ShouldCompress()`：如果上下文接近阈值则先压缩
-4. `LLMClient.StreamCompletion(...)`：执行流式生成
-5. 将 assistant 回复和 tool calls 追加回 `t.Messages`
-6. 增加当前 iteration 计数
-
-这里的一个关键点是：**system prompt、历史消息、当前用户输入、工具结果消息，最终都会统一落在 `t.Messages` 上，作为下一轮 LLM 的完整上下文。**
+At the end it also attempts to save the session memory and closes the turn.
 
 ---
 
-## 7. 系统提示词是怎么拼起来的
+## 6. What Happens Before and After an LLM Call
 
-系统提示词逻辑主要在 `pkg/agent/system_prompt.go`。
+The key steps inside `Turn.requestOpenAIAPI(ctx)` are quite clear:
 
-`BuildEnhancedSystemPrompt(...)` 在当前实现里大致由几部分拼接而成：
+1. `ensureSystemPrompt()`: ensures the system prompt has been inserted into the message list
+2. `ensureUserMessage()`: ensures the current user input is appended only once
+3. `ShouldCompress()`: compresses first if the context is approaching the threshold
+4. `LLMClient.StreamCompletion(...)`: performs the streaming generation
+5. Appends the assistant reply and tool calls back to `t.Messages`
+6. Increments the current iteration counter
 
-1. `BuildBaseSystemPrompt()`：基础角色说明、工作目录、git/sandbox 环境信息
-2. 用户环境信息：时区、操作系统、shell、editor、可用编程工具
-3. 工具目录：按类别列出工具、参数 schema、required 字段和示例参数
-4. 子代理说明：当前可用子代理、模型、允许工具、system prompt
-5. 执行策略：工具调用规范、执行时的原则
-6. 当前 goals：如果 turn 配置里带了 goals，会附加到 prompt 末尾
-
-因此当前 nano-agent 的 prompt 不是一个固定模板，而是“基础模板 + 环境信息 + 工具清单 + 子代理能力 + 当前目标”的组合产物。
+One key point here: **the system prompt, history messages, current user input, and tool-result messages all ultimately land on `t.Messages`, serving as the complete context for the next LLM call.**
 
 ---
 
-## 8. 工具调用与并行调度
+## 7. How the System Prompt Is Assembled
 
-工具调度核心在 `pkg/agent/tool_scheduler.go`。
+The system prompt logic lives mainly in `pkg/agent/system_prompt.go`.
 
-### 8.1 Turn 里如何执行工具
+In the current implementation, `BuildEnhancedSystemPrompt(...)` is assembled from roughly these parts:
 
-在 `Turn.Execute()` 中，模型返回的 tool calls 会先被转换成 `ToolToExecute`，然后统一走：
+1. `BuildBaseSystemPrompt()`: base role description, working directory, git/sandbox environment info
+2. User environment info: timezone, operating system, shell, editor, available programming tools
+3. Tool catalog: tools listed by category, with parameter schemas, required fields, and example parameters
+4. Subagent descriptions: currently available subagents, models, allowed tools, and system prompts
+5. Execution policy: tool-call conventions and principles to follow during execution
+6. Current goals: if the turn configuration carries goals, they are appended to the end of the prompt
+
+So the current nano-agent prompt is not a fixed template, but a composite of "base template + environment info + tool inventory + subagent capabilities + current goals".
+
+---
+
+## 8. Tool Invocation and Parallel Scheduling
+
+The core of tool scheduling is in `pkg/agent/tool_scheduler.go`.
+
+### 8.1 How Tools Are Executed Inside a Turn
+
+In `Turn.Execute()`, the tool calls returned by the model are first converted into `ToolToExecute`, and then uniformly go through:
 
 - `executeToolCallsInParallel(...)`
-- 底层实际调用 `ToolScheduler.ExecuteParallel(...)`
+- Which underneath actually calls `ToolScheduler.ExecuteParallel(...)`
 
-### 8.2 ToolScheduler 做什么
+### 8.2 What ToolScheduler Does
 
-`ToolScheduler` 负责：
+`ToolScheduler` is responsible for:
 
-- 工具调用校验
-- 状态流转：`validating` → `scheduled` → `executing` → `success/error/cancelled`
-- 审批流（如果配置了 `approvalHandler`）
-- 并发执行
-- 重试与恢复策略
-- 向上层发送 worker 事件
+- Tool-call validation
+- State transitions: `validating` → `scheduled` → `executing` → `success/error/cancelled`
+- The approval flow (if an `approvalHandler` is configured)
+- Concurrent execution
+- Retry and recovery strategies
+- Sending worker events upward
 
-这意味着 turn 本身更像“编排者”，真正的工具生命周期管理集中在 scheduler 中。
+This means the turn itself is more like an "orchestrator", while the real tool lifecycle management is centralized in the scheduler.
 
-### 8.3 工具结果如何回流到上下文
+### 8.3 How Tool Results Flow Back into the Context
 
-工具执行完成后，`addToolResultsToContext(...)` 会：
+After tool execution completes, `addToolResultsToContext(...)` will:
 
-1. 把每个结果包装成 `role=tool` 的消息
-2. 追加到 `t.Messages`
-3. 记入 `t.ToolResults`
-4. 记录 execution history
-5. 如果工具是 `task_done` 且成功，则标记任务完成
+1. Wrap each result into a `role=tool` message
+2. Append it to `t.Messages`
+3. Record it in `t.ToolResults`
+4. Record the execution history
+5. If the tool is `task_done` and it succeeded, mark the task as complete
 
 ---
 
-## 9. 上下文压缩逻辑
+## 9. Context Compression Logic
 
-上下文压缩在 `pkg/agent/context_compression.go` 与 `pkg/agent/turn.go`。
+Context compression lives in `pkg/agent/context_compression.go` and `pkg/agent/turn.go`.
 
-### 9.1 什么时候触发
+### 9.1 When It Triggers
 
-在每次 LLM 调用前，`requestOpenAIAPI()` 都会先检查：
+Before every LLM call, `requestOpenAIAPI()` first checks:
 
 - `t.ShouldCompress()`
 
-如果 token 使用量接近阈值，就执行 `CompressMessages(...)`。
+If token usage is approaching the threshold, it runs `CompressMessages(...)`.
 
-### 9.2 压缩策略
+### 9.2 Compression Strategy
 
-`CompressionStrategy` 的核心思路是：
+The core idea of `CompressionStrategy` is:
 
-1. 保留 system message
-2. 保留最近若干轮消息
-3. 对更早的历史做摘要压缩
-4. 尽量避免把 tool call / tool result 链路从中间截断
+1. Keep the system message
+2. Keep the most recent N rounds of messages
+3. Summarize-compress the earlier history
+4. Avoid cutting a tool call / tool result chain in the middle as much as possible
 
-压缩完成后会产出 `CompressionInfo`，并通过事件流上报压缩前后 token 数、压缩比例和摘要内容。
+After compression completes, a `CompressionInfo` is produced, and the pre/post-compression token counts, compression ratio, and summary content are reported through the event stream.
 
 ---
 
-## 10. Session 与历史消息管理
+## 10. Session and History Message Management
 
-session 逻辑在 `pkg/agent/session.go`。
+Session logic is in `pkg/agent/session.go`.
 
-### 10.1 Session 的作用
+### 10.1 What a Session Does
 
-每个 `Session` 保存：
+Each `Session` stores:
 
 - `ConversationHistory`
-- 创建时间 / 最近活跃时间
-- token 统计与时长
-- metadata
+- Creation time / last active time
+- Token statistics and duration
+- Metadata
 
-因此多轮对话是按 session 隔离的，而不是所有请求共享一个全局上下文。
+Therefore multi-turn conversations are isolated per session, rather than all requests sharing one global context.
 
-### 10.2 SessionManager 的作用
+### 10.2 What SessionManager Does
 
-`SessionManager` 负责：
+`SessionManager` is responsible for:
 
 - `GetOrCreateSession(...)`
-- session TTL 管理
-- 定期清理过期 session
-- 持久化到本地或 OSS 存储
+- Session TTL management
+- Periodically cleaning up expired sessions
+- Persisting to local or OSS storage
 
-### 10.3 历史清洗
+### 10.3 History Sanitization
 
-在进入 turn 前，还会做一次消息序列清理，避免历史中残留不完整的 tool-call/tool-result 序列，破坏后续模型调用顺序。
+Before entering a turn, the message sequence is also cleaned up once, to avoid incomplete tool-call/tool-result sequences left in the history that would break the ordering of subsequent model calls.
 
 ---
 
-## 11. 配置如何影响 agent
+## 11. How Configuration Affects the Agent
 
-配置加载入口在 `pkg/config/config.go` 的 `LoadConfig(...)`。
+The config loading entry point is `LoadConfig(...)` in `pkg/config/config.go`.
 
-对 agent 影响最大的配置包括：
+The configuration items with the biggest impact on the agent include:
 
 - `APIKey` / `BaseURL` / `Model`
 - `SubAgents`
@@ -363,39 +365,39 @@ session 逻辑在 `pkg/agent/session.go`。
 - `Turn`
 - `ContextConfig`
 
-其中几个特别关键：
+A few are especially critical:
 
-1. `SubAgents`：决定是否注册静态子代理和 `unified_agent`
-2. `IsSubAgent`：防止给子代理注册仅主 agent 可用的工具，例如 `spawn_sub_agents`
-3. `ToolRecovery`：控制工具失败后的默认重试与 per-tool 策略
-4. `ContextConfig`：决定上下文压缩阈值、保留比例和最近保留轮数
+1. `SubAgents`: determines whether static subagents and `unified_agent` are registered
+2. `IsSubAgent`: prevents registering main-agent-only tools, such as `spawn_sub_agents`, on subagents
+3. `ToolRecovery`: controls the default retry behavior after tool failures and per-tool policies
+4. `ContextConfig`: determines the context compression threshold, retention ratio, and number of recent rounds to keep
 
-### 11.1 沙箱设计补充
+### 11.1 Sandbox Design Addendum
 
-当前 sandbox 实现提供 Linux `bwrap`、macOS `sandbox-exec` 以及 `PathChecker` 路径级访问控制。后续沙箱重构应从“Shell 命令包装器”升级为统一 Sandbox Runtime，并把 Docker 作为优先级更高、隔离性更强的执行后端。完整设计见 [沙箱设计方案](./SANDBOX_DESIGN.md)。
-
----
-
-## 12. 当前实现可以概括成什么模式
-
-如果用一句话概括，当前 nano-agent 的实现逻辑是：
-
-> **一个以 `Agent` 为外层编排器、以 `Turn` 为单轮执行核心、以 `ToolScheduler` 为工具执行中枢、以 `SessionManager` 为多轮上下文隔离层、并通过静态/动态子代理扩展能力边界的回合制 agent 架构。**
-
-它的几个鲜明特点是：
-
-- 主路径是回合制循环，而不是一次性单请求执行
-- 工具调用是模型驱动、scheduler 并发执行
-- system prompt 是动态拼装的
-- session/history 与 turn/execution 解耦
-- 子代理既支持进程内克隆，也支持 IPC 隔离
-- 上下文压缩被放在每次 LLM 调用之前，属于主执行链的一部分
+The current sandbox implementation provides Linux `bwrap`, macOS `sandbox-exec`, and `PathChecker` path-level access control. The future sandbox refactoring should upgrade from a "shell command wrapper" to a unified Sandbox Runtime, with Docker as a higher-priority, stronger-isolation execution backend. See the full design in [Sandbox Design](./SANDBOX_DESIGN.md).
 
 ---
 
-## 13. 推荐阅读顺序
+## 12. What Pattern the Current Implementation Boils Down To
 
-如果要继续深入源码，建议按下面顺序读：
+In one sentence, the current nano-agent implementation logic is:
+
+> **A turn-based agent architecture with `Agent` as the outer orchestrator, `Turn` as the per-turn execution core, `ToolScheduler` as the tool-execution hub, `SessionManager` as the multi-turn context isolation layer, and static/dynamic subagents extending its capability boundaries.**
+
+Its distinctive features are:
+
+- The main path is a turn-based loop, not a one-shot single-request execution
+- Tool calls are model-driven and executed concurrently by the scheduler
+- The system prompt is assembled dynamically
+- Session/history is decoupled from turn/execution
+- Subagents support both in-process cloning and IPC isolation
+- Context compression happens before every LLM call, as part of the main execution chain
+
+---
+
+## 13. Recommended Reading Order
+
+If you want to dive deeper into the source code, read in this order:
 
 1. `pkg/agent/agent.go`
 2. `pkg/agent/turn.go`
@@ -406,4 +408,4 @@ session 逻辑在 `pkg/agent/session.go`。
 7. `pkg/agent/unified_agent.go`
 8. `pkg/agent/dynamic_subagent.go`
 
-这样能先把主链路看清，再看子代理和高级能力。
+This way you get the main chain clear first, then move on to subagents and advanced capabilities.

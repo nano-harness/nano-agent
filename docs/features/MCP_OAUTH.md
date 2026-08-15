@@ -1,5 +1,7 @@
 # MCP OAuth 2.0 Integration Guide
 
+[中文](./MCP_OAUTH.zh-CN.md)
+
 This guide explains how to configure and use OAuth 2.0 authentication with MCP (Model Context Protocol) servers in nano-agent.
 
 ## Overview

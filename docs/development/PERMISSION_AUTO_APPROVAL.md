@@ -1,5 +1,7 @@
 # Permission Auto-Approval
 
+[中文](./PERMISSION_AUTO_APPROVAL.zh-CN.md)
+
 ## Design goals
 
 nano-agent reduces repeated confirmations for clearly safe operations inside the agent working directory while still requiring approval for paths outside that trusted root.

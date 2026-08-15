@@ -1,5 +1,7 @@
 # Filesystem Checkpointing (M2-4)
 
+[中文](./CHECKPOINTING.zh-CN.md)
+
 `pkg/checkpoint` provides snapshot/restore of the agent's working tree so
 destructive operations can be rolled back. It is the nano-agent counterpart of
 the Claude Code filesystem checkpointing feature.

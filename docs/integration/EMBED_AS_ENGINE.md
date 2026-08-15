@@ -1,5 +1,7 @@
 # Embed nano-agent as an engine
 
+[中文](./EMBED_AS_ENGINE.zh-CN.md)
+
 This document defines the supported contract for orchestrators that drive nano-agent as an embedded execution engine while preserving standalone CLI usage.
 
 ## Invocation mode

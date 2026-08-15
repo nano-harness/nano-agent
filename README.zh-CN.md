@@ -1,6 +1,6 @@
 # nano-agent
 
-[English](./README.md) | 中文版本
+[English](./README.md)
 
 一个用Go语言构建的轻量级AI代码助手，具有模块化工具架构和基于回合的对话流程。nano-agent支持任何兼容OpenAI API的LLM提供商，用于智能代码分析、修改和生成任务。
 

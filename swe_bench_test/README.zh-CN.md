@@ -1,6 +1,6 @@
 # SWE-bench Evaluation for Nano-Agent
 
-[English](README.md) | 中文版本
+[English](./README.md)
 
 这是一个优化的SWE-bench评估脚本，支持使用预构建的Docker镜像和二进制模式执行nano-agent任务。
 

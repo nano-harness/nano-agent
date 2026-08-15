@@ -1,5 +1,7 @@
 # Daemon Runtime
 
+[中文](./DAEMON_RUNTIME.zh-CN.md)
+
 The daemon exposes HTTP and WebSocket APIs over public session and event state.
 
 ## Session streams

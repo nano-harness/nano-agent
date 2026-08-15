@@ -1,4 +1,6 @@
-# nano CLI Commands & 三端能力一致性矩阵
+# nano CLI Commands & Three-Frontend Capability Parity Matrix
+
+[中文](./COMMANDS_API.zh-CN.md)
 
 This document tracks the public, scriptable surface exposed by the `nano`
 binary, and the parity matrix between the three primary frontends:
@@ -40,7 +42,7 @@ Metadata/list subcommands accept `--json` for machine-readable output.
 | `binary list-skills`     | List installed skills (personal + project)               |
 | `binary swebench <p>`    | SWE-bench-compatible one-shot evaluation                 |
 
-## 三端能力一致性矩阵
+## Three-frontend capability parity matrix
 
 The following matrix tracks whether each user-facing capability is reachable
 from each frontend. ✅ = supported, ⚠️ = partial / wrapped, ❌ = not yet wired.

@@ -1,5 +1,7 @@
 # Skills Documentation Release Integration - Implementation Summary
 
+[中文](./SKILLS_RELEASE_INTEGRATION.zh-CN.md)
+
 ## Overview
 
 Successfully integrated skill documentation into the nano-agent release pipeline, enabling automatic packaging and distribution of skill documents with each release.

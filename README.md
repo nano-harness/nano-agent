@@ -1,8 +1,14 @@
 # nano-agent
 
-[中文版本](./README_zh.md) | English
+[中文](./README.zh-CN.md)
 
-A lightweight AI-powered code assistant built in Go, featuring a modular tool architecture and turn-based conversation flow. nano-agent works with any OpenAI-compatible LLM API for intelligent code analysis, modification, and generation tasks.
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://golang.org)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![SWE-bench](https://img.shields.io/badge/SWE--bench-61.3%25-success)](./docs/testing/SWE_BENCH.md)
+
+> A lightweight AI coding assistant in Go — **61.3% on SWE-bench**, swarm multi-agent, TUI + daemon, MCP, sandbox. One binary, zero dependencies.
+>
+> Part of the [nano series](https://nano-harness.github.io) — [nano-symphony](https://github.com/nano-harness/nano-symphony) · [nano-agent](https://github.com/nano-harness/nano-agent) · [nano-cloud](https://github.com/nano-harness/nano-cloud). Pairs with the [harness-101](https://github.com/albert-lv/harness-101) course.
 
 ## ✨ Features
 

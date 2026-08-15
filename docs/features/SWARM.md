@@ -1,5 +1,7 @@
 # Swarm Multi-Agent System
 
+[中文](./SWARM.zh-CN.md)
+
 The Swarm system enables nano-agent to operate as a coordinated team of AI agents, where a team-lead agent can spawn and coordinate multiple teammate agents to work on different aspects of a complex task in parallel.
 
 ## Overview

@@ -1,5 +1,7 @@
 # Sandbox × Permission Mode Matrix
 
+[中文](./sandbox-permission-matrix.zh-CN.md)
+
 > Expected behavior of `nano binary exec` across all sandbox/permission combinations.
 > This matrix serves as the single source of truth for both nano-agent tests and
 > symphony's `resolveSandboxAndPermission` validation.

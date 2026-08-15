@@ -1,5 +1,7 @@
 # TView UI Integration for Image Paste & File Input
 
+[中文](./tview_multimodal_integration.zh-CN.md)
+
 ## Current State
 
 TView UI currently uses the `github.com/atotto/clipboard` package for basic text clipboard operations. Unlike Bubbletea which has direct event handling for paste events, TView's clipboard integration is simpler and text-focused.

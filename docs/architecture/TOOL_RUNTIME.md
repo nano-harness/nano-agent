@@ -1,5 +1,7 @@
 # Tool Runtime
 
+[中文](./TOOL_RUNTIME.zh-CN.md)
+
 `pkg/toolruntime` is the stable runtime seam for tool metadata, catalog lookup, and execution.
 
 ## Components

@@ -1,5 +1,7 @@
 # Extensions
 
+[中文](./EXTENSIONS.zh-CN.md)
+
 The extension ecosystem normalizes skills, MCP servers, tools, agents, and commands into a common manifest.
 
 ## Manifest kinds

@@ -1,365 +1,367 @@
 # Nano Agent Daemon Deployment Guide
 
-本文档介绍如何在AWS EC2实例上部署nano agent的daemon模式，以及如何通过配置文件连接到远程daemon。
+[中文](./DEPLOYMENT.zh-CN.md)
 
-## 快速开始
+This document describes how to deploy the nano agent daemon mode on an AWS EC2 instance, and how to connect to the remote daemon via configuration files.
 
-### 服务器部署
-1. 配置部署脚本中的EC2地址和密钥路径
-2. 运行 `./deploy-daemon.sh` 部署daemon到EC2
-3. 确认daemon运行状态
-## 新增功能：可配置的图像生成器模型
+## Quick Start
 
-最新版本支持通过环境变量配置OpenRouter和Seedream图像生成器模型：
-- `OPENROUTER_IMAGE_MODEL`: OpenRouter图像模型名称（默认：google/gemini-2.5-flash-image）
-- `SEEDREAM_IMAGE_MODEL`: Seedream图像模型名称（默认：doubao-seedream-4-0-250828）
+### Server Deployment
+1. Configure the EC2 address and key path in the deployment scripts
+2. Run `./deploy-daemon.sh` to deploy the daemon to EC2
+3. Verify the daemon is running
+## New Feature: Configurable Image Generator Models
 
-这使得用户可以灵活切换不同的图像生成模型，无需修改代码。
+The latest version supports configuring the OpenRouter and Seedream image generator models via environment variables:
+- `OPENROUTER_IMAGE_MODEL`: OpenRouter image model name (default: google/gemini-2.5-flash-image)
+- `SEEDREAM_IMAGE_MODEL`: Seedream image model name (default: doubao-seedream-4-0-250828)
+
+This allows users to flexibly switch between different image generation models without modifying code.
 
 
-### 客户端连接
-1. 复制客户端配置模板：`cp deployment/client-config.yaml .nano.yaml`
-2. 编辑配置文件，设置daemon服务器地址和端口
-3. 使用 `nano "your prompt"` 自动连接到daemon
+### Client Connection
+1. Copy the client configuration template: `cp deployment/client-config.yaml .nano.yaml`
+2. Edit the configuration file to set the daemon server address and port
+3. Use `nano "your prompt"` to automatically connect to the daemon
 
-详细步骤请参考下面的章节。
+For detailed steps, refer to the sections below.
 
-## 部署脚本说明
+## Deployment Script Overview
 
-### `unified-deploy.sh` - 统一部署脚本
+### `unified-deploy.sh` - Unified Deployment Script
 
-这是统一部署脚本，整合了所有部署、监控、测试和故障恢复功能。
+This is the unified deployment script, integrating all deployment, monitoring, testing, and failure recovery functionality.
 
-**主要功能：**
-- 完整部署（构建+传输+配置+启动）
-- 服务管理（启动/停止/重启）
-- 健康检查和状态监控
-- 故障诊断和自动修复
-- 日志查看和分析
-- SystemD配置修复
+**Main features:**
+- Full deployment (build + transfer + configure + start)
+- Service management (start/stop/restart)
+- Health checks and status monitoring
+- Failure diagnosis and automatic repair
+- Log viewing and analysis
+- SystemD configuration repair
 
-**支持的命令：**
+**Supported commands:**
 ```bash
-./unified-deploy.sh deploy    # 完整部署
-./unified-deploy.sh restart   # 重启服务
-./unified-deploy.sh start     # 启动服务
-./unified-deploy.sh stop      # 停止服务
-./unified-deploy.sh status    # 检查状态
-./unified-deploy.sh test      # 运行健康检查
-./unified-deploy.sh logs      # 查看日志
-./unified-deploy.sh fix       # 修复SystemD配置
-./unified-deploy.sh monitor   # 启动监控模式
+./unified-deploy.sh deploy    # Full deployment
+./unified-deploy.sh restart   # Restart the service
+./unified-deploy.sh start     # Start the service
+./unified-deploy.sh stop      # Stop the service
+./unified-deploy.sh status    # Check status
+./unified-deploy.sh test      # Run health checks
+./unified-deploy.sh logs      # View logs
+./unified-deploy.sh fix       # Repair SystemD configuration
+./unified-deploy.sh monitor   # Start monitoring mode
 ```
 
-## 使用前准备
+## Prerequisites
 
-### 1. 修改脚本配置
+### 1. Modify Script Configuration
 
-在使用脚本前，需要修改以下变量：
+Before using the scripts, modify the following variables:
 
 ```bash
-# 在 deploy-daemon.sh 和 update-daemon.sh 中修改这些变量
-EC2_HOST="your-ec2-instance.compute.amazonaws.com"  # 你的EC2实例地址
-PEM_FILE="~/Downloads/your-key.pem"                # 你的PEM密钥文件路径
+# Modify these variables in deploy-daemon.sh and update-daemon.sh
+EC2_HOST="your-ec2-instance.compute.amazonaws.com"  # Your EC2 instance address
+PEM_FILE="~/Downloads/your-key.pem"                # Path to your PEM key file
 ```
 
-### 2. 配置API密钥
+### 2. Configure API Keys
 
-在 `deploy-daemon.sh` 中，找到配置文件部分并设置你的LLM API密钥：
+In `deploy-daemon.sh`, find the configuration file section and set your LLM API key:
 
 ```yaml
-api_key: "your-llm-api-key"  # 替换为你的实际API密钥
+api_key: "your-llm-api-key"  # Replace with your actual API key
 ```
 
-### 3. 确保EC2实例配置
+### 3. Ensure EC2 Instance Configuration
 
-- EC2实例运行Ubuntu系统
-- 安全组开放8080端口（或你配置的其他端口）
-- 有足够的磁盘空间和内存
+- The EC2 instance runs Ubuntu
+- The security group opens port 8080 (or another port you configured)
+- There is sufficient disk space and memory
 
-## 部署步骤
+## Deployment Steps
 
-1. 给脚本添加执行权限：
+1. Add execute permission to the scripts:
 ```bash
 chmod +x unified-deploy.sh
 ```
 
-2. 运行完整部署：
+2. Run the full deployment:
 ```bash
 ./unified-deploy.sh deploy
 ```
 
-3. 检查部署状态：
+3. Check deployment status:
 ```bash
 ./unified-deploy.sh status
 ```
 
-4. 运行健康检查：
+4. Run health checks:
 ```bash
 ./unified-deploy.sh test
 ```
 
-## Daemon管理命令
+## Daemon Management Commands
 
-### 推荐方式：使用统一脚本
+### Recommended: Using the Unified Script
 
 ```bash
-# 查看daemon状态（包含详细健康检查）
+# View daemon status (includes detailed health checks)
 ./unified-deploy.sh status
 
-# 查看daemon日志
+# View daemon logs
 ./unified-deploy.sh logs
 
-# 停止daemon
+# Stop the daemon
 ./unified-deploy.sh stop
 
-# 启动daemon
+# Start the daemon
 ./unified-deploy.sh start
 
-# 重启daemon
+# Restart the daemon
 ./unified-deploy.sh restart
 
-# 运行完整测试
+# Run full tests
 ./unified-deploy.sh test
 
-# 修复SystemD配置问题
+# Repair SystemD configuration issues
 ./unified-deploy.sh fix
 
-# 启动监控模式
+# Start monitoring mode
 ./unified-deploy.sh monitor
 ```
 
-### 备选方式：直接使用nano命令
+### Alternative: Using nano Commands Directly
 
-部署完成后，可以在EC2实例上使用以下命令管理daemon：
+After deployment, you can use the following commands on the EC2 instance to manage the daemon:
 
 ```bash
-# 查看daemon状态
+# View daemon status
 nano daemon status
 
-# 查看daemon日志
+# View daemon logs
 nano daemon logs
 
-# 停止daemon
+# Stop the daemon
 nano daemon stop
 
-# 启动daemon
+# Start the daemon
 nano daemon start
 
-# 重启daemon
+# Restart the daemon
 nano daemon restart
 ```
 
-## 客户端使用
+## Client Usage
 
-### 配置文件优先级
+### Configuration File Priority
 
-nano使用以下优先级顺序加载配置文件：
-1. 命令行指定的配置文件（`--config` 参数）
-2. 项目目录下的 `.nano.yaml`
-3. 全局配置文件 `~/.config/nano/config.yaml`
-4. 环境变量（最高优先级，覆盖文件配置）
+nano loads configuration files in the following priority order:
+1. Configuration file specified on the command line (the `--config` flag)
+2. `.nano.yaml` in the project directory
+3. Global configuration file `~/.config/nano/config.yaml`
+4. Environment variables (highest priority, overriding file configuration)
 
-### 方式一：通过配置文件连接到远程daemon（推荐）
+### Method 1: Connect to the Remote Daemon via Configuration File (Recommended)
 
-1. **创建客户端配置文件**：
+1. **Create the client configuration file**:
 ```bash
-# 复制客户端配置模板到全局配置目录
+# Copy the client configuration template to the global configuration directory
 cp deployment/client-config.yaml ~/.config/nano/config.yaml
 
-# 或者复制到项目目录（优先级更高）
+# Or copy it to the project directory (higher priority)
 cp deployment/client-config.yaml .nano.yaml
 
-# 或者使用自定义配置文件路径
+# Or use a custom configuration file path
 cp deployment/client-config.yaml /path/to/my-config.yaml
 ```
 
-2. **编辑配置文件**，修改daemon连接信息：
+2. **Edit the configuration file** to modify the daemon connection information:
 ```yaml
-# 在配置文件中设置daemon连接信息
+# Set the daemon connection information in the configuration file
 daemon:
-  port: 8080                           # 远程daemon的端口
-  host: "your-ec2-instance.com"        # 替换为你的EC2实例地址
-  api_key: "nano-agent-9527!"          # 如果daemon设置了认证密钥
+  port: 8080                           # Port of the remote daemon
+  host: "your-ec2-instance.com"        # Replace with your EC2 instance address
+  api_key: "nano-agent-9527!"          # If the daemon has an authentication key set
 ```
 
-3. **使用daemon模式**：
+3. **Use daemon mode**:
 ```bash
-# 自动检测并使用daemon（如果daemon正在运行）
+# Automatically detect and use the daemon (if the daemon is running)
 nano "your prompt here"
 
-# 强制使用daemon模式
+# Force daemon mode
 nano --daemon "your prompt here"
 nano -d "your prompt here"
 
-# 使用自定义配置文件
+# Use a custom configuration file
 nano --config /path/to/my-config.yaml "your prompt here"
 nano -c /path/to/my-config.yaml "your prompt here"
 
-# 设置超时时间（默认300秒）
+# Set a timeout (default is 300 seconds)
 nano --daemon --timeout 600 "your prompt here"
 
-# 强制使用TUI模式（即使daemon正在运行）
+# Force TUI mode (even if the daemon is running)
 nano --tui "your prompt here"
 nano -t "your prompt here"
 ```
 
-### 方式二：使用client子命令
+### Method 2: Using the client Subcommand
 
-#### 执行命令
+#### Execute Commands
 ```bash
-# 通过daemon执行命令
+# Execute a command through the daemon
 nano client exec "your prompt here"
 
-# 设置超时时间
+# Set a timeout
 nano client exec --timeout 600 "your prompt here"
 ```
 
-#### 查看daemon状态
+#### View Daemon Status
 ```bash
-# 查看daemon健康状态和基本信息
+# View daemon health status and basic information
 nano client status
 ```
 
-#### MCP管理
+#### MCP Management
 ```bash
-# 查看MCP状态
+# View MCP status
 nano client mcp status
 
-# 列出可用的MCP工具
+# List available MCP tools
 nano client mcp tools
 
-# 获取MCP诊断信息
+# Get MCP diagnostic information
 nano client mcp diagnostics
 ```
 
-#### 内存管理
+#### Memory Management
 ```bash
-# 列出所有内存条目
+# List all memory entries
 nano client memory list
 
-# 保存内存条目
+# Save a memory entry
 nano client memory save "key" "content"
 
-# 获取内存条目
+# Get a memory entry
 nano client memory get "key"
 
-# 删除内存条目
+# Delete a memory entry
 nano client memory delete "key"
 ```
 
-### 方式三：通过环境变量配置
+### Method 3: Configuration via Environment Variables
 
 ```bash
-# 设置daemon连接相关环境变量
+# Set daemon connection environment variables
 export NANO_DAEMON_HOST="your-ec2-instance.com"
 export NANO_DAEMON_PORT="8080"
 export NANO_DAEMON_API_KEY="nano-agent-9527!"
 
-# 设置其他配置
+# Set other configuration
 export NANO_API_KEY="your-llm-api-key"
 export NANO_BASE_URL="https://api.openai.com/v1"
 export NANO_MODEL="gpt-4"
 export NANO_VERBOSE="true"
-# 图像生成器配置（新增）
-export OPENROUTER_IMAGE_MODEL="google/gemini-2.5-flash-image"  # OpenRouter图像模型
-export SEEDREAM_IMAGE_MODEL="doubao-seedream-4-0-250828"      # Seedream图像模型
-export IMAGE_API_KEY: [REDACTED]                # OpenRouter API密钥
-export SEEDREAM_API_KEY: [REDACTED]               # Seedream API密钥
+# Image generator configuration (new)
+export OPENROUTER_IMAGE_MODEL="google/gemini-2.5-flash-image"  # OpenRouter image model
+export SEEDREAM_IMAGE_MODEL="doubao-seedream-4-0-250828"      # Seedream image model
+export IMAGE_API_KEY: [REDACTED]                # OpenRouter API key
+export SEEDREAM_API_KEY: [REDACTED]               # Seedream API key
 
 
-# 使用daemon模式
+# Use daemon mode
 nano --daemon "your prompt here"
 ```
 
-### 配置文件查看
+### Viewing Configuration Files
 
 ```bash
-# 查看配置文件加载顺序和状态
+# View configuration file load order and status
 nano config locations
 
-# 使用自定义配置文件查看
+# View using a custom configuration file
 nano --config /path/to/config.yaml config locations
 ```
 
-### 配置文件位置
+### Configuration File Locations
 
-**服务器端（EC2实例）**：
-- 配置文件：`~/.config/nano/config.yaml`
-- PID文件：`~/.nano/daemon.pid`
-- 日志文件：`~/.nano/daemon.log`
+**Server side (EC2 instance)**:
+- Configuration file: `~/.config/nano/config.yaml`
+- PID file: `~/.nano/daemon.pid`
+- Log file: `~/.nano/daemon.log`
 
-**客户端（本地机器）**：
-- 全局配置：`~/.config/nano/config.yaml`
-- 项目配置：`.nano.yaml`（项目根目录）
-- 配置优先级：项目配置 > 全局配置 > 环境变量
+**Client side (local machine)**:
+- Global configuration: `~/.config/nano/config.yaml`
+- Project configuration: `.nano.yaml` (project root directory)
+- Configuration priority: project configuration > global configuration > environment variables
 
-### 客户端配置说明
+### Client Configuration Notes
 
-**重要：daemon客户端配置限制**
+**Important: daemon client configuration limitations**
 
-daemon客户端只是一个HTTP客户端，所有AI处理都在daemon服务器端进行。因此，客户端配置文件中的大部分配置项都**不会生效**：
+The daemon client is just an HTTP client; all AI processing happens on the daemon server side. Therefore, most configuration items in the client configuration file **will not take effect**:
 
-❌ **无效的配置项**（在daemon客户端模式下被忽略）：
-- LLM配置（`api_key`, `base_url`, `model`等）
-- 内存系统配置（`memory`部分）
-- 工具配置（`enabled_tools`, `disabled_tools`等）
-- MCP配置（`mcp`部分）
-- 网络搜索API密钥（`web_search_api_keys`）
-- 上下文管理配置（`context`部分）
+❌ **Ineffective configuration items** (ignored in daemon client mode):
+- LLM configuration (`api_key`, `base_url`, `model`, etc.)
+- Memory system configuration (the `memory` section)
+- Tool configuration (`enabled_tools`, `disabled_tools`, etc.)
+- MCP configuration (the `mcp` section)
+- Web search API keys (`web_search_api_keys`)
+- Context management configuration (the `context` section)
 
-✅ **有效的配置项**：
+✅ **Effective configuration items**:
 ```yaml
-# 客户端超时设置
-response_timeout: 300s  # 等待daemon响应的超时时间
-http_timeout: 60s       # HTTP请求超时时间
+# Client timeout settings
+response_timeout: 300s  # Timeout for waiting on daemon responses
+http_timeout: 60s       # HTTP request timeout
 
-# 安全设置（客户端本地行为）
+# Security settings (client local behavior)
 confirm_destructive: false
 
-# Daemon连接配置（最重要）
+# Daemon connection configuration (most important)
 daemon:
-  host: "your-ec2-instance.com"    # 远程daemon服务器地址
-  port: 8080                       # daemon监听端口
-  api_key: "your-api-key"          # 可选：认证密钥
-  tls_cert_file: ""                # 可选：HTTPS证书
-  tls_key_file: ""                 # 可选：HTTPS私钥
+  host: "your-ec2-instance.com"    # Remote daemon server address
+  port: 8080                       # Daemon listening port
+  api_key: "your-api-key"          # Optional: authentication key
+  tls_cert_file: ""                # Optional: HTTPS certificate
+  tls_key_file: ""                 # Optional: HTTPS private key
 ```
 
-**重要提示**：
-- 客户端**只需要配置`daemon`部分**，其他配置由服务器端处理
-- 如果daemon服务器设置了`api_key`认证，客户端必须配置相同的密钥
-- 支持HTTPS连接，需要配置相应的证书文件
+**Important notes**:
+- The client **only needs the `daemon` section configured**; other configuration is handled on the server side
+- If the daemon server has an `api_key` set for authentication, the client must configure the same key
+- HTTPS connections are supported; the corresponding certificate files need to be configured
 
-### 客户端配置最佳实践
+### Client Configuration Best Practices
 
-1. **项目级配置**（推荐）：
+1. **Project-level configuration** (recommended):
 ```bash
-# 在项目根目录创建配置文件
+# Create the configuration file in the project root directory
 cp deployment/client-config.yaml .nano.yaml
-# 编辑配置，只保留daemon部分
+# Edit the configuration, keeping only the daemon section
 ```
 
-2. **全局配置**：
+2. **Global configuration**:
 ```bash
-# 创建全局配置目录
+# Create the global configuration directory
 mkdir -p ~/.config/nano
-# 复制并编辑配置文件
+# Copy and edit the configuration file
 cp deployment/client-config.yaml ~/.config/nano/config.yaml
 ```
 
-3. **配置验证**：
+3. **Configuration verification**:
 ```bash
-# 检查daemon连接
+# Check the daemon connection
 nano client status
 
-# 查看配置路径
+# View configuration paths
 nano config paths
 ```
 
-4. **常见配置示例**：
+4. **Common configuration examples**:
 
-**本地开发环境**：
+**Local development environment**:
 ```yaml
 daemon:
   host: "127.0.0.1"
@@ -367,7 +369,7 @@ daemon:
   api_key: ""
 ```
 
-**连接远程服务器**：
+**Connecting to a remote server**:
 ```yaml
 daemon:
   host: "your-server.example.com"
@@ -375,7 +377,7 @@ daemon:
   api_key: "your-secure-api-key"
 ```
 
-**HTTPS连接**：
+**HTTPS connection**:
 ```yaml
 daemon:
   host: "your-server.example.com"
@@ -385,123 +387,123 @@ daemon:
   tls_key_file: "/path/to/client.key"
 ```
 
-## 安全注意事项
+## Security Considerations
 
-1. **API密钥安全**：确保不要将API密钥提交到版本控制系统
-2. **网络安全**：考虑使用VPN或限制访问IP范围
-3. **认证**：可以在daemon配置中设置API密钥进行认证
-4. **HTTPS**：生产环境建议配置TLS证书
+1. **API key security**: make sure not to commit API keys to version control
+2. **Network security**: consider using a VPN or restricting the allowed IP range
+3. **Authentication**: you can set an API key in the daemon configuration for authentication
+4. **HTTPS**: configuring TLS certificates is recommended for production environments
 
-## 故障排除
+## Troubleshooting
 
-### 使用统一脚本进行故障排除
+### Troubleshooting with the Unified Script
 
-1. **快速诊断**
+1. **Quick diagnosis**
    ```bash
-   # 运行完整测试，包含所有健康检查
+   # Run full tests, including all health checks
    ./unified-deploy.sh test
 
-   # 查看详细状态信息
+   # View detailed status information
    ./unified-deploy.sh status
    ```
 
-2. **自动修复常见问题**
+2. **Automatically repair common issues**
    ```bash
-   # 修复SystemD配置问题
+   # Repair SystemD configuration issues
    ./unified-deploy.sh fix
 
-   # 重启服务解决临时问题
+   # Restart the service to resolve temporary issues
    ./unified-deploy.sh restart
    ```
 
-3. **查看详细日志**
+3. **View detailed logs**
    ```bash
-   # 查看daemon日志
+   # View daemon logs
    ./unified-deploy.sh logs
 
-   # 启动监控模式，实时查看状态
+   # Start monitoring mode to watch status in real time
    ./unified-deploy.sh monitor
    ```
 
-### 常见问题
+### Common Issues
 
-**服务器部署问题**：
-1. **连接被拒绝**：检查EC2安全组是否开放了相应端口
-2. **Go未找到**：脚本会自动安装Go，如果失败请手动安装
-3. **权限问题**：确保PEM文件权限正确（600）
-4. **端口冲突**：如果8080端口被占用，修改配置中的端口号
-5. **SystemD服务问题**：使用 `./unified-deploy.sh fix` 自动修复配置
+**Server deployment issues**:
+1. **Connection refused**: check whether the EC2 security group opens the corresponding port
+2. **Go not found**: the script will install Go automatically; if that fails, install it manually
+3. **Permission issues**: ensure the PEM file has the correct permissions (600)
+4. **Port conflict**: if port 8080 is in use, change the port number in the configuration
+5. **SystemD service issues**: use `./unified-deploy.sh fix` to automatically repair the configuration
 
-**客户端连接问题**：
-1. **无法连接到daemon**：
+**Client connection issues**:
+1. **Unable to connect to the daemon**:
    ```bash
-   # 检查daemon状态
+   # Check daemon status
    nano client status
-   # 检查配置
+   # Check configuration
    nano config paths
    ```
 
-2. **认证失败**：
-   - 确保客户端和服务器的`api_key`一致
-   - 检查配置文件中的`daemon.api_key`设置
+2. **Authentication failure**:
+   - Ensure the `api_key` on the client and server match
+   - Check the `daemon.api_key` setting in the configuration file
 
-3. **配置文件未生效**：
+3. **Configuration file not taking effect**:
    ```bash
-   # 检查配置加载顺序
+   # Check the configuration load order
    nano config paths
-   # 确保配置文件在正确位置
+   # Ensure the configuration file is in the correct location
    ```
 
-4. **网络连接问题**：
-   - 检查防火墙设置
-   - 确认服务器地址和端口正确
-   - 测试网络连通性：`telnet your-server 8080`
-   - 使用 `./unified-deploy.sh status` 验证daemon运行状态
+4. **Network connection issues**:
+   - Check firewall settings
+   - Confirm the server address and port are correct
+   - Test network connectivity: `telnet your-server 8080`
+   - Use `./unified-deploy.sh status` to verify the daemon is running
 
-5. **HTTPS证书问题**：
-   - 确保证书文件路径正确
-   - 检查证书有效性
-   - 验证证书与服务器域名匹配
+5. **HTTPS certificate issues**:
+   - Ensure the certificate file paths are correct
+   - Check certificate validity
+   - Verify the certificate matches the server domain
 
-### 查看日志
+### Viewing Logs
 
 ```bash
-# 在EC2实例上查看daemon日志
+# View daemon logs on the EC2 instance
 nano daemon logs
 
-# 或直接查看日志文件
+# Or view the log file directly
 tail -f ~/.nano/daemon.log
 ```
 
-## 高级配置
+## Advanced Configuration
 
-### 自定义端口和主机
+### Custom Port and Host
 
-在 `deploy-daemon.sh` 中修改：
+Modify in `deploy-daemon.sh`:
 ```bash
-DAEMON_PORT="8080"     # 修改为你想要的端口
-DAEMON_HOST="0.0.0.0"  # 0.0.0.0 监听所有接口，127.0.0.1 仅本地
+DAEMON_PORT="8080"     # Change to the port you want
+DAEMON_HOST="0.0.0.0"  # 0.0.0.0 listens on all interfaces; 127.0.0.1 is local only
 ```
 
-### 启用HTTPS
+### Enabling HTTPS
 
-在配置文件中添加TLS证书配置：
+Add the TLS certificate configuration to the configuration file:
 ```yaml
 daemon:
   tls_cert_file: "/path/to/cert.pem"
   tls_key_file: "/path/to/key.pem"
 ```
 
-### 系统服务配置
+### System Service Configuration
 
-如需将daemon配置为系统服务，可以创建systemd服务文件：
+To configure the daemon as a system service, you can create a systemd service file:
 
 ```bash
-# 创建服务文件
+# Create the service file
 sudo nano /etc/systemd/system/nano-daemon.service
 ```
 
-服务文件内容：
+Service file contents:
 ```ini
 [Unit]
 Description=Nano Agent Daemon
@@ -520,7 +522,7 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-启用服务：
+Enable the service:
 ```bash
 sudo systemctl enable nano-daemon
 sudo systemctl start nano-daemon

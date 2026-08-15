@@ -1,5 +1,7 @@
 # Configuration Deep Merge System
 
+[中文](./config-deep-merge.zh-CN.md)
+
 ## Overview
 
 Nano-agent now supports **deep merging** of configuration files from multiple layers, allowing settings from global user configuration to be combined with project-specific configuration instead of being replaced entirely.

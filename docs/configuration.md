@@ -1,5 +1,7 @@
 # Configuration
 
+[中文](./configuration.zh-CN.md)
+
 ## Environment Variables
 
 `nano` reads environment variables with the following priority:

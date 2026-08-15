@@ -1,5 +1,7 @@
 # Extension and Event Schemas
 
+[中文](./EXTENSION_EVENT_SCHEMA.zh-CN.md)
+
 This document records the stable public schemas introduced by the architecture refactor.
 
 ## Extension manifest

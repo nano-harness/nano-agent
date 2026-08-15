@@ -1,5 +1,7 @@
 # TUI Image Paste & File Input Implementation - Complete Summary
 
+[中文](./tui_multimodal_complete.zh-CN.md)
+
 ## Overview
 
 Successfully implemented comprehensive support for image pasting and file input in nano-agent's TUI mode, completing all remaining work items from the original implementation.

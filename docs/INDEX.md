@@ -1,11 +1,13 @@
 # Documentation Index
 
+[中文](./INDEX.zh-CN.md)
+
 Welcome to the nano-agent documentation. This index helps you navigate through all available documentation organized by category.
 
 ## Getting Started
 
 - [Main README](../README.md) - Project overview, features, and quick start guide
-- [README (中文)](../README_zh.md) - 项目概述、特性和快速入门指南
+- [README (Chinese)](../README.zh-CN.md) - Project overview, features, and quick start guide (Chinese)
 - [CHANGELOG](../CHANGELOG.md) - Version history and release notes
 
 ## Architecture
@@ -71,7 +73,7 @@ Testing infrastructure and guidelines:
 
 - [E2E Testing](../e2e/README.md) - End-to-end testing infrastructure
 - [SWE-bench Testing](../swe_bench_test/README.md) - SWE-bench evaluation scripts
-- [SWE-bench Testing (中文)](../swe_bench_test/README_zh.md) - SWE-bench 评估脚本
+- [SWE-bench Testing (Chinese)](../swe_bench_test/README.zh-CN.md) - SWE-bench evaluation scripts (Chinese)
 
 ## References
 

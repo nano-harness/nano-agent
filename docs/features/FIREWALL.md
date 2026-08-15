@@ -1,5 +1,7 @@
 # Dangerous Command Firewall
 
+[中文](./FIREWALL.zh-CN.md)
+
 The Dangerous Command Firewall is a built-in security feature that detects and intercepts potentially dangerous shell commands before they execute, providing an additional layer of protection beyond permission modes.
 
 ## Overview

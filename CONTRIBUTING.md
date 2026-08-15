@@ -1,5 +1,7 @@
 # Contributing to nano-agent
 
+[中文](./CONTRIBUTING.zh-CN.md)
+
 Thank you for your interest in contributing! This document covers the basics.
 
 ## Getting started

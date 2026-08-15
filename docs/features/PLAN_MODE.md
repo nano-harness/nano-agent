@@ -1,5 +1,7 @@
 # Plan Mode
 
+[中文](./PLAN_MODE.zh-CN.md)
+
 Plan Mode is a read-only execution mode designed for safe code analysis and planning without the risk of modifying files or system state.
 
 ## Overview

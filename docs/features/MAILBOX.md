@@ -1,5 +1,7 @@
 # Mailbox System Documentation
 
+[中文](./MAILBOX.zh-CN.md)
+
 ## Overview
 
 The Mailbox system provides structured, asynchronous message passing between parent and child agents in nano-agent's fork-based parallel execution model. It enables child agents to report progress, findings, and requests back to their parent agents without blocking execution.

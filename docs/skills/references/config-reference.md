@@ -1,5 +1,7 @@
 # Configuration Reference
 
+[中文](./config-reference.zh-CN.md)
+
 Complete reference for all `.nano.yaml` configuration options.
 
 ## File Locations

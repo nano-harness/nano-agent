@@ -1,8 +1,10 @@
-# Nano Agent Daemon API（Web 客户端实现指南）
+# Nano Agent Daemon API (Web Client Implementation Guide)
 
-## 0. 阅读指南
+[中文](./DAEMON_API.zh-CN.md)
 
-本文面向 Web/桌面客户端实现者，描述 nano daemon 的 REST 与 WebSocket 协议。当前版本为 v5，覆盖 daemon 模式新增的模型发现、MCP、命令、记忆、监控、会话生命周期、team-lead 与 scheduler API。自动化场景优先使用 `nano daemon execute --json`；交互式 UI 建议通过 WebSocket 消费事件流。
+## 0. Reading guide
+
+This document is for Web/desktop client implementers and describes the REST and WebSocket protocols of the nano daemon. The current version is v5, covering the daemon-mode additions for model discovery, MCP, commands, memory, monitoring, session lifecycle, team-lead, and scheduler APIs. For automation scenarios, prefer `nano daemon execute --json`; for interactive UIs, consume the event stream over WebSocket.
 
 
 ## Binary engine contract
@@ -16,67 +18,67 @@ nano binary exec < prompt.txt
 
 Binary mode appends a `<<<NANO_RESULT>>>` JSON summary by default and supports `NANO_BINARY_RESULT_FORMAT=plain|json|both`, semantic exit codes, `--sandbox=auto|on|off`, and `--on-exit-cmd`. See `docs/integration/EMBED_AS_ENGINE.md` for the full embedding contract.
 
-## 1. 协议总览
+## 1. Protocol overview
 
-| 项 | 说明 |
+| Item | Description |
 |---|---|
 | Base URL | `http://HOST:PORT/api/v1` |
-| Public health | `GET /health` 与 `GET /api/v1/health` 均可用 |
-| WebSocket | `ws://HOST:PORT/api/v1/stream` 或 `/api/v1/teams/sessions/{id}/stream` |
-| REST 鉴权 | 配置 API Key 时，使用 `X-API-Key: KEY` 或 `Authorization: Bearer KEY` |
-| WebSocket 鉴权 | `?api_key=`、`?apikey=`、`?apiKey=`、`?key=`、`X-API-Key`、`Authorization: Bearer/ApiKey KEY` |
-| 编码 | UTF-8 JSON |
-| 错误 | JSON handler 返回 `{ "error": "message" }` 或 `{ "success": false, "error": "message" }`；部分旧 handler 仍可能返回纯文本 `http.Error` |
-| 限流/重试 | 对 HTTP 429/503、网络超时、WebSocket 异常关闭实现指数退避：1s/2s/5s/10s/30s，封顶 30s |
+| Public health | Both `GET /health` and `GET /api/v1/health` are available |
+| WebSocket | `ws://HOST:PORT/api/v1/stream` or `/api/v1/teams/sessions/{id}/stream` |
+| REST auth | When an API key is configured, use `X-API-Key: KEY` or `Authorization: Bearer KEY` |
+| WebSocket auth | `?api_key=`, `?apikey=`, `?apiKey=`, `?key=`, `X-API-Key`, `Authorization: Bearer/ApiKey KEY` |
+| Encoding | UTF-8 JSON |
+| Errors | JSON handlers return `{ "error": "message" }` or `{ "success": false, "error": "message" }`; some legacy handlers may still return plain-text `http.Error` |
+| Rate limiting / retry | Implement exponential backoff for HTTP 429/503, network timeouts, and abnormal WebSocket closures: 1s/2s/5s/10s/30s, capped at 30s |
 
-## 2. REST API 路由总表
+## 2. REST API route summary
 
-| Method | Path | 鉴权 | 幂等性 | 用途 |
+| Method | Path | Auth | Idempotent | Purpose |
 |---|---|---:|---:|---|
-| GET | `/health` | 否 | 是 | 根路径健康检查 |
-| GET | `/api/v1/health` | 否 | 是 | API 健康检查 |
-| GET | `/api/v1/status` | 是 | 是 | daemon/agent 状态 |
-| GET | `/api/v1/models` | 是 | 是 | 列出已知模型提供商预设 |
-| GET | `/api/v1/models/doctor` | 是 | 是 | 检查当前模型配置归属与识别结果 |
-| GET | `/api/v1/model/routes` | 是 | 是 | 列出当前配置的模型路由与健康状态 |
-| GET | `/api/v1/events?since_seq=N` | 是 | 是 | 查询 active task / team session 事件 |
-| GET | `/api/v1/audit?since_seq=N` | 是 | 是 | 查询 sandbox、审批、权限和错误审计事件 |
-| GET | `/api/v1/mcp/status` | 是 | 是 | MCP 开关、连接、资源、提示与工具统计 |
-| GET | `/api/v1/mcp/tools` | 是 | 是 | 列出 MCP 工具 |
-| GET | `/api/v1/mcp/diagnostics` | 是 | 是 | MCP 诊断占位信息 |
-| GET | `/api/v1/commands` | 是 | 是 | 列出 slash commands |
-| GET | `/api/v1/memory` | 是 | 是 | 搜索/列出记忆 |
-| POST | `/api/v1/memory` | 是 | 否 | 保存记忆 |
-| GET | `/api/v1/memory/{key}` | 是 | 是 | 按 key 搜索记忆 |
-| DELETE | `/api/v1/memory/{key}` | 是 | 是 | 删除 key-value 记忆 |
-| GET | `/api/v1/metrics` | 是 | 是 | 当前系统与性能指标 |
-| GET | `/api/v1/metrics/history?limit=N` | 是 | 是 | 指标历史 |
-| GET | `/api/v1/system/health` | 是 | 是 | 系统健康状态 |
-| GET | `/api/v1/sessions?limit=N` | 是 | 是 | 列出普通会话/任务历史 |
-| GET | `/api/v1/sessions/stats` | 是 | 是 | 会话状态统计与生命周期指标 |
-| GET | `/api/v1/sessions/{id}` | 是 | 是 | 查看普通会话详情 |
-| DELETE | `/api/v1/sessions/{id}` | 是 | 是 | 删除普通会话 |
-| GET | `/api/v1/sessions/{id}/context/status` | 是 | 是 | 查看会话上下文状态 |
-| GET | `/api/v1/sessions/{id}/state` | 是 | 是 | 查看会话生命周期状态 |
-| PUT | `/api/v1/sessions/{id}/state` | 是 | 是 | 设置会话生命周期状态 |
-| POST | `/api/v1/sessions/{id}/resume` | 是 | 是 | 从增量存储恢复事件 |
-| POST | `/api/v1/sessions/{id}/execute` | 是 | 否 | 同步/异步执行普通会话任务 |
-| POST | `/api/v1/sessions/{id}/cancel` | 是 | 是 | 取消普通会话当前任务 |
-| POST | `/api/v1/sessions/reset` | 是 | 是 | 重置普通会话历史与元数据 |
-| GET | `/api/v1/teams/sessions` | 是 | 是 | 列出 team-lead 会话 |
-| POST | `/api/v1/teams/sessions` | 是 | 是 | 创建/恢复 team-lead 会话 |
-| GET | `/api/v1/teams/sessions/{id}` | 是 | 是 | 查看 team-lead 会话 |
-| DELETE | `/api/v1/teams/sessions/{id}` | 是 | 是 | 删除 team-lead 会话 |
-| POST | `/api/v1/teams/sessions/{id}/execute` | 是 | 否 | HTTP 同步执行 team-lead 输入 |
-| POST | `/api/v1/teams/sessions/{id}/cancel` | 是 | 是 | 取消 team-lead 活跃任务 |
-| GET | `/api/v1/teams/sessions/{id}/events?since_seq=N` | 是 | 是 | HTTP poll 续传 team-lead 事件 |
-| POST | `/api/v1/scheduler/tasks` | 是 | 否 | 创建 cron task |
-| GET | `/api/v1/scheduler/tasks` | 是 | 是 | 列出 cron tasks |
-| DELETE | `/api/v1/scheduler/tasks/{id}` | 是 | 是 | 删除 cron task |
+| GET | `/health` | No | Yes | Root-path health check |
+| GET | `/api/v1/health` | No | Yes | API health check |
+| GET | `/api/v1/status` | Yes | Yes | daemon/agent status |
+| GET | `/api/v1/models` | Yes | Yes | List known model provider presets |
+| GET | `/api/v1/models/doctor` | Yes | Yes | Inspect the attribution and recognition of the current model configuration |
+| GET | `/api/v1/model/routes` | Yes | Yes | List currently configured model routes and their health status |
+| GET | `/api/v1/events?since_seq=N` | Yes | Yes | Query active task / team session events |
+| GET | `/api/v1/audit?since_seq=N` | Yes | Yes | Query sandbox, approval, permission, and error audit events |
+| GET | `/api/v1/mcp/status` | Yes | Yes | MCP switch, connection, resource, prompt, and tool statistics |
+| GET | `/api/v1/mcp/tools` | Yes | Yes | List MCP tools |
+| GET | `/api/v1/mcp/diagnostics` | Yes | Yes | MCP diagnostics placeholder information |
+| GET | `/api/v1/commands` | Yes | Yes | List slash commands |
+| GET | `/api/v1/memory` | Yes | Yes | Search/list memory |
+| POST | `/api/v1/memory` | Yes | No | Save memory |
+| GET | `/api/v1/memory/{key}` | Yes | Yes | Search memory by key |
+| DELETE | `/api/v1/memory/{key}` | Yes | Yes | Delete key-value memory |
+| GET | `/api/v1/metrics` | Yes | Yes | Current system and performance metrics |
+| GET | `/api/v1/metrics/history?limit=N` | Yes | Yes | Metrics history |
+| GET | `/api/v1/system/health` | Yes | Yes | System health status |
+| GET | `/api/v1/sessions?limit=N` | Yes | Yes | List regular session/task history |
+| GET | `/api/v1/sessions/stats` | Yes | Yes | Session state statistics and lifecycle metrics |
+| GET | `/api/v1/sessions/{id}` | Yes | Yes | View regular session details |
+| DELETE | `/api/v1/sessions/{id}` | Yes | Yes | Delete a regular session |
+| GET | `/api/v1/sessions/{id}/context/status` | Yes | Yes | View session context status |
+| GET | `/api/v1/sessions/{id}/state` | Yes | Yes | View session lifecycle state |
+| PUT | `/api/v1/sessions/{id}/state` | Yes | Yes | Set session lifecycle state |
+| POST | `/api/v1/sessions/{id}/resume` | Yes | Yes | Resume events from incremental storage |
+| POST | `/api/v1/sessions/{id}/execute` | Yes | No | Execute a regular session task synchronously/asynchronously |
+| POST | `/api/v1/sessions/{id}/cancel` | Yes | Yes | Cancel the current task of a regular session |
+| POST | `/api/v1/sessions/reset` | Yes | Yes | Reset regular session history and metadata |
+| GET | `/api/v1/teams/sessions` | Yes | Yes | List team-lead sessions |
+| POST | `/api/v1/teams/sessions` | Yes | Yes | Create/resume a team-lead session |
+| GET | `/api/v1/teams/sessions/{id}` | Yes | Yes | View a team-lead session |
+| DELETE | `/api/v1/teams/sessions/{id}` | Yes | Yes | Delete a team-lead session |
+| POST | `/api/v1/teams/sessions/{id}/execute` | Yes | No | Execute team-lead input synchronously over HTTP |
+| POST | `/api/v1/teams/sessions/{id}/cancel` | Yes | Yes | Cancel the active task of a team-lead session |
+| GET | `/api/v1/teams/sessions/{id}/events?since_seq=N` | Yes | Yes | Resume team-lead events via HTTP polling |
+| POST | `/api/v1/scheduler/tasks` | Yes | No | Create a cron task |
+| GET | `/api/v1/scheduler/tasks` | Yes | Yes | List cron tasks |
+| DELETE | `/api/v1/scheduler/tasks/{id}` | Yes | Yes | Delete a cron task |
 
-`/api/v1/teams/*` 仅在 team-lead registry 初始化后注册；`/api/v1/scheduler/*` 在 scheduler 未启用时返回 503。
+`/api/v1/teams/*` is only registered after the team-lead registry is initialized; `/api/v1/scheduler/*` returns 503 when the scheduler is not enabled.
 
-## 3. REST API 详解
+## 3. REST API details
 
 ### 3.1 Health / Status
 
@@ -113,7 +115,7 @@ export interface ModelRouteInfo {
 export type ModelRoutesResponse = ModelRouteInfo[];
 ```
 
-`/models` 返回内置 provider presets；`/models/doctor` 根据当前 `base_url` 与 `model` 推断 provider，适合设置页诊断；`/model/routes` 返回当前配置的模型路由列表及其熔断器状态与健康指标，适合监控与故障排查。
+`/models` returns built-in provider presets; `/models/doctor` infers the provider from the current `base_url` and `model`, suitable for settings-page diagnostics; `/model/routes` returns the currently configured model routes along with their circuit-breaker state and health metrics, suitable for monitoring and troubleshooting.
 
 ### 3.3 MCP
 
@@ -160,7 +162,7 @@ export interface CommandInfo {
 export interface CommandsResponse { commands: CommandInfo[] }
 ```
 
-daemon 有 agent 工作目录时返回项目命令与内置命令；否则只返回内置命令，避免意外访问 daemon 进程 home 目录。
+When the daemon has an agent working directory, both project commands and built-in commands are returned; otherwise only built-in commands are returned, to avoid accidentally accessing the daemon process home directory.
 
 ### 3.5 Events and audit
 
@@ -281,7 +283,7 @@ export interface SessionsStatsResponse {
 }
 ```
 
-`GET /sessions?limit=N` 默认 `limit=200`，最大接受 `2000`。`POST /sessions/{id}/execute` 在 `async=true` 时立即返回 `run_id/status=running`；否则等待完成、错误或超时，并可在 `include_steps=true` 时返回事件步骤。
+`GET /sessions?limit=N` defaults to `limit=200` and accepts a maximum of `2000`. `POST /sessions/{id}/execute` returns `run_id/status=running` immediately when `async=true`; otherwise it waits for completion, error, or timeout, and can return event steps when `include_steps=true`.
 
 ### 3.8 Session lifecycle / context / resume
 
@@ -306,7 +308,7 @@ export interface SessionResumeRequest { from_seq?: number }
 export interface SessionResumeResponse { session_id: string; from_seq: number; events: unknown[] }
 ```
 
-`/resume` 依赖 `IncrementalSessionStorage`；存储不支持时返回 HTTP 501。
+`/resume` depends on `IncrementalSessionStorage`; it returns HTTP 501 when the storage does not support it.
 
 ### 3.9 Team-lead sessions
 
@@ -334,7 +336,7 @@ export interface TeamLeadEventsResponse { session_id: string; since_seq: number;
 export interface TeamLeadCancelResponse { success: boolean; cancelled_tasks: number }
 ```
 
-`POST /teams/sessions` 未提供 `team_name` 时默认 `default`；未提供 `session_id` 时 daemon 自动生成。`interactive_confirm=true` 会让 team-lead 工具调用进入交互审批流程。
+`POST /teams/sessions` defaults `team_name` to `default` when it is not provided; when `session_id` is not provided, the daemon generates one automatically. `interactive_confirm=true` puts team-lead tool calls into an interactive approval flow.
 
 ### 3.10 Scheduler
 
@@ -353,24 +355,24 @@ export interface ListTasksResponse { success: boolean; tasks: unknown[] }
 export interface DeleteTaskResponse { success: boolean; error?: string }
 ```
 
-## 4. WebSocket 协议
+## 4. WebSocket protocol
 
-### 4.1 连接建立
+### 4.1 Connection establishment
 
-普通会话连接 `/api/v1/stream`，发送 `subscribe` 帧指定 `session_id` 续传已有任务，或发送带 `command` 的帧启动/附着会话任务。Team-lead 会话连接 `/api/v1/teams/sessions/{id}/stream`，可发送 `subscribe` 续传，也可发送 `lead_input` 启动一次 team-lead turn。
+For regular sessions, connect to `/api/v1/stream` and send a `subscribe` frame with a `session_id` to resume an existing task, or send a frame carrying a `command` to start/attach to a session task. For team-lead sessions, connect to `/api/v1/teams/sessions/{id}/stream`; you can send `subscribe` to resume, or send `lead_input` to start a team-lead turn.
 
-### 4.2 Client → Server 帧
+### 4.2 Client → Server frames
 
-| type | 连接 | 关键字段 | 说明 |
+| type | Connection | Key fields | Description |
 |---|---|---|---|
-| `subscribe` | 普通/team | `session_id?`, `run_id?`, `since_seq?`, `streams?` | 订阅并从 `since_seq` 后续传；普通连接必须提供 `session_id` |
-| `command` 或空 type + `command` | 普通 | `session_id`, `command`, `timeout?`, `images?` | 启动普通会话任务；如果已有 running task 会自动附着并忽略新命令 |
-| `lead_input` | team | `command`, `task_id?`, `since_seq?` | 启动 team-lead 输入；`task_id` 为空时自动生成 |
-| `replay` | team | `since_seq?` | 只回放 `since_seq` 后的 team-lead 事件，完成后返回 `replay_complete`，不进入 live 订阅 |
-| `tool_approval` | 普通/team | `call_id`, `approved` | 提交工具审批结果 |
-| `approve` / `reject` | team | `call_id` | `tool_approval` 的 team-lead 兼容别名 |
-| `cancel` | team | - | 取消 team-lead 活跃任务并返回 `cancel_ack` |
-| `ping` | 普通/team | - | 返回 `pong` |
+| `subscribe` | regular/team | `session_id?`, `run_id?`, `since_seq?`, `streams?` | Subscribe and resume after `since_seq`; regular connections must provide `session_id` |
+| `command` or empty type + `command` | regular | `session_id`, `command`, `timeout?`, `images?` | Start a regular session task; if a task is already running, the connection automatically attaches and the new command is ignored |
+| `lead_input` | team | `command`, `task_id?`, `since_seq?` | Start team-lead input; `task_id` is auto-generated when empty |
+| `replay` | team | `since_seq?` | Replay only the team-lead events after `since_seq`; returns `replay_complete` when done, without entering the live subscription |
+| `tool_approval` | regular/team | `call_id`, `approved` | Submit a tool approval result |
+| `approve` / `reject` | team | `call_id` | Team-lead compatibility aliases for `tool_approval` |
+| `cancel` | team | - | Cancel the active team-lead task and return `cancel_ack` |
+| `ping` | regular/team | - | Returns `pong` |
 
 ```json
 { "type": "subscribe", "session_id": "web-1", "run_id": "run_abc", "since_seq": 42, "streams": ["default"] }
@@ -395,28 +397,28 @@ export interface CancelFrame { type: 'cancel' }
 export interface PingFrame { type: 'ping' }
 ```
 
-### 4.3 Server → Client 帧
+### 4.3 Server → Client frames
 
-| type | 连接 | 说明 |
+| type | Connection | Description |
 |---|---|---|
-| `session_start` | team | team-lead replay/live stream 开始 |
-| `replay_complete` | team | `replay` 帧回放结束，包含 `since_seq/last_seq/count` |
-| `lead_input_ack` | team | team-lead 接收输入，包含 `session_id/team_name/task_id` |
-| `cancel_ack` | team | team-lead cancel 已处理，包含 `cancelled_tasks` |
-| `tool_approval_ack` | 普通/team | 审批结果已提交 |
-| `status` | 普通 | 未提供 command/subscribe 时返回会话当前 `status/title/updated_at` |
-| `stream_content` / `content` | 普通/team | assistant 文本流/完成态文本 |
-| `thinking` | 普通/team | 可折叠思考块 |
-| `tool_use` / `tool_call` / `tool_result` | 普通/team | 工具调用与结果 |
-| `waiting_for_user` / `tool_approval_request` | 普通/team | 工具审批请求 |
-| `mailbox_sent` | team | 团队邮箱动态 |
-| `idle_notification` | team | teammate 状态摘要 |
-| `spawn_teammate` | team | teammate/专家被拉起 |
-| `token_stats` | 普通/team | token 统计 |
-| `completion` / `done` | 普通/team | turn 完成；`completion` 包含 `last_seq` |
-| `pong` | 普通/team | 心跳响应 |
-| `chunk` | 普通/team | 大消息分片 |
-| `error` | 普通/team | 错误帧，通常包含 `error` 与可选 `severity` |
+| `session_start` | team | team-lead replay/live stream start |
+| `replay_complete` | team | `replay` frame playback finished; contains `since_seq/last_seq/count` |
+| `lead_input_ack` | team | team-lead received the input; contains `session_id/team_name/task_id` |
+| `cancel_ack` | team | team-lead cancel processed; contains `cancelled_tasks` |
+| `tool_approval_ack` | regular/team | Approval result submitted |
+| `status` | regular | Returned when no command/subscribe is provided; contains the session's current `status/title/updated_at` |
+| `stream_content` / `content` | regular/team | Assistant text stream / completed text |
+| `thinking` | regular/team | Collapsible thinking block |
+| `tool_use` / `tool_call` / `tool_result` | regular/team | Tool calls and results |
+| `waiting_for_user` / `tool_approval_request` | regular/team | Tool approval request |
+| `mailbox_sent` | team | Team mailbox activity |
+| `idle_notification` | team | Teammate status summary |
+| `spawn_teammate` | team | Teammate/expert spawned |
+| `token_stats` | regular/team | Token statistics |
+| `completion` / `done` | regular/team | Turn completed; `completion` contains `last_seq` |
+| `pong` | regular/team | Heartbeat response |
+| `chunk` | regular/team | Large-message chunk |
+| `error` | regular/team | Error frame; usually contains `error` and an optional `severity` |
 
 ```json
 { "type":"lead_input_ack", "session_id":"lead-alpha-chat", "team_name":"alpha", "task_id":"task_1" }
@@ -427,9 +429,9 @@ export interface PingFrame { type: 'ping' }
 { "type":"completion", "session_id":"web-1", "run_id":"run_abc", "success":true, "status":"completed", "session_done":true, "last_seq":55 }
 ```
 
-### 4.4 工具审批
+### 4.4 Tool approval
 
-工具审批请求可能以 `tool_approval_request` 直接发送，也可能以 `waiting_for_user` 事件携带 `metadata.kind=tool_approval_request` 的形式出现。客户端收到审批请求后应阻塞该工具调用的 UI 决策，但不阻塞 WebSocket 读循环；用户选择后发送 `tool_approval`。Team-lead stream 也接受 `approve` / `reject` 作为显式别名，便于 UI 将按钮动作直接映射为 frame。
+A tool approval request may be sent directly as `tool_approval_request`, or it may appear as a `waiting_for_user` event carrying `metadata.kind=tool_approval_request`. After receiving an approval request, the client should block the UI decision for that tool call, but must not block the WebSocket read loop; after the user chooses, send `tool_approval`. The team-lead stream also accepts `approve` / `reject` as explicit aliases, making it easy for the UI to map button actions directly to frames.
 
 ```json
 { "type":"tool_approval_request", "call_id":"call_1", "tool_name":"Bash", "parameters":{"command":"git status"}, "timeout_seconds":60 }
@@ -449,17 +451,17 @@ export interface ToolApprovalRequestFrame {
 export interface ToolApprovalAckFrame { type: 'tool_approval_ack'; session_id?: string; call_id: string; approved: boolean }
 ```
 
-### 4.5 大消息分片
+### 4.5 Large-message chunking
 
 ```json
 { "type":"chunk", "id":"msg_1", "index":0, "total":3, "data":"...", "is_chunk":true, "complete":false }
 ```
 
-客户端按 `id` 收集 `index`，达到 `total` 后按序拼接 `data` 并重新解析 JSON。
+The client collects `index` values by `id`, and once `total` is reached, concatenates `data` in order and re-parses the JSON.
 
-### 4.6 重连与续传
+### 4.6 Reconnection and resumption
 
-客户端必须持久化最大 `seq` 或 `completion.last_seq`，断线后将该值作为 `since_seq` 恢复；`since_seq` 是排他下界，daemon 只回放 `seq > since_seq` 的事件。
+The client must persist the maximum `seq` or `completion.last_seq`; after a disconnect, resume by passing that value as `since_seq`. `since_seq` is an exclusive lower bound: the daemon only replays events with `seq > since_seq`.
 
 ```mermaid
 sequenceDiagram
@@ -473,35 +475,35 @@ sequenceDiagram
   Daemon-->>Web: replay missed events
 ```
 
-### 4.7 心跳
+### 4.7 Heartbeat
 
-客户端每 30s 发送 `ping`，90s 未收到任何消息应断开并重连。普通流 server read deadline 约 300s；team-lead stream 使用独立 read timeout。
+The client sends `ping` every 30s; if no message is received for 90s, it should disconnect and reconnect. The regular stream server read deadline is about 300s; the team-lead stream uses a separate read timeout.
 
-## 5. 事件类型枚举
+## 5. Event type enumeration
 
-| StreamEvent.type | WS 发送 | Web UI 建议 |
+| StreamEvent.type | Sent over WS | Web UI suggestion |
 |---|---:|---|
-| `session_start` | 是 | 标记 replay/live stream 开始 |
-| `lead_input_ack` | 是 | 将提交按钮切到运行态并记录 task_id |
-| `stream_content` | 是 | 追加 assistant 流式文本 |
-| `content` | 是 | 完成态 assistant 文本 |
-| `thinking` | 是 | 可折叠思考块 |
-| `tool_use` | 是 | 工具调用卡片 |
-| `tool_call` / `tool_result` | 是 | 调试/详细步骤 |
-| `waiting_for_user` / `tool_approval_request` | 是 | 审批 UI |
-| `tool_approval_ack` | 是 | 清理审批等待态 |
-| `mailbox_sent` | 是 | 团队动态 |
-| `idle_notification` | 是 | teammate 状态 |
-| `spawn_teammate` | 是 | roster 更新 |
-| `status` | 是 | 会话概览/标题刷新 |
-| `error` | 是 | 错误提示 |
-| `completion` / `done` | 是 | 标记 turn 完成并保存 `last_seq` |
-| `token_stats` | 是 | 状态栏 token 统计 |
-| `cancel_ack` | 是 | 取消操作反馈 |
-| `pong` | 是 | 心跳响应 |
-| `chunk` | 是 | 分片重组 |
+| `session_start` | Yes | Mark replay/live stream start |
+| `lead_input_ack` | Yes | Switch the submit button to the running state and record task_id |
+| `stream_content` | Yes | Append assistant streaming text |
+| `content` | Yes | Completed assistant text |
+| `thinking` | Yes | Collapsible thinking block |
+| `tool_use` | Yes | Tool call card |
+| `tool_call` / `tool_result` | Yes | Debug/detailed steps |
+| `waiting_for_user` / `tool_approval_request` | Yes | Approval UI |
+| `tool_approval_ack` | Yes | Clear the approval pending state |
+| `mailbox_sent` | Yes | Team activity |
+| `idle_notification` | Yes | Teammate status |
+| `spawn_teammate` | Yes | Roster update |
+| `status` | Yes | Session overview/title refresh |
+| `error` | Yes | Error notification |
+| `completion` / `done` | Yes | Mark the turn as complete and save `last_seq` |
+| `token_stats` | Yes | Status-bar token statistics |
+| `cancel_ack` | Yes | Cancel operation feedback |
+| `pong` | Yes | Heartbeat response |
+| `chunk` | Yes | Chunk reassembly |
 
-## 6. Swarm / Team-Lead 流程
+## 6. Swarm / Team-Lead flow
 
 ```mermaid
 sequenceDiagram
@@ -519,22 +521,22 @@ sequenceDiagram
   Lead-->>Web: stream_content + completion(last_seq)
 ```
 
-## 7. 错误码表
+## 7. Error code table
 
-| 层级 | 示例 | 处理建议 |
+| Level | Example | Handling suggestion |
 |---|---|---|
-| HTTP 400 | invalid JSON / invalid request body / command required | 修正请求 |
-| HTTP 401/403 | invalid API key | 重新鉴权 |
-| HTTP 404 | session not found / task not found | 创建或恢复会话 |
-| HTTP 409 | run mismatch / task not running | 重新订阅最新 run 或刷新状态 |
-| HTTP 422 | cannot cancel this session | 刷新任务状态，禁用取消按钮 |
-| HTTP 501 | incremental storage unavailable / memory delete not implemented | 降级隐藏相关能力 |
-| HTTP 503 | daemon draining / scheduler disabled / team-lead disabled | 展示不可用状态并退避重试 |
-| HTTP 5xx | daemon error | 退避重试 |
+| HTTP 400 | invalid JSON / invalid request body / command required | Fix the request |
+| HTTP 401/403 | invalid API key | Re-authenticate |
+| HTTP 404 | session not found / task not found | Create or resume the session |
+| HTTP 409 | run mismatch / task not running | Re-subscribe to the latest run or refresh the state |
+| HTTP 422 | cannot cancel this session | Refresh the task state and disable the cancel button |
+| HTTP 501 | incremental storage unavailable / memory delete not implemented | Degrade and hide the related capability |
+| HTTP 503 | daemon draining / scheduler disabled / team-lead disabled | Show an unavailable state and back off before retrying |
+| HTTP 5xx | daemon error | Back off and retry |
 | WS close 1006 | abnormal close | reconnect with since_seq |
-| WS error frame | `{type:'error'}` | 展示并按 severity 决定是否重试 |
+| WS error frame | `{type:'error'}` | Display it and decide whether to retry based on severity |
 
-## 8. TypeScript 类型定义汇总
+## 8. TypeScript type definitions summary
 
 ```ts
 export interface TokenStats { input_tokens: number; output_tokens: number; total_tokens: number; peak_tokens_per_second?: number }
@@ -565,26 +567,26 @@ export interface CompletionFrame {
 export type ServerFrame = StreamEvent | ToolApprovalRequestFrame | ToolApprovalAckFrame | ChunkFrame | CompletionFrame;
 ```
 
-## 9. 客户端实现 Checklist
+## 9. Client implementation checklist
 
-- [ ] REST 支持 `X-API-Key` 与 `Authorization: Bearer`，WebSocket 支持 query token
-- [ ] 持久化最大 `seq` 与 `completion.last_seq`
-- [ ] 断线用最后已收到的序号作为 `since_seq` 续传，普通流可带 `run_id` 防止串 run
-- [ ] 指数退避并封顶 30s
-- [ ] chunk 重组后再解析
-- [ ] ping/pong 心跳与超时
-- [ ] 审批 UI 不阻塞读循环，并处理 `tool_approval_ack`
-- [ ] cancel/reset/sessions 走 REST 或控制帧
-- [ ] 对未启用 team-lead/scheduler/incremental storage 的 503/501 做能力降级
-- [ ] 未知事件以 warning 记录，不崩溃
+- [ ] REST supports `X-API-Key` and `Authorization: Bearer`; WebSocket supports query token
+- [ ] Persist the maximum `seq` and `completion.last_seq`
+- [ ] On disconnect, resume using the last received sequence number as `since_seq`; regular streams may carry `run_id` to avoid cross-run mixing
+- [ ] Exponential backoff capped at 30s
+- [ ] Reassemble chunks before parsing
+- [ ] ping/pong heartbeat and timeouts
+- [ ] Approval UI does not block the read loop, and `tool_approval_ack` is handled
+- [ ] cancel/reset/sessions go through REST or control frames
+- [ ] Degrade capabilities for 503/501 from team-lead/scheduler/incremental storage that are not enabled
+- [ ] Log unknown events as warnings without crashing
 
-## 10. 兼容性与版本
+## 10. Compatibility and versioning
 
-v5 在 v4 Web 客户端指南基础上补齐 daemon 模式新增 REST API：`models`、`models/doctor`、`model/routes`（模型路由与熔断器健康状态）、`mcp`、`commands`、`memory`、`metrics`、`system/health`、session stats/context/state/resume、team-lead get/delete/execute/cancel/events 与 scheduler tasks；WebSocket 文档同步补充 `lead_input_ack`、`cancel_ack`、`tool_approval_ack`、`status`、`completion.last_seq`、`images` 与当前鉴权方式。
+v5 completes the daemon-mode additions on top of the v4 Web client guide with new REST APIs: `models`, `models/doctor`, `model/routes` (model routes and circuit-breaker health status), `mcp`, `commands`, `memory`, `metrics`, `system/health`, session stats/context/state/resume, team-lead get/delete/execute/cancel/events, and scheduler tasks; the WebSocket documentation is updated accordingly with `lead_input_ack`, `cancel_ack`, `tool_approval_ack`, `status`, `completion.last_seq`, `images`, and the current authentication methods.
 
-v4 破坏性变更：删除旧 Adapter `SendEvent/SubmitChannel/CancelChannel`；删除 `lead-chat --plain` 与 readline 纯文本输出；删除 daemon stream-exec 的 `fmt.Print` 渲染分支；脚本应迁移到 `nano daemon execute --json`。
+v4 breaking changes: removed the old Adapter `SendEvent/SubmitChannel/CancelChannel`; removed `lead-chat --plain` and the readline plain-text output; removed the `fmt.Print` rendering branch of daemon stream-exec; scripts should migrate to `nano daemon execute --json`.
 
-## 11. 附录
+## 11. Appendix
 
 ```bash
 wscat -c 'ws://127.0.0.1:8080/api/v1/stream?api_key=KEY'
@@ -598,4 +600,4 @@ wscat -c 'ws://127.0.0.1:8080/api/v1/teams/sessions/lead-alpha-chat/stream?api_k
 > {"type":"cancel"}
 ```
 
-CLI 对应关系：`nano chat` 使用本地 EventSource；`nano chat --daemon` 与 `nano lead-chat` 使用 daemon WebSocket；`nano daemon execute --json` 使用同步 HTTP，适合 CI。
+CLI correspondence: `nano chat` uses a local EventSource; `nano chat --daemon` and `nano lead-chat` use the daemon WebSocket; `nano daemon execute --json` uses synchronous HTTP and is suitable for CI.

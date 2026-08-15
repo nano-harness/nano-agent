@@ -1,5 +1,7 @@
 # Configuration and Migration Guide
 
+[中文](./CONFIGURATION.zh-CN.md)
+
 This guide records the configuration compatibility rules for the architecture refactor. The refactor is additive: existing CLI flags, `.nano.yaml` fields, daemon APIs, sessions, skills, commands, and team data remain supported unless explicitly listed below.
 
 ## Configuration sources and precedence

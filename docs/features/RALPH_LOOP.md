@@ -1,5 +1,7 @@
 # Ralph-loop
 
+[中文](./RALPH_LOOP.zh-CN.md)
+
 Ralph-loop lets a Stop hook request another agent turn by returning a block decision, for example:
 
 ```json

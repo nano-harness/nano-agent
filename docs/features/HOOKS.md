@@ -1,5 +1,7 @@
 # Hooks
 
+[中文](./HOOKS.zh-CN.md)
+
 Hooks are lifecycle extension points executed through `pkg/hookservice`.
 
 ## Compatibility

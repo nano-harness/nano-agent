@@ -1,5 +1,7 @@
 # Nano-Agent Skills Documentation
 
+[中文](./README.zh-CN.md)
+
 This directory contains skill documents for nano-agent that help the agent understand and assist with various startup modes and configurations.
 
 ## What's Included

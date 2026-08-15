@@ -1,5 +1,7 @@
 # Migration Guide
 
+[中文](./MIGRATION_GUIDE.zh-CN.md)
+
 This guide covers all migration scenarios for nano-agent, including architecture refactoring and feature upgrades.
 
 ## Table of Contents

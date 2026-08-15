@@ -1,74 +1,76 @@
-# 智能子代理编排系统
+# Intelligent Sub-Agent Orchestration System
 
-## 概述
+[中文](./INTELLIGENT_ORCHESTRATION.zh-CN.md)
 
-nano-agent 的智能子代理编排系统是一个先进的任务分发和执行框架，能够自动识别用户请求中的子代理标识符，并智能地将任务分配给最合适的专业化代理。该系统通过减少不必要的LLM调用和优化任务路由，显著提升了系统的响应速度和执行效率。
+## Overview
 
-## 核心组件
+nano-agent's intelligent sub-agent orchestration system is an advanced task dispatch and execution framework. It automatically recognizes sub-agent indicators in user requests and intelligently assigns tasks to the most suitable specialized agents. By reducing unnecessary LLM calls and optimizing task routing, the system significantly improves response speed and execution efficiency.
 
-### 1. IntelligentSubAgentOrchestrator (智能子代理编排器)
+## Core Components
 
-智能编排器是系统的核心组件，负责：
+### 1. IntelligentSubAgentOrchestrator (Intelligent Sub-Agent Orchestrator)
 
-- **标识符检测**: 自动检测用户输入中的子代理标识符
-- **执行计划生成**: 基于任务内容创建最优的执行计划
-- **任务分配**: 将复杂任务分解并分配给合适的子代理
+The intelligent orchestrator is the core component of the system, responsible for:
 
-#### 主要方法
+- **Indicator detection**: Automatically detects sub-agent indicators in user input
+- **Execution plan generation**: Creates optimal execution plans based on task content
+- **Task assignment**: Breaks down complex tasks and assigns them to appropriate sub-agents
+
+#### Main Methods
 
 ```go
-// 检测输入是否包含子代理标识符
+// Detect whether the input contains sub-agent indicators
 func (o *IntelligentSubAgentOrchestrator) HasSubAgentIndicators(input string) bool
 
-// 创建执行计划
+// Create an execution plan
 func (o *IntelligentSubAgentOrchestrator) CreateExecutionPlan(ctx context.Context, userInput string) (*OrchestrationPlan, error)
 ```
 
-### 2. UnifiedAgentTool (统一代理工具)
+### 2. UnifiedAgentTool (Unified Agent Tool)
 
-统一代理工具集成了智能编排器，提供：
+The unified agent tool integrates the intelligent orchestrator and provides:
 
-- **统一接口**: 为所有代理操作提供一致的接口
-- **智能路由**: 根据任务特征自动选择执行路径
-- **回退机制**: 在编排失败时提供可靠的回退选项
+- **Unified interface**: A consistent interface for all agent operations
+- **Intelligent routing**: Automatically selects the execution path based on task characteristics
+- **Fallback mechanism**: Reliable fallback options when orchestration fails
 
-### 3. 优化的主代理流程
+### 3. Optimized Main Agent Flow
 
-主代理的 `ProcessStream` 方法经过优化，实现：
+The main agent's `ProcessStream` method has been optimized to implement:
 
-- **预检查机制**: 在调用LLM之前先检查子代理标识符
-- **直接路由**: 对于明确的任务直接路由到相应代理
-- **性能优化**: 避免不必要的LLM调用
+- **Pre-check mechanism**: Checks for sub-agent indicators before calling the LLM
+- **Direct routing**: Routes unambiguous tasks directly to the corresponding agent
+- **Performance optimization**: Avoids unnecessary LLM calls
 
-## 工作流程
+## Workflow
 
-### 1. 请求处理流程
+### 1. Request Processing Flow
 
 ```
-用户输入 → 标识符检测 → 路由决策 → 执行
-    ↓           ↓           ↓        ↓
-  "写代码"   → 检测到"code" → 路由到coder → 执行任务
+User input → Indicator detection → Routing decision → Execution
+     ↓                ↓                     ↓             ↓
+"写代码" (write code) → detects "code" → routes to coder → executes the task
 ```
 
-### 2. 智能检测机制
+### 2. Intelligent Detection Mechanism
 
-系统通过以下方式检测子代理标识符：
+The system detects sub-agent indicators in the following ways:
 
-1. **显式代理名称**: 直接提及代理名称（如 "让coder帮我..."）
-2. **关键词匹配**: 匹配 `WhenToUse` 字段中定义的关键词
-3. **模式识别**: 识别特定的触发模式（如 "@coder", "使用[writer]"）
+1. **Explicit agent names**: Directly mentioning an agent name (e.g. "have coder help me...")
+2. **Keyword matching**: Matching keywords defined in the `WhenToUse` field
+3. **Pattern recognition**: Recognizing specific trigger patterns (e.g. "@coder", "use [writer]")
 
-### 3. 执行模式
+### 3. Execution Modes
 
-系统支持三种执行模式：
+The system supports three execution modes:
 
-- **主代理模式**: 没有检测到子代理标识符时使用
-- **单子代理模式**: 明确指向单个子代理时使用
-- **多子代理模式**: 需要多个子代理协作时使用
+- **Main agent mode**: Used when no sub-agent indicator is detected
+- **Single sub-agent mode**: Used when a request explicitly targets a single sub-agent
+- **Multi sub-agent mode**: Used when multiple sub-agents need to collaborate
 
-## 配置示例
+## Configuration Examples
 
-### 子代理配置
+### Sub-Agent Configuration
 
 ```yaml
 sub_agents:
@@ -85,77 +87,77 @@ sub_agents:
     enabled: true
 ```
 
-### 触发示例
+### Trigger Examples
 
-系统现在只支持显式调用模式，以下输入会触发相应的子代理：
+The system now only supports explicit invocation. The following inputs trigger the corresponding sub-agents:
 
 ```bash
-# 触发 coder 子代理 - 显式调用
-"@coder 请帮我写一个Python函数"
-"让coder实现这个功能"
-"[coder] debug这个代码问题"
+# Trigger the coder sub-agent - explicit invocation
+"@coder 请帮我写一个Python函数"  # "@coder, please write a Python function for me"
+"让coder实现这个功能"           # "Have coder implement this feature"
+"[coder] debug这个代码问题"     # "[coder] debug this code issue"
 "use coder to fix this bug"
 "coder help me with this algorithm"
 
-# 触发 writer 子代理 - 显式调用
-"@writer 写一份API文档"
-"让writer创建用户手册"
-"使用[writer]生成内容"
+# Trigger the writer sub-agent - explicit invocation
+"@writer 写一份API文档"         # "@writer, write an API document"
+"让writer创建用户手册"          # "Have writer create a user manual"
+"使用[writer]生成内容"          # "Use [writer] to generate content"
 "use writer to create documentation"
 "writer help me write a blog post"
 
-# 不触发子代理（使用主代理）
-"今天天气怎么样？"
-"你好"
-"请帮我写一个Python函数"  # 没有显式调用，使用主代理
-"debug这个代码问题"        # 没有显式调用，使用主代理
-"写一份API文档"           # 没有显式调用，使用主代理
+# Do not trigger a sub-agent (use the main agent)
+"今天天气怎么样？"               # "How's the weather today?"
+"你好"                         # "Hello"
+"请帮我写一个Python函数"        # No explicit invocation, uses the main agent
+"debug这个代码问题"             # No explicit invocation, uses the main agent
+"写一份API文档"                # No explicit invocation, uses the main agent
 ```
 
-**注意**: 系统已移除关键词匹配功能，只支持显式调用模式。这意味着必须明确指定要使用的子代理，否则将使用主代理处理请求。
+**Note**: Keyword matching has been removed from the system; only explicit invocation is supported. This means you must explicitly specify the sub-agent to use, otherwise the request is handled by the main agent.
 
-## 性能优化
+## Performance Optimization
 
-### 1. 预检查机制
+### 1. Pre-Check Mechanism
 
-系统在调用LLM之前先进行本地检查：
+The system performs a local check before calling the LLM:
 
 ```go
-// 检查是否有子代理标识符
+// Check whether there are sub-agent indicators
 hasSubAgentIndicators := len(triggeredAgents) > 0
 if !hasSubAgentIndicators {
-    // 直接使用主代理，避免LLM调用
+    // Use the main agent directly, avoiding an LLM call
     return a.processDirectly(ctx, userInput, onEvent)
 }
 ```
 
-### 2. 缓存和复用
+### 2. Caching and Reuse
 
-- **配置缓存**: 子代理配置在启动时加载并缓存
-- **模式复用**: 编译后的正则表达式模式被复用
-- **连接池**: HTTP连接复用减少开销
+- **Configuration caching**: Sub-agent configurations are loaded and cached at startup
+- **Pattern reuse**: Compiled regular expression patterns are reused
+- **Connection pooling**: HTTP connection reuse reduces overhead
 
-### 3. 并发处理
+### 3. Concurrent Processing
 
-多子代理任务支持并发执行：
+Multi sub-agent tasks support concurrent execution:
 
 ```go
-// 并发执行多个子代理
+// Execute multiple sub-agents concurrently
 for _, agentName := range agentNames {
     go func(name string) {
         defer wg.Done()
         err := a.processWithSubAgent(ctx, userInput, name, eventHandler)
-        // 处理结果...
+        // Process the result...
     }(agentName)
 }
 ```
 
-## API 接口
+## API Interfaces
 
 ### REST API
 
 ```bash
-# 执行任务
+# Execute a task
 POST /api/v1/sessions/sess_demo/execute
 {
     "command": "请帮我写一个排序算法",
@@ -167,22 +169,22 @@ POST /api/v1/sessions/sess_demo/execute
 ### WebSocket API
 
 ```javascript
-// 建立连接
+// Establish a connection
 const ws = new WebSocket('ws://localhost:8080/api/v1/stream');
 
-// 发送任务
+// Send a task
 ws.send(JSON.stringify({
-  command: '写一个快速排序算法',
+  command: '写一个快速排序算法',  // "Write a quicksort algorithm"
   session_id: 'sess_demo',
   timeout: 60
 }));
 ```
 
-## 监控和诊断
+## Monitoring and Diagnostics
 
-### 1. 日志记录
+### 1. Logging
 
-系统提供详细的日志记录：
+The system provides detailed logging:
 
 ```
 [INFO] No sub-agent indicators detected, processing with main agent directly
@@ -190,86 +192,86 @@ ws.send(JSON.stringify({
 [DEBUG] Found sub-agent trigger (@pattern): coder
 ```
 
-### 2. 性能指标
+### 2. Performance Metrics
 
-- **响应时间**: 从请求到首次响应的时间
-- **路由准确性**: 正确路由到合适代理的比例
-- **缓存命中率**: 配置和模式缓存的命中率
+- **Response time**: Time from request to first response
+- **Routing accuracy**: Proportion of requests correctly routed to the appropriate agent
+- **Cache hit rate**: Hit rate of the configuration and pattern caches
 
-### 3. 错误处理
+### 3. Error Handling
 
-系统提供多层错误处理：
+The system provides multi-layered error handling:
 
-- **编排失败回退**: 智能编排失败时回退到传统模式
-- **代理不可用处理**: 目标代理不可用时的处理策略
-- **超时保护**: 防止长时间运行的任务阻塞系统
+- **Orchestration failure fallback**: Falls back to the traditional mode when intelligent orchestration fails
+- **Agent unavailability handling**: Handling strategy when the target agent is unavailable
+- **Timeout protection**: Prevents long-running tasks from blocking the system
 
-## 最佳实践
+## Best Practices
 
-### 1. 子代理设计
+### 1. Sub-Agent Design
 
-- **专业化**: 每个子代理应专注于特定领域
-- **清晰的边界**: 明确定义每个代理的职责范围
-- **关键词优化**: 精心设计 `WhenToUse` 关键词以提高匹配准确性
+- **Specialization**: Each sub-agent should focus on a specific domain
+- **Clear boundaries**: Clearly define the scope of responsibility of each agent
+- **Keyword optimization**: Carefully design `WhenToUse` keywords to improve matching accuracy
 
-### 2. 性能优化
+### 2. Performance Optimization
 
-- **合理配置**: 根据实际需求配置子代理数量
-- **资源管理**: 监控内存和CPU使用情况
-- **缓存策略**: 合理使用缓存减少重复计算
+- **Sensible configuration**: Configure the number of sub-agents based on actual needs
+- **Resource management**: Monitor memory and CPU usage
+- **Caching strategy**: Use caches appropriately to reduce repeated computation
 
-### 3. 错误处理
+### 3. Error Handling
 
-- **优雅降级**: 确保系统在部分组件失败时仍能工作
-- **日志记录**: 详细记录错误信息以便调试
-- **监控告警**: 设置适当的监控和告警机制
+- **Graceful degradation**: Ensure the system keeps working when some components fail
+- **Logging**: Record detailed error information for debugging
+- **Monitoring and alerting**: Set up appropriate monitoring and alerting mechanisms
 
-## 故障排除
+## Troubleshooting
 
-### 常见问题
+### Common Issues
 
-1. **子代理未被触发**
-   - 检查 `WhenToUse` 关键词配置
-   - 验证子代理是否启用
-   - 查看日志中的检测信息
+1. **Sub-agent not triggered**
+   - Check the `WhenToUse` keyword configuration
+   - Verify the sub-agent is enabled
+   - Check the detection information in the logs
 
-2. **性能问题**
-   - 检查是否有不必要的LLM调用
-   - 监控子代理的响应时间
-   - 优化关键词匹配逻辑
+2. **Performance issues**
+   - Check for unnecessary LLM calls
+   - Monitor sub-agent response times
+   - Optimize the keyword matching logic
 
-3. **编排失败**
-   - 查看编排器的错误日志
-   - 检查LLM连接状态
-   - 验证配置文件格式
+3. **Orchestration failures**
+   - Review the orchestrator's error logs
+   - Check the LLM connection status
+   - Validate the configuration file format
 
-### 调试技巧
+### Debugging Tips
 
 ```bash
-# 启用详细日志
+# Enable verbose logging
 export NANO_VERBOSE=true
 
-# 查看编排决策过程
-nano --debug "你的任务"
+# Inspect the orchestration decision process
+nano --debug "你的任务"  # "your task"
 
-# 测试特定子代理
+# Test a specific sub-agent
 nano subagent serve --name coder
 ```
 
-## 未来发展
+## Future Development
 
-### 计划功能
+### Planned Features
 
-1. **学习能力**: 基于历史数据优化路由决策
-2. **动态配置**: 运行时动态调整子代理配置
-3. **负载均衡**: 智能分配任务以平衡负载
-4. **A/B测试**: 支持不同编排策略的对比测试
+1. **Learning capability**: Optimize routing decisions based on historical data
+2. **Dynamic configuration**: Dynamically adjust sub-agent configuration at runtime
+3. **Load balancing**: Intelligently distribute tasks to balance load
+4. **A/B testing**: Support comparative testing of different orchestration strategies
 
-### 扩展性
+### Extensibility
 
-系统设计支持：
+The system design supports:
 
-- **插件化架构**: 易于添加新的子代理类型
-- **分布式部署**: 支持跨节点的子代理部署
-- **云原生**: 支持容器化和Kubernetes部署
-- **API扩展**: 丰富的API接口支持第三方集成
+- **Pluggable architecture**: Easy to add new sub-agent types
+- **Distributed deployment**: Sub-agent deployment across nodes
+- **Cloud native**: Support for containerized and Kubernetes deployment
+- **API extension**: Rich API interfaces for third-party integration

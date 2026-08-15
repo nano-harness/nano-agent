@@ -1,86 +1,88 @@
-# 沙箱设计方案
+# Sandbox Design
 
-本文补充 nano-agent 的沙箱设计方向。当前实现已经具备基础沙箱能力：Linux 通过 `bwrap` 包装 Shell 命令，macOS 通过 `sandbox-exec` 包装 Shell 命令，Go 进程内文件工具通过 `PathChecker` 执行路径级访问控制，并支持 `AllowedPaths`、`BlockedPaths`、`ReadOnlyPaths`、`ExtraReadOnlyPaths`、`ExtraWritablePaths` 等配置。后续设计目标是将这些能力从“Shell 命令包装器”升级为统一的 Sandbox Runtime，并把 Docker 作为优先级更高、隔离性更强的执行后端。
+[中文](./SANDBOX_DESIGN.zh-CN.md)
 
-## 1. 设计目标
+This document supplements the sandbox design direction for nano-agent. The current implementation already has basic sandbox capabilities: on Linux, Shell commands are wrapped with `bwrap`; on macOS, Shell commands are wrapped with `sandbox-exec`; the in-process Go file tools enforce path-level access control through `PathChecker`; and configuration options such as `AllowedPaths`, `BlockedPaths`, `ReadOnlyPaths`, `ExtraReadOnlyPaths`, and `ExtraWritablePaths` are supported. The subsequent design goal is to upgrade these capabilities from "Shell command wrappers" into a unified Sandbox Runtime, and to make Docker the higher-priority, stronger-isolation execution backend.
 
-nano-agent 的沙箱不应只解决“命令是否允许执行”，还需要解决以下问题：
+## 1. Design Goals
 
-- 限制 Agent 对宿主机文件系统的访问范围。
-- 限制 Shell 命令、Hook、MCP Server、子 Agent 的副作用。
-- 隔离网络、环境变量、进程、临时文件、凭据。
-- 支持 YOLO/acceptEdits 等高权限模式下的安全兜底。
-- 支持可审计、可回滚、可复现的任务执行环境。
-- 支持本地开发、Daemon、CI、SWE-bench、团队模式等不同场景。
+The nano-agent sandbox should not only answer "is a command allowed to execute"; it also needs to address the following problems:
 
-核心原则是：
+- Limit the scope of the agent's access to the host filesystem.
+- Limit the side effects of Shell commands, Hooks, MCP Servers, and sub-agents.
+- Isolate networking, environment variables, processes, temporary files, and credentials.
+- Provide a safety net for high-privilege modes such as YOLO/acceptEdits.
+- Support auditable, rollbackable, and reproducible task execution environments.
+- Support different scenarios such as local development, Daemon, CI, SWE-bench, and team mode.
 
-> 权限系统决定“能不能做”，沙箱系统决定“就算做了也只能影响受控环境”。
+The core principle is:
 
-## 2. 沙箱分层模型
+> The permission system decides "whether something can be done"; the sandbox system decides "even if it is done, it can only affect a controlled environment".
 
-建议采用三层沙箱模型。
+## 2. Sandbox Layering Model
+
+A three-layer sandbox model is recommended.
 
 ### 2.1 Policy Sandbox
 
-Policy Sandbox 负责“是否允许执行”。它不提供真正的进程隔离，而是做策略决策。
+The Policy Sandbox is responsible for "whether execution is allowed". It does not provide real process isolation; it makes policy decisions.
 
-适用对象：
+Applies to:
 
 - `run_shell_command`
-- 文件工具
-- Web 工具
-- MCP 工具
+- File tools
+- Web tools
+- MCP tools
 - Hook
 - Slash Command prelude
-- Subagent 工具调用
+- Subagent tool calls
 
-能力范围：
+Capability scope:
 
-- 权限模式判断。
-- allow / deny rule。
-- Session allowlist。
-- CommandGuard。
-- Hook 决策。
-- 用户确认。
-- 审计日志。
+- Permission mode evaluation.
+- allow / deny rules.
+- Session allowlist.
+- CommandGuard.
+- Hook decisions.
+- User confirmation.
+- Audit logging.
 
 ### 2.2 Path Sandbox
 
-Path Sandbox 负责“Agent 能访问哪些宿主机路径”，继续由当前 `PathChecker` 演进。
+The Path Sandbox is responsible for "which host paths the agent can access", and continues to evolve from the current `PathChecker`.
 
-适用对象：
+Applies to:
 
 - `read_file`
 - `write_file`
 - `edit_file`
 - `delete_file`
-- workspace 工具
-- Go 进程内执行的文件操作
+- workspace tools
+- File operations executed inside the Go process
 
-能力范围：
+Capability scope:
 
-- 工作目录内默认可访问。
-- 敏感路径默认禁止。
-- 可配置只读路径。
-- 可配置额外可写路径。
-- 解析 symlink，防止路径穿越。
-- 对不存在的新文件，解析最近存在的父目录。
+- Paths inside the working directory are accessible by default.
+- Sensitive paths are denied by default.
+- Configurable read-only paths.
+- Configurable additional writable paths.
+- Resolve symlinks to prevent path traversal.
+- For new files that do not exist yet, resolve the nearest existing parent directory.
 
 ### 2.3 Execution Sandbox
 
-Execution Sandbox 负责“真正隔离子进程”。
+The Execution Sandbox is responsible for "actually isolating child processes".
 
-适用对象：
+Applies to:
 
-- Shell 命令
-- Hook 脚本
-- MCP stdio server
+- Shell commands
+- Hook scripts
+- MCP stdio servers
 - Slash Command prelude
-- 构建、测试、安装依赖等长任务
-- Subagent 执行环境
+- Long-running tasks such as builds, tests, and dependency installation
+- Subagent execution environments
 
-推荐后端：
+Recommended backends:
 
 - `none`
 - `native`
@@ -88,185 +90,185 @@ Execution Sandbox 负责“真正隔离子进程”。
   - macOS: `sandbox-exec`
 - `docker`
 
-未来可选后端：
+Future optional backends:
 
 - `podman`
 - `firecracker`
 - `nsjail`
 
-其中 Docker 应作为推荐后端, 尤其适合 YOLO、Daemon、CI、SWE-bench 和远程任务场景。
+Docker should be the recommended backend, especially for YOLO, Daemon, CI, SWE-bench, and remote task scenarios.
 
-## 3. Docker 沙箱设计
+## 3. Docker Sandbox Design
 
-### 3.1 为什么 Docker 是更好的选择
+### 3.1 Why Docker Is the Better Choice
 
-相比 `bwrap` / `sandbox-exec`，Docker 的优势是：
+Compared with `bwrap` / `sandbox-exec`, Docker's advantages are:
 
-- 跨平台一致性更好。
-- 隔离边界更清晰。
-- 可限制 CPU、内存、进程数、网络、文件系统。
-- 适合长任务、CI、Daemon、SWE-bench。
-- 可以构建可复现的开发环境。
-- 更容易做快照、缓存、清理和审计。
-- 对 YOLO 模式更安全：即使自动执行危险命令，也限制在容器内。
-- 可以将 Agent 的执行环境和用户宿主机隔离，减少误删、泄密、污染系统环境的风险。
+- Better cross-platform consistency.
+- Clearer isolation boundaries.
+- Can limit CPU, memory, process count, networking, and filesystem.
+- Well suited for long-running tasks, CI, Daemon, and SWE-bench.
+- Can build reproducible development environments.
+- Easier snapshotting, caching, cleanup, and auditing.
+- Safer for YOLO mode: even if dangerous commands are executed automatically, they are confined inside the container.
+- Can isolate the agent's execution environment from the user's host, reducing the risk of accidental deletion, credential leakage, and pollution of the system environment.
 
-推荐后端优先级：
+Recommended backend priority:
 
-1. 显式配置的 backend。
-2. Daemon / CI / YOLO 场景优先 Docker。
-3. 本地轻量交互可使用 native。
-4. 无可用后端时才 fallback 到 none，并给出明显警告。
+1. An explicitly configured backend.
+2. Prefer Docker for Daemon / CI / YOLO scenarios.
+3. Use native for lightweight local interaction.
+4. Fall back to none only when no backend is available, with a prominent warning.
 
-### 3.2 Docker 执行模式
+### 3.2 Docker Execution Modes
 
-Docker 后端建议支持三种执行模式。
+The Docker backend should support three execution modes.
 
-#### 一次性容器模式
+#### One-off Container Mode
 
-每次 Shell 命令启动一个临时容器。
+Each Shell command starts a temporary container.
 
-优点：
+Advantages:
 
-- 隔离最强。
-- 每个命令干净执行。
-- 易清理。
+- Strongest isolation.
+- Every command runs cleanly.
+- Easy to clean up.
 
-缺点：
+Disadvantages:
 
-- 启动开销较大。
-- 依赖安装、构建缓存不友好。
+- Higher startup overhead.
+- Unfriendly to dependency installation and build caches.
 
-适用：
+Suitable for:
 
-- 高风险命令。
-- Hook。
-- 未信任 MCP。
-- YOLO 模式下的危险命令。
-- CI 审计任务。
+- High-risk commands.
+- Hook.
+- Untrusted MCP.
+- Dangerous commands in YOLO mode.
+- CI audit tasks.
 
-#### 会话级持久容器
+#### Session-level Persistent Container
 
-每个 Agent session 创建一个持久容器，所有命令在同一容器内执行。
+Each Agent session creates one persistent container, and all commands run inside the same container.
 
-优点：
+Advantages:
 
-- 性能更好。
-- 保留依赖安装结果。
-- 适合交互式开发。
-- 适合长任务和多轮修改。
+- Better performance.
+- Preserves dependency installation results.
+- Suitable for interactive development.
+- Suitable for long tasks and multi-round modifications.
 
-缺点：
+Disadvantages:
 
-- 需要生命周期管理。
-- 容器内状态可能累积污染。
+- Requires lifecycle management.
+- State inside the container may accumulate pollution.
 
-适用：
+Suitable for:
 
-- TUI / Daemon 长会话。
-- 多轮编码任务。
-- 构建、测试、修复循环。
-- SWE-bench。
+- TUI / Daemon long sessions.
+- Multi-round coding tasks.
+- Build, test, and fix loops.
+- SWE-bench.
 
-#### 任务级隔离容器
+#### Task-level Isolated Container
 
-每个 Turn 或每个 Task 创建一个容器。
+Each Turn or each Task creates one container.
 
-优点：
+Advantages:
 
-- 比一次性命令更高效。
-- 比会话级容器更可控。
-- 方便做任务级回滚和审计。
+- More efficient than one-off commands.
+- More controllable than session-level containers.
+- Convenient for task-level rollback and auditing.
 
-适用：
+Suitable for:
 
-- Subagent。
-- Team mode。
-- 批量任务。
-- OpenSpec implementation task。
+- Subagent.
+- Team mode.
+- Batch tasks.
+- OpenSpec implementation task.
 
-推荐默认：
+Recommended defaults:
 
-- 本地普通模式：会话级容器。
-- YOLO 模式：任务级或一次性容器。
-- Daemon 模式：会话级容器 + 强资源限制。
-- CI 模式：一次性或任务级容器。
+- Local normal mode: session-level container.
+- YOLO mode: task-level or one-off container.
+- Daemon mode: session-level container + strict resource limits.
+- CI mode: one-off or task-level container.
 
-## 4. Sandbox Runtime 抽象
+## 4. Sandbox Runtime Abstraction
 
-建议引入统一抽象，避免不同执行场景直接依赖具体后端。
+A unified abstraction is recommended so that different execution scenarios do not depend directly on specific backends.
 
 ### 4.1 SandboxRuntime
 
-`SandboxRuntime` 负责：
+`SandboxRuntime` is responsible for:
 
-- 创建执行环境。
-- 包装命令。
-- 挂载工作区。
-- 注入环境变量。
-- 控制网络。
-- 设置资源限制。
-- 收集日志。
-- 清理容器或临时目录。
+- Creating execution environments.
+- Wrapping commands.
+- Mounting the workspace.
+- Injecting environment variables.
+- Controlling networking.
+- Setting resource limits.
+- Collecting logs.
+- Cleaning up containers or temporary directories.
 
-当前实现状态：
+Current implementation status:
 
-- `pkg/sandbox` 已定义 `Runtime`、`SandboxRequest`、`SandboxEnvironment`、`SandboxResult`、`Backend`、`NetworkPolicy`、`Mount` 和 `ResourceLimits`。
-- `NewRuntime` 将现有 `none`、Linux `bwrap`、macOS `sandbox-exec` 后端接入统一 adapter，不改变现有执行行为。
-- `NewRuntime` 已支持显式 `docker` backend 的一次性容器模式，并通过 `sandbox.backend`、`sandbox.docker_image`、`NANO_SANDBOX_BACKEND`、`NANO_SANDBOX_DOCKER_IMAGE` 配置。
-- 当 CLI permission mode 为 `yolo` 且未显式配置 sandbox backend 时，默认启用 Docker backend；如果需要复现性更强的容器镜像，可将 `sandbox.docker_image` 配置为 digest 形式。
-- `run_shell_command` 已通过 `SandboxRuntime.PrepareCommand` 包装实际命令，并把 backend、network、mount、resource limit、fallback 信息写入 tool result metadata，同时发布 sandbox command lifecycle audit events。
-- `hookservice` 可通过 `Options.SandboxRuntime` 将 hook shell 命令接入统一沙箱入口。
-- MCP stdio server 启动命令已通过 Toolbox 注入的 `SandboxRuntime` 包装。
-- Slash Command 的 `!prelude` 命令已可通过 `slash.CommandRuntime` 进入统一沙箱入口。
-- Team/Subagent 元数据已记录 sandbox policy，并已用于会话级/任务级 Docker 容器生命周期管理。
-- `SandboxRuntime` 可发布 sandbox audit events，Daemon `TaskEventStore` 已可保存并重放 sandbox events。
-- Go 进程内文件工具继续使用 `PathChecker` 做路径级沙箱检查。
+- `pkg/sandbox` already defines `Runtime`, `SandboxRequest`, `SandboxEnvironment`, `SandboxResult`, `Backend`, `NetworkPolicy`, `Mount`, and `ResourceLimits`.
+- `NewRuntime` wires the existing `none`, Linux `bwrap`, and macOS `sandbox-exec` backends into a unified adapter without changing existing execution behavior.
+- `NewRuntime` already supports the one-off container mode of an explicit `docker` backend, configured via `sandbox.backend`, `sandbox.docker_image`, `NANO_SANDBOX_BACKEND`, and `NANO_SANDBOX_DOCKER_IMAGE`.
+- When the CLI permission mode is `yolo` and no sandbox backend is explicitly configured, the Docker backend is enabled by default; if a more reproducible container image is needed, `sandbox.docker_image` can be configured in digest form.
+- `run_shell_command` already wraps the actual command through `SandboxRuntime.PrepareCommand`, writes backend, network, mount, resource limit, and fallback information into the tool result metadata, and publishes sandbox command lifecycle audit events.
+- `hookservice` can route hook shell commands into the unified sandbox entry via `Options.SandboxRuntime`.
+- MCP stdio server startup commands are wrapped via the `SandboxRuntime` injected by Toolbox.
+- Slash Command `!prelude` commands can enter the unified sandbox entry via `slash.CommandRuntime`.
+- Team/Subagent metadata already records sandbox policy, and it is used for session-level/task-level Docker container lifecycle management.
+- `SandboxRuntime` can publish sandbox audit events, and the Daemon `TaskEventStore` can already persist and replay sandbox events.
+- In-process Go file tools continue to use `PathChecker` for path-level sandbox checks.
 
 ### 4.2 SandboxSession
 
-`SandboxSession` 表示一次 Agent 会话的沙箱实例，负责保存：
+`SandboxSession` represents the sandbox instance of one Agent session, and is responsible for storing:
 
-- session id。
-- container id。
-- workspace mount。
-- 网络策略。
-- 资源配置。
-- 生命周期状态。
+- session id.
+- container id.
+- workspace mount.
+- network policy.
+- resource configuration.
+- lifecycle state.
 
-Session 可短生命周期，也可复用。
+Sessions may be short-lived or reused.
 
 ### 4.3 SandboxExecutor
 
-`SandboxExecutor` 负责在沙箱内执行单个命令，需要支持：
+`SandboxExecutor` is responsible for executing a single command inside the sandbox, and needs to support:
 
-- stdout / stderr 流式输出。
-- 取消。
-- 超时。
-- 后台任务。
-- exit code。
-- 审计记录。
+- stdout / stderr streaming output.
+- Cancellation.
+- Timeout.
+- Background tasks.
+- exit code.
+- Audit records.
 
-## 5. Docker 挂载策略
+## 5. Docker Mount Policy
 
-默认挂载：
+Default mounts:
 
-- 工作目录：读写挂载到 `/workspace`。
-- 临时目录：容器内独立 `/tmp`。
-- 用户 home：默认不挂载。
-- `.git`：默认挂载，支持 git diff / status。
-- SSH、GPG、AWS、Kube、Docker socket：默认不挂载。
-- Docker socket：默认禁止，除非显式开启。
+- Working directory: mounted read-write at `/workspace`.
+- Temporary directory: an independent `/tmp` inside the container.
+- User home: not mounted by default.
+- `.git`: mounted by default, to support git diff / status.
+- SSH, GPG, AWS, Kube, Docker socket: not mounted by default.
+- Docker socket: denied by default unless explicitly enabled.
 
-建议挂载规则：
+Suggested mount rules:
 
-- `workspace`: read-write。
-- `extra_read_only_paths`: read-only。
-- `extra_writable_paths`: read-write。
-- `blocked_paths`: 不挂载。
-- `secrets`: 只通过显式 secret mount 或环境变量白名单注入。
+- `workspace`: read-write.
+- `extra_read_only_paths`: read-only.
+- `extra_writable_paths`: read-write.
+- `blocked_paths`: not mounted.
+- `secrets`: injected only through explicit secret mounts or an environment variable allowlist.
 
-强烈建议默认禁止挂载：
+Strongly recommended to deny mounting by default:
 
 - `~/.ssh`
 - `~/.gnupg`
@@ -276,105 +278,105 @@ Session 可短生命周期，也可复用。
 - `/var/run/docker.sock`
 - `/etc`
 - `/root`
-- 用户 home 全目录
+- The user's entire home directory
 
-## 6. Docker 网络策略
+## 6. Docker Network Policy
 
-网络策略应按任务风险配置。
+Network policy should be configured according to task risk.
 
-建议支持：
+Suggested support:
 
 - `network: none`
-  - 完全无网络。
-  - 适合代码分析、测试、格式化。
+  - No network at all.
+  - Suitable for code analysis, testing, and formatting.
 - `network: restricted`
-  - 只允许配置白名单域名或代理。
-  - 适合依赖下载。
+  - Only allow allowlisted domains or a proxy from configuration.
+  - Suitable for dependency downloads.
 - `network: bridge`
-  - 默认 Docker 网络。
-  - 适合普通开发任务，但需要审计。
+  - The default Docker network.
+  - Suitable for ordinary development tasks, but requires auditing.
 - `network: host`
-  - 默认不建议。
-  - 仅开发者显式启用。
+  - Not recommended by default.
+  - Only enabled explicitly by developers.
 
-推荐默认：
+Recommended defaults:
 
-- read-only / analysis：`none`。
-- build / test：`none` 或 `restricted`。
-- dependency install：`restricted`。
-- web / MCP：按工具权限单独开放。
-- YOLO：默认 `none`，需要网络时显式确认。
+- read-only / analysis: `none`.
+- build / test: `none` or `restricted`.
+- dependency install: `restricted`.
+- web / MCP: opened individually per tool permission.
+- YOLO: `none` by default; explicit confirmation required when networking is needed.
 
-## 7. Docker 资源限制
+## 7. Docker Resource Limits
 
-必须支持资源限制，避免 Agent 生成命令拖垮宿主机。
+Resource limits must be supported to prevent agent-generated commands from overwhelming the host.
 
-建议配置项：
+Suggested configuration items:
 
-- CPU 限制。
-- 内存限制。
-- pids 限制。
-- 磁盘写入上限。
-- 单命令超时。
-- 容器最大生命周期。
-- 最大后台任务数。
-- 最大输出大小。
-- 最大文件数。
-- 最大网络流量，后续可选。
+- CPU limit.
+- Memory limit.
+- pids limit.
+- Disk write cap.
+- Per-command timeout.
+- Maximum container lifetime.
+- Maximum number of background tasks.
+- Maximum output size.
+- Maximum number of files.
+- Maximum network traffic, optional later.
 
-推荐默认：
+Recommended defaults:
 
-- CPU：2 核。
-- 内存：2GB 或 4GB。
-- PIDs：256。
-- 命令超时：120 秒。
-- 长任务自动转后台。
-- 输出上限沿用当前 shell output 限制。
+- CPU: 2 cores.
+- Memory: 2GB or 4GB.
+- PIDs: 256.
+- Command timeout: 120 seconds.
+- Long tasks automatically moved to background.
+- Output limit follows the current shell output limit.
 
-## 8. Docker 镜像策略
+## 8. Docker Image Policy
 
-### 8.1 默认基础镜像
+### 8.1 Default Base Images
 
-可提供官方推荐镜像，例如：
+Officially recommended images can be provided, for example:
 
 - `nano-agent/sandbox:go`
 - `nano-agent/sandbox:node`
 - `nano-agent/sandbox:python`
 - `nano-agent/sandbox:full`
 
-### 8.2 项目自定义镜像
+### 8.2 Project Custom Images
 
-项目可在 `.nano.yaml` 中配置：
+A project can configure in `.nano.yaml`:
 
-- image。
-- dockerfile。
-- build context。
-- build args。
-- init command。
+- image.
+- dockerfile.
+- build context.
+- build args.
+- init command.
 
-### 8.3 自动检测镜像
+### 8.3 Automatic Image Detection
 
-可根据项目文件自动建议镜像：
+An image can be suggested automatically based on project files:
 
-- `go.mod` → Go 镜像。
-- `package.json` → Node 镜像。
-- `pyproject.toml` / `requirements.txt` → Python 镜像。
-- `Cargo.toml` → Rust 镜像。
-- `pom.xml` → Maven 镜像。
+- `go.mod` → Go image.
+- `package.json` → Node image.
+- `pyproject.toml` / `requirements.txt` → Python image.
+- `Cargo.toml` → Rust image.
+- `pom.xml` → Maven image.
 
-自动检测只作为建议，不应静默拉取未知镜像。
+Automatic detection is only a suggestion; unknown images should not be pulled silently.
 
-### 8.4 镜像安全
+### 8.4 Image Security
 
-- 不自动使用不可信镜像。
-- 首次使用镜像需提示来源。
-- 可配置 trusted registries。
-- 可记录镜像 digest。
-- Daemon 模式建议固定 digest。
+- Do not automatically use untrusted images.
+- Prompt for the source on first use of an image.
+- Trusted registries can be configured.
+- Image digests can be recorded.
+- Pinning digests is recommended in Daemon mode.
 
-## 9. 配置设计
+## 9. Configuration Design
 
-建议扩展 `sandbox` 配置。以下字段是设计目标，不要求一次性实现：
+It is recommended to extend the `sandbox` configuration. The following fields are design goals and are not required to be implemented all at once:
 
 ```yaml
 sandbox:
@@ -431,157 +433,157 @@ sandbox:
     pids_limit: 256
 ```
 
-## 10. 与权限系统的关系
+## 10. Relationship with the Permission System
 
-Docker 沙箱不是权限系统的替代，而是权限系统的兜底。
+The Docker sandbox is not a replacement for the permission system; it is its safety net.
 
-推荐规则：
+Recommended rules:
 
-- `default` 模式：
-  - 危险命令仍需确认。
-  - 确认后在沙箱内执行。
-- `acceptEdits`：
-  - 文件编辑允许，但只作用于挂载的 workspace。
-- `yolo`：
-  - 自动执行，但必须强制启用 Docker 或 native sandbox。
-  - 如果无沙箱后端，应阻止进入 YOLO 或强警告二次确认。
-- `daemon`：
-  - 默认要求 Docker backend。
-  - 非 Docker backend 需要显式配置。
-- `ci`：
-  - Docker backend 默认开启。
-  - 网络默认关闭。
+- `default` mode:
+  - Dangerous commands still require confirmation.
+  - After confirmation, they run inside the sandbox.
+- `acceptEdits`:
+  - File edits are allowed, but only take effect on the mounted workspace.
+- `yolo`:
+  - Executes automatically, but a Docker or native sandbox must be forcibly enabled.
+  - If no sandbox backend is available, entering YOLO should be blocked or require a strongly warned second confirmation.
+- `daemon`:
+  - Requires the Docker backend by default.
+  - Non-Docker backends require explicit configuration.
+- `ci`:
+  - Docker backend enabled by default.
+  - Network disabled by default.
 
-## 11. 与 Hook 的关系
+## 11. Relationship with Hooks
 
-Hook 也必须运行在沙箱里，不能绕过工具权限。
+Hooks must also run inside the sandbox and must not bypass tool permissions.
 
-建议：
+Suggestions:
 
-- PreToolUse / PostToolUse Hook 默认在 Docker 或 native sandbox 中执行。
-- Hook 只接收结构化 JSON 输入。
-- Hook 默认不继承 secrets。
-- Hook 超时短于普通 shell 命令。
-- Hook 失败策略可配置为 `allow`、`confirm`、`block`。
-- Hook 的 stdout / stderr 进入审计日志。
-- Hook 不允许默认访问 Docker socket。
+- PreToolUse / PostToolUse Hooks execute in a Docker or native sandbox by default.
+- Hooks only receive structured JSON input.
+- Hooks do not inherit secrets by default.
+- Hook timeouts are shorter than ordinary shell commands.
+- The Hook failure policy can be configured as `allow`, `confirm`, or `block`.
+- Hook stdout / stderr goes into the audit log.
+- Hooks are not allowed to access the Docker socket by default.
 
-## 12. 与 MCP 的关系
+## 12. Relationship with MCP
 
-MCP Server 是高风险扩展，应纳入沙箱。
+MCP Servers are high-risk extensions and should be included in the sandbox.
 
-建议：
+Suggestions:
 
-- stdio MCP server 可运行在 Docker sandbox 内。
-- 每个 MCP server 可配置独立 backend、image、mount、network。
-- 默认不允许 MCP server 访问宿主机 home。
-- MCP server 的权限要进入 Extension Manifest。
-- 未信任 MCP server 默认只读、无网络或 restricted network。
-- MCP tool 调用也要经过 Policy Pipeline。
+- stdio MCP servers can run inside a Docker sandbox.
+- Each MCP server can be configured with an independent backend, image, mounts, and network.
+- MCP servers are not allowed to access the host home directory by default.
+- MCP server permissions must go into the Extension Manifest.
+- Untrusted MCP servers default to read-only, with no network or a restricted network.
+- MCP tool calls must also go through the Policy Pipeline.
 
-## 13. 与多 Agent / Swarm 的关系
+## 13. Relationship with Multi-Agent / Swarm
 
-不同 Agent 可以有不同沙箱。
+Different agents can have different sandboxes.
 
-建议：
+Suggestions:
 
-- Team Lead 使用主 session sandbox。
-- Subagent 默认创建 task-level sandbox。
-- Investigator 只读 sandbox。
-- Coder 使用 workspace rw sandbox。
-- Researcher 可使用 network restricted sandbox。
-- Untrusted Agent 使用一次性 Docker 容器。
-- 每个 Agent 的 sandbox id、container id、mount、网络策略进入事件流和审计日志。
+- Team Lead uses the main session sandbox.
+- Subagent creates a task-level sandbox by default.
+- Investigator uses a read-only sandbox.
+- Coder uses a workspace rw sandbox.
+- Researcher can use a network-restricted sandbox.
+- Untrusted Agent uses a one-off Docker container.
+- Each agent's sandbox id, container id, mounts, and network policy go into the event stream and audit log.
 
-## 14. 与后台任务的关系
+## 14. Relationship with Background Tasks
 
-当前 shell 支持后台任务，Docker 后端需要明确长任务生命周期。
+The current shell supports background tasks; the Docker backend needs to define the long-task lifecycle clearly.
 
-建议：
+Suggestions:
 
-- 后台任务绑定到 `SandboxSession`。
-- 如果 session 容器退出，后台任务自动取消。
-- `bash_output` 从容器执行日志中读取。
-- `kill_bash` 映射为容器内进程 kill，而不是直接操作宿主机进程。
-- 对会话级容器，后台任务可跨 turn 保持。
-- 对任务级容器，turn 结束时默认清理。
+- Background tasks are bound to a `SandboxSession`.
+- If the session container exits, background tasks are cancelled automatically.
+- `bash_output` reads from the container execution logs.
+- `kill_bash` maps to killing a process inside the container, rather than operating on host processes directly.
+- For session-level containers, background tasks can persist across turns.
+- For task-level containers, they are cleaned up by default when the turn ends.
 
-## 15. 与审计和回滚的关系
+## 15. Relationship with Audit and Rollback
 
-Docker 后端应提供更强审计能力。
+The Docker backend should provide stronger audit capabilities.
 
-建议记录：
+Suggested records:
 
-- image。
-- image digest。
-- container id。
-- sandbox mode。
-- mounts。
-- network mode。
-- env allowlist。
-- resource limits。
-- command。
-- exit code。
-- duration。
-- stdout / stderr 摘要。
-- changed files 摘要。
-- git diff 摘要。
+- image.
+- image digest.
+- container id.
+- sandbox mode.
+- mounts.
+- network mode.
+- env allowlist.
+- resource limits.
+- command.
+- exit code.
+- duration.
+- stdout / stderr summary.
+- changed files summary.
+- git diff summary.
 
-可选增强：
+Optional enhancements:
 
-- 执行前创建 git checkpoint。
-- 执行后生成 diff。
-- 高风险命令自动保存 patch。
-- 支持 `/sandbox diff`、`/sandbox reset`、`/sandbox logs`、`/sandbox status`。
+- Create a git checkpoint before execution.
+- Generate a diff after execution.
+- Automatically save a patch for high-risk commands.
+- Support `/sandbox diff`, `/sandbox reset`, `/sandbox logs`, `/sandbox status`.
 
-## 16. 推荐实现阶段
+## 16. Recommended Implementation Phases
 
-### 第一阶段：抽象 Sandbox Runtime
+### Phase 1: Abstract the Sandbox Runtime
 
-- 保留现有 bwrap / sandbox-exec 实现。
-- 引入 `backend` 概念。
-- 将当前 `Sandbox` 接口扩展为统一 runtime。
-- 将 `PathChecker` 保持为独立路径层。
-- 增加事件与审计字段。
+- Keep the existing bwrap / sandbox-exec implementations.
+- Introduce the `backend` concept.
+- Extend the current `Sandbox` interface into a unified runtime.
+- Keep `PathChecker` as an independent path layer.
+- Add event and audit fields.
 
-### 第二阶段：实现 Docker command 模式
+### Phase 2: Implement Docker Command Mode
 
-- 支持每次命令用 `docker run --rm` 执行。
-- 挂载 workspace 到 `/workspace`。
-- 支持 network none / bridge。
-- 支持 env allowlist。
-- 支持 memory / cpu / pids 限制。
-- 支持 stdout / stderr 流式输出。
+- Support executing each command with `docker run --rm`.
+- Mount the workspace at `/workspace`.
+- Support network none / bridge.
+- Support env allowlist.
+- Support memory / cpu / pids limits.
+- Support stdout / stderr streaming output.
 
-### 第三阶段：实现 Docker session 模式
+### Phase 3: Implement Docker Session Mode
 
-- 每个 Agent session 创建一个持久容器。
-- Shell 命令通过 `docker exec` 执行。
-- 支持后台任务。
-- 支持取消。
-- 支持 session 结束清理。
-- 支持 daemon 重启后的容器恢复或清理。
+- Each Agent session creates one persistent container.
+- Shell commands execute via `docker exec`.
+- Support background tasks.
+- Support cancellation.
+- Support cleanup when the session ends.
+- Support container recovery or cleanup after a daemon restart.
 
-### 第四阶段：将 Hook / MCP / Subagent 纳入 Docker 沙箱
+### Phase 4: Bring Hook / MCP / Subagent into the Docker Sandbox
 
-- Hook 默认沙箱执行。
-- stdio MCP 可运行在容器内。
-- Subagent 可绑定独立 sandbox profile。
-- Extension manifest 增加 sandbox 权限声明。
+- Hooks execute in the sandbox by default.
+- stdio MCP can run inside containers.
+- Subagent can bind to an independent sandbox profile.
+- The extension manifest gains sandbox permission declarations.
 
-### 第五阶段：默认策略调整
+### Phase 5: Default Policy Adjustments
 
-- Daemon 默认推荐 Docker。
-- YOLO 默认要求 Docker 或 native sandbox。
-- CI 默认 Docker + network none。
-- 无沙箱时高风险命令强提示。
+- Daemon recommends Docker by default.
+- YOLO requires a Docker or native sandbox by default.
+- CI defaults to Docker + network none.
+- High-risk commands get a strong warning when no sandbox is present.
 
-## 17. 推荐结论
+## 17. Recommended Conclusions
 
-- 当前 bwrap / sandbox-exec 适合作为轻量 native backend。
-- Docker 应作为更推荐的强隔离 backend。
-- YOLO、Daemon、CI、多 Agent、MCP、Hook 等高风险场景应优先使用 Docker。
-- 沙箱要从“Shell 包装器”升级为“统一执行环境管理器”。
-- 权限系统与沙箱系统必须分离但联动。
-- Docker 沙箱应支持 command / task / session 三种生命周期。
-- 所有沙箱行为必须进入事件流与审计日志。
+- The current bwrap / sandbox-exec are suitable as lightweight native backends.
+- Docker should be the more strongly recommended strong-isolation backend.
+- High-risk scenarios such as YOLO, Daemon, CI, multi-Agent, MCP, and Hook should prefer Docker.
+- The sandbox should be upgraded from a "Shell wrapper" to a "unified execution environment manager".
+- The permission system and the sandbox system must be separate but work together.
+- The Docker sandbox should support three lifecycles: command / task / session.
+- All sandbox behavior must go into the event stream and audit log.

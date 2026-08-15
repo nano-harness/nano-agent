@@ -1,5 +1,7 @@
 # End-to-End Testing Infrastructure
 
+[中文](./README.zh-CN.md)
+
 This directory contains a comprehensive end-to-end (e2e) testing system for the nano-agent project, covering all execution modes and the sub-agent (expert) system including parallel execution.
 
 ## Overview

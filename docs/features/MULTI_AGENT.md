@@ -1,5 +1,7 @@
 # Multi-Agent Runtime
 
+[中文](./MULTI_AGENT.zh-CN.md)
+
 The multi-agent runtime supports team-lead sessions, configurable teammates, mailboxes, and replayable team events.
 
 ## Agent profiles

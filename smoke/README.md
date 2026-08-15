@@ -1,5 +1,7 @@
 # PTY Smoke Tests for nano-agent
 
+[中文](./README.zh-CN.md)
+
 This directory contains PTY-based smoke tests for the TUI and CLI interfaces of nano-agent.
 
 ## Overview

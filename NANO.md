@@ -1,5 +1,7 @@
 # nano-agent LLM error handling
 
+[中文](./NANO.zh-CN.md)
+
 ## Retry, failback, and circuit breaker classification
 
 `pkg/llm` classifies provider errors into separate retry and failback signals. Context overflow is intentionally not retried in the LLM client layer: the agent layer handles it in `pkg/agent/turn_policy.go` by attempting message compression and then retrying the same model.
