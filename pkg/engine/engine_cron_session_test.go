@@ -20,7 +20,7 @@ func cronTestConfig(t *testing.T) *config.Config {
 	cfg.Cron = &config.CronConfig{
 		EventsDir:          t.TempDir(),
 		PermissionPolicy:   "auto_approve",
-		TurnTimeout:        time.Second,
+		TurnTimeout:        30 * time.Second,
 		LogRetentionDays:   30,
 		LogCleanupInterval: time.Hour,
 	}
@@ -104,7 +104,9 @@ func TestExecuteTaskWithMeta_NotifierCalledStartedFinished(t *testing.T) {
 func TestExecuteTaskWithMeta_FinishedHasError(t *testing.T) {
 	cfg := cronTestConfig(t)
 	mock := llm.NewMockClient()
-	mock.Responses = []llm.MockResponse{{Error: errors.New("boom")}}
+	// Rule-based (not sequential) so the error is tied to the task command
+	// regardless of async calls like session title generation.
+	mock.Rules["cron command"] = llm.MockResponse{Error: errors.New("boom")}
 	eng, err := engine.New(cfg, nil, engine.WithScheduler(), engine.WithAgentOpts(agent.WithLLMClient(mock)))
 	require.NoError(t, err)
 	eng.Agent.GetSessionManager().SetStorage(nil)

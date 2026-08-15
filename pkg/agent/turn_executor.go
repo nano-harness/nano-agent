@@ -83,6 +83,11 @@ func (e *turnExecutor) Execute(ctx context.Context) error {
 	for {
 		if t.shouldTerminate() {
 			logger.Infof("Turn termination condition met")
+			// A turn killed by its context (timeout/cancel) before completing
+			// must surface the error instead of reporting success.
+			if t.TerminationCause() == "context_done" && ctx.Err() != nil {
+				return ctx.Err()
+			}
 			break
 		}
 		// K1.1: Check early stop based on completion criteria (consecutive errors, etc.)

@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/stretchr/testify/require"
 )
 
 // helper to write a tiny shell hook that records its event into a file
@@ -56,9 +58,11 @@ func TestSwarmHookDispatcherFiresLifecycleEvents(t *testing.T) {
 	}
 
 	for _, p := range []string{startLog, idleLog, stopLog} {
-		if _, err := os.Stat(p); err != nil {
-			t.Fatalf("expected hook log %s: %v", p, err)
-		}
+		p := p
+		require.Eventually(t, func() bool {
+			_, err := os.Stat(p)
+			return err == nil
+		}, 10*time.Second, 50*time.Millisecond, "expected hook log %s", p)
 	}
 }
 

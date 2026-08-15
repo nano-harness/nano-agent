@@ -466,27 +466,32 @@ func (s *Service) runCommandHook(ctx context.Context, h *Hook, input Input) (*De
 		}, nil
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(3)
+	var ioWg sync.WaitGroup
+	ioWg.Add(2)
+	var stdinWg sync.WaitGroup
+	stdinWg.Add(1)
 	var outBytes, errBytes []byte
 	var writeErr error
 
 	go func() {
-		defer wg.Done()
+		defer stdinWg.Done()
 		_, writeErr = stdin.Write(payload)
 		_ = stdin.Close()
 	}()
 	go func() {
-		defer wg.Done()
+		defer ioWg.Done()
 		outBytes, _ = io.ReadAll(stdout)
 	}()
 	go func() {
-		defer wg.Done()
+		defer ioWg.Done()
 		errBytes, _ = io.ReadAll(stderr)
 	}()
 
+	// cmd.Wait closes the stdout/stderr pipes once the process exits, so it
+	// must not run before the readers have drained them (os/exec docs).
+	ioWg.Wait()
 	waitErr := cmd.Wait()
-	wg.Wait()
+	stdinWg.Wait()
 
 	// A broken-pipe stdin write error is expected when the hook process exits
 	// before reading all its input (e.g. `exit 2` runs immediately). Log it as
