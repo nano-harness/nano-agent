@@ -27,6 +27,7 @@
 - [Mailbox 系统](features/MAILBOX.md) - agent 间通信基础设施
 - [智能编排](features/INTELLIGENT_ORCHESTRATION.md) - 智能任务分发与子 agent 路由
 - [Hooks 系统](features/HOOKS.md) - Hook 加载与执行服务
+- [Shell 输出预算](features/SHELL_OUTPUT.zh-CN.md) - 可配置的内联输出上限与落盘机制
 - [扩展](features/EXTENSIONS.md) - skill、MCP server、工具和 agent 的扩展清单
 - [MCP OAuth](features/MCP_OAUTH.md) - MCP server 的 OAuth 集成
 

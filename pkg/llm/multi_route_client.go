@@ -13,6 +13,23 @@ import (
 
 type routeClientFactory func(ResolvedRoute, []interfaces.Tool) LLMClient
 
+// ModelSwitchEvent describes an automatic model route switch (fallback).
+type ModelSwitchEvent struct {
+	FromRoute string
+	FromModel string
+	ToRoute   string
+	ToModel   string
+	Reason    string
+}
+
+// ModelSwitchHooks are invoked around automatic model route switches
+// (fallback). Pre may veto a switch by returning a non-empty block reason;
+// Post is purely a notification fired after a fallback route succeeds.
+type ModelSwitchHooks struct {
+	Pre  func(ctx context.Context, sw ModelSwitchEvent) (blockReason string)
+	Post func(ctx context.Context, sw ModelSwitchEvent)
+}
+
 // MultiRouteClient implements LLMClient by trying configured routes in order.
 type MultiRouteClient struct {
 	routes []ResolvedRoute
@@ -21,9 +38,10 @@ type MultiRouteClient struct {
 	gate   interfaces.ToolGate
 	cfg    *config.Config
 
-	mu      sync.Mutex
-	clients map[string]LLMClient
-	factory routeClientFactory
+	mu          sync.Mutex
+	clients     map[string]LLMClient
+	factory     routeClientFactory
+	switchHooks ModelSwitchHooks
 }
 
 // NewMultiRouteClient creates an LLM client with provider/model fallback support.
@@ -48,6 +66,68 @@ func newMultiRouteClient(routes []ResolvedRoute, tools []interfaces.Tool, cfg *c
 		cfg:     cfg,
 		clients: make(map[string]LLMClient),
 		factory: factory,
+	}
+}
+
+// SetModelSwitchHooks installs hooks invoked around automatic model route
+// switches (fallback). Nil hooks disable the corresponding notification.
+func (m *MultiRouteClient) SetModelSwitchHooks(hooks ModelSwitchHooks) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.switchHooks = hooks
+}
+
+// guardModelSwitch fires the Pre hook for a fallback from routes[i] to the
+// next route. It returns the switch event for a later Post notification, or a
+// non-nil blocked error when a hook vetoes the switch. When no next route
+// exists there is no switch to guard and both results are nil.
+func (m *MultiRouteClient) guardModelSwitch(ctx context.Context, route ResolvedRoute, i int, cause error) (*ModelSwitchEvent, *error) {
+	if i+1 >= len(m.routes) {
+		return nil, nil
+	}
+	next := m.routes[i+1]
+	reason := "unknown"
+	if cause != nil {
+		if info := NewAPIErrorHandler(nil).AnalyzeError(cause, ExtractHTTPStatus(cause)); info != nil {
+			reason = string(info.Category)
+		} else {
+			reason = cause.Error()
+		}
+	}
+	sw := &ModelSwitchEvent{
+		FromRoute: route.Name,
+		FromModel: route.Model,
+		ToRoute:   next.Name,
+		ToModel:   next.Model,
+		Reason:    reason,
+	}
+	m.mu.Lock()
+	pre := m.switchHooks.Pre
+	m.mu.Unlock()
+	if pre != nil {
+		if blockReason := pre(ctx, *sw); blockReason != "" {
+			blocked := fmt.Errorf("model switch from %s (%s) to %s (%s) blocked by hook: %s",
+				sw.FromRoute, sw.FromModel, sw.ToRoute, sw.ToModel, blockReason)
+			return nil, &blocked
+		}
+	}
+	return sw, nil
+}
+
+// notifyPostModelSwitch fires the Post hook for a fallback switch that
+// ultimately succeeded on a later route. Nil-safe.
+func (m *MultiRouteClient) notifyPostModelSwitch(ctx context.Context, pendingSwitch *ModelSwitchEvent) {
+	if pendingSwitch == nil {
+		return
+	}
+	m.mu.Lock()
+	post := m.switchHooks.Post
+	m.mu.Unlock()
+	if post != nil {
+		post(ctx, *pendingSwitch)
 	}
 }
 
@@ -87,7 +167,8 @@ func (m *MultiRouteClient) GenerateContent(ctx context.Context, prompt string) (
 		return "", fmt.Errorf("no model routes configured")
 	}
 	var lastErr error
-	for _, route := range m.routes {
+	var pendingSwitch *ModelSwitchEvent
+	for i, route := range m.routes {
 		breaker := m.health.BreakerForRoute(route)
 		if err := breaker.AllowRequest(); err != nil {
 			lastErr = err
@@ -96,6 +177,7 @@ func (m *MultiRouteClient) GenerateContent(ctx context.Context, prompt string) (
 		content, err := m.clientFor(route).GenerateContent(ctx, prompt)
 		if err == nil {
 			breaker.RecordSuccess()
+			m.notifyPostModelSwitch(ctx, pendingSwitch)
 			return content, nil
 		}
 		lastErr = err
@@ -103,6 +185,11 @@ func (m *MultiRouteClient) GenerateContent(ctx context.Context, prompt string) (
 			return "", err
 		}
 		breaker.RecordFailure()
+		sw, blocked := m.guardModelSwitch(ctx, route, i, err)
+		if blocked != nil {
+			return "", *blocked
+		}
+		pendingSwitch = sw
 	}
 	if lastErr != nil {
 		return "", lastErr
@@ -143,6 +230,7 @@ func (m *MultiRouteClient) stream(ctx context.Context, messages []Message, onEve
 		return fmt.Errorf("no model routes configured")
 	}
 	var lastErr error
+	var pendingSwitch *ModelSwitchEvent
 	for i, route := range m.routes {
 		breaker := m.health.BreakerForRoute(route)
 		if err := breaker.AllowRequest(); err != nil {
@@ -155,6 +243,7 @@ func (m *MultiRouteClient) stream(ctx context.Context, messages []Message, onEve
 		err := call(m.clientFor(route), tracker.handle)
 		if err == nil {
 			breaker.RecordSuccess()
+			m.notifyPostModelSwitch(ctx, pendingSwitch)
 			return nil
 		}
 		lastErr = err
@@ -170,6 +259,11 @@ func (m *MultiRouteClient) stream(ctx context.Context, messages []Message, onEve
 			category = string(info.Category)
 		}
 		m.emitFallbackEvent(onEvent, route, m.nextRouteName(i+1), reason, category)
+		sw, blocked := m.guardModelSwitch(ctx, route, i, err)
+		if blocked != nil {
+			return *blocked
+		}
+		pendingSwitch = sw
 	}
 	if lastErr != nil {
 		return lastErr

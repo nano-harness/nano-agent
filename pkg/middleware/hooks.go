@@ -25,6 +25,8 @@ const (
 	HookPermissionRequest  HookEvent = hookservice.EventPermissionRequest
 	HookPermissionDenied   HookEvent = hookservice.EventPermissionDenied
 	HookNotification       HookEvent = hookservice.EventNotification
+	HookPreModelSwitch     HookEvent = hookservice.EventPreModelSwitch
+	HookPostModelSwitch    HookEvent = hookservice.EventPostModelSwitch
 )
 
 // Hook is a user-defined shell script that fires before or after tool execution.

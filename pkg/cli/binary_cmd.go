@@ -245,6 +245,10 @@ func normalizeBinaryHookEventName(key string) hookservice.Event {
 		return hookservice.EventPermissionDenied
 	case "notification":
 		return hookservice.EventNotification
+	case "premodelswitch":
+		return hookservice.EventPreModelSwitch
+	case "postmodelswitch":
+		return hookservice.EventPostModelSwitch
 	default:
 		return hookservice.EventPreToolUse
 	}

@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/managedsettings"
-	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v2"
 )
 
@@ -202,6 +202,49 @@ type SandboxConfig struct {
 	// denied even when NetworkAccess is true.
 	// TODO: implement allow-list enforcement in the bwrap and sandbox-exec backends.
 	NetworkAllowlist []string `mapstructure:"network_allowlist" yaml:"network_allowlist,omitempty"`
+}
+
+// Shell output limits used when the corresponding ShellConfig values are
+// zero, negative, or unset.
+const (
+	// DefaultShellInlineOutputMaxBytes is the default budget for shell output
+	// inlined into the model context (64KB). Larger outputs are spilled to a
+	// file and replaced with a head/tail preview plus a file reference.
+	DefaultShellInlineOutputMaxBytes = 64 * 1024
+	// DefaultShellCaptureOutputMaxBytes is the default absolute cap for
+	// captured shell output (16MB, aligned with Gemini CLI).
+	DefaultShellCaptureOutputMaxBytes = 16 * 1024 * 1024
+)
+
+// ShellConfig controls run_shell_command output capture and inline budgeting.
+type ShellConfig struct {
+	// InlineOutputMaxBytes is the budget (in bytes) for shell output inlined
+	// into the model context. When captured output exceeds this budget, the
+	// full output is written to a spill file and the context receives a
+	// head/tail preview plus the file path. Default: 65536 (64KB).
+	// Values <= 0 fall back to the default.
+	InlineOutputMaxBytes int `mapstructure:"inline_output_max_bytes" yaml:"inline_output_max_bytes"`
+
+	// CaptureOutputMaxBytes is the absolute cap (in bytes) for captured shell
+	// output per stream, replacing the previously hardcoded 16MB limit.
+	// Default: 16MB. Values <= 0 fall back to the default.
+	CaptureOutputMaxBytes int `mapstructure:"capture_output_max_bytes" yaml:"capture_output_max_bytes"`
+}
+
+// InlineBudgetBytes returns the effective inline output budget in bytes.
+func (c *ShellConfig) InlineBudgetBytes() int {
+	if c == nil || c.InlineOutputMaxBytes <= 0 {
+		return DefaultShellInlineOutputMaxBytes
+	}
+	return c.InlineOutputMaxBytes
+}
+
+// CaptureLimitBytes returns the effective capture limit in bytes.
+func (c *ShellConfig) CaptureLimitBytes() int {
+	if c == nil || c.CaptureOutputMaxBytes <= 0 {
+		return DefaultShellCaptureOutputMaxBytes
+	}
+	return c.CaptureOutputMaxBytes
 }
 
 // HookCommand is a single command hook definition.
@@ -785,6 +828,9 @@ type Config struct {
 	// ArbitraryExecCommands extends the built-in interpreter eval confirmation list.
 	ArbitraryExecCommands []string `mapstructure:"arbitrary_exec_commands" yaml:"arbitrary_exec_commands"`
 
+	// Shell controls run_shell_command output capture and inline budgeting.
+	Shell *ShellConfig `mapstructure:"shell" yaml:"shell"`
+
 	CustomSystemPrompt string `mapstructure:"custom_system_prompt" yaml:"custom_system_prompt"`
 
 	// OpenSpec integration configuration
@@ -1183,6 +1229,12 @@ func DefaultConfig() *Config {
 
 		// Safety defaults
 		ConfirmDestructive: true,
+
+		// Shell output capture / inline budget defaults
+		Shell: &ShellConfig{
+			InlineOutputMaxBytes:  DefaultShellInlineOutputMaxBytes,
+			CaptureOutputMaxBytes: DefaultShellCaptureOutputMaxBytes,
+		},
 
 		// Loop detection defaults
 		LoopDetection: &LoopDetectionConfig{
@@ -1996,6 +2048,11 @@ func (c *Config) DeepCopy() *Config {
 	copied.BlockedEnvVars = append([]string(nil), c.BlockedEnvVars...)
 	copied.SensitiveReadPaths = append([]string(nil), c.SensitiveReadPaths...)
 	copied.ArbitraryExecCommands = append([]string(nil), c.ArbitraryExecCommands...)
+
+	if c.Shell != nil {
+		shellCfg := *c.Shell
+		copied.Shell = &shellCfg
+	}
 	copied.AllowedRules = append([]string(nil), c.AllowedRules...)
 	copied.Fallbacks = append([]string(nil), c.Fallbacks...)
 	if c.ProvidersBlock != nil {

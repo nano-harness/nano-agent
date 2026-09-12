@@ -20,8 +20,14 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
 )
 
-// MaxShellOutputBytes is the maximum size of command output to capture (16MB, aligned with Gemini CLI)
-const MaxShellOutputBytes = 16 * 1024 * 1024
+// MaxShellOutputBytes is the default maximum size of command output to capture
+// (16MB, aligned with Gemini CLI). The effective limit is configurable via
+// shell.capture_output_max_bytes; see ShellTool.captureOutputMaxBytes.
+const MaxShellOutputBytes = config.DefaultShellCaptureOutputMaxBytes
+
+// DefaultShellInlineOutputBytes is the default budget for shell output inlined
+// into the model context (64KB). Configurable via shell.inline_output_max_bytes.
+const DefaultShellInlineOutputBytes = config.DefaultShellInlineOutputMaxBytes
 
 // OutputCallback is a function that receives streaming output from a command
 type OutputCallback func(stream string, chunk string) // stream: "stdout" or "stderr"
@@ -53,6 +59,12 @@ type ShellTool struct {
 	sandboxRuntime sandbox.Runtime
 	guard          *middleware.CommandGuard
 	bgManager      *BackgroundTaskManager // Optional: for background task support
+
+	// inlineOutputMaxBytes is the budget for output inlined into the model
+	// context. Larger outputs are spilled to a file (spill-to-file).
+	inlineOutputMaxBytes int
+	// captureOutputMaxBytes is the absolute capture limit per stream.
+	captureOutputMaxBytes int
 }
 
 // NewShellTool creates a new ShellTool instance.
@@ -64,9 +76,19 @@ func NewShellTool(workingDir string, cfg map[string]interface{}, sandboxCfg *con
 	}
 
 	tool := &ShellTool{
-		workingDir:     workingDir,
-		config:         cfg,
-		sandboxRuntime: sandbox.NewRuntime(sandboxCfg, workingDir),
+		workingDir:            workingDir,
+		config:                cfg,
+		sandboxRuntime:        sandbox.NewRuntime(sandboxCfg, workingDir),
+		inlineOutputMaxBytes:  DefaultShellInlineOutputBytes,
+		captureOutputMaxBytes: MaxShellOutputBytes,
+	}
+
+	// Load output limits from tool config; zero or negative values keep defaults.
+	if v, ok := intConfigValue(cfg, "shell_inline_output_max_bytes"); ok && v > 0 {
+		tool.inlineOutputMaxBytes = v
+	}
+	if v, ok := intConfigValue(cfg, "shell_capture_output_max_bytes"); ok && v > 0 {
+		tool.captureOutputMaxBytes = v
 	}
 
 	// Load env var filters and strict mode from tool config.
@@ -453,11 +475,20 @@ func (t *ShellTool) executeWithAutoBackground(ctx context.Context, command, dire
 			"environment":    environment,
 		}
 
+		// Spill oversized output to a file and replace it with a head/tail
+		// preview so only a bounded budget is inlined into the model context.
+		t.spillOutputIfNeeded(result)
+
 		// Add truncation information from result metadata if present
 		if result.Metadata != nil {
 			if truncated, ok := result.Metadata["output_truncated"].(bool); ok && truncated {
 				metadata["output_truncated"] = true
-				metadata["max_output_bytes"] = MaxShellOutputBytes
+				metadata["max_output_bytes"] = t.captureOutputMaxBytes
+			}
+			for _, key := range []string{"output_spilled", "output_file", "total_bytes", "inline_output_max_bytes"} {
+				if v, ok := result.Metadata[key]; ok {
+					metadata[key] = v
+				}
 			}
 		}
 
@@ -670,7 +701,7 @@ func (t *ShellTool) executeCommand(ctx context.Context, command, directory strin
 				result.Metadata = make(map[string]interface{})
 			}
 			result.Metadata["output_truncated"] = true
-			result.Metadata["max_output_bytes"] = MaxShellOutputBytes
+			result.Metadata["max_output_bytes"] = t.captureOutputMaxBytes
 		}
 
 		// Check for timeout or context cancellation
@@ -758,6 +789,121 @@ func publishCommandFinished(publisher sandbox.EventPublisher, env *sandbox.Sandb
 		"timed_out":   result.TimedOut,
 		"success":     result.Success,
 	})
+}
+
+// spillOutputIfNeeded replaces oversized captured output with a head/tail
+// preview and writes the full output to a spill file, so that only a bounded
+// budget (inlineOutputMaxBytes) is inlined into the model context. The
+// capture limit (captureOutputMaxBytes) is unaffected and still applies
+// upstream during streaming.
+func (t *ShellTool) spillOutputIfNeeded(result *CommandResult) {
+	if result == nil || t.inlineOutputMaxBytes <= 0 {
+		return
+	}
+	total := len(result.Stdout) + len(result.Stderr)
+	if total <= t.inlineOutputMaxBytes {
+		return
+	}
+
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]interface{})
+	}
+	result.Metadata["total_bytes"] = total
+	result.Metadata["inline_output_max_bytes"] = t.inlineOutputMaxBytes
+
+	path, err := writeShellSpillFile(result.Stdout, result.Stderr)
+	if err != nil {
+		result.Metadata["output_spill_error"] = err.Error()
+	} else {
+		result.Metadata["output_spilled"] = true
+		result.Metadata["output_file"] = path
+	}
+
+	stdoutBudget, stderrBudget := splitSpillBudget(t.inlineOutputMaxBytes, len(result.Stdout), len(result.Stderr))
+	result.Stdout = spillPreview(result.Stdout, stdoutBudget)
+	result.Stderr = spillPreview(result.Stderr, stderrBudget)
+}
+
+// splitSpillBudget divides the inline budget between stdout and stderr
+// proportionally to their sizes, guaranteeing each non-empty stream a
+// minimum share (capped at 1KB or 10% of the budget, whichever is smaller).
+func splitSpillBudget(budget, stdoutLen, stderrLen int) (int, int) {
+	switch {
+	case stdoutLen == 0:
+		return 0, budget
+	case stderrLen == 0:
+		return budget, 0
+	}
+	minShare := budget / 10
+	if minShare > 1024 {
+		minShare = 1024
+	}
+	if minShare < 1 {
+		minShare = 1
+	}
+	stdoutBudget := budget * stdoutLen / (stdoutLen + stderrLen)
+	if stdoutBudget < minShare {
+		stdoutBudget = minShare
+	}
+	if maxStdout := budget - minShare; stdoutBudget > maxStdout {
+		stdoutBudget = maxStdout
+	}
+	return stdoutBudget, budget - stdoutBudget
+}
+
+// spillPreview returns s unchanged when it fits the budget; otherwise it
+// keeps the first ~80% and last ~20% of the budget with an omission marker.
+func spillPreview(s string, budget int) string {
+	if len(s) <= budget {
+		return s
+	}
+	if budget < 2 {
+		return ""
+	}
+	head := budget * 4 / 5
+	tail := budget - head
+	return s[:head] + fmt.Sprintf("\n... [%d bytes omitted] ...\n", len(s)-head-tail) + s[len(s)-tail:]
+}
+
+// writeShellSpillFile writes the full captured output to a timestamped file
+// under <user-cache-dir>/nano-shell-output/ (falling back to the OS temp
+// dir) and returns the file path.
+func writeShellSpillFile(stdout, stderr string) (string, error) {
+	dir := ""
+	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+		dir = filepath.Join(cacheDir, "nano-shell-output")
+	}
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "nano-shell-output")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("failed to create shell output spill directory: %w", err)
+	}
+
+	name := fmt.Sprintf("shell-output-%s-%d.txt", time.Now().Format("20060102-150405.000000"), os.Getpid())
+	path := filepath.Join(dir, name)
+
+	var buf strings.Builder
+	buf.WriteString("=== STDOUT ===\n")
+	buf.WriteString(stdout)
+	buf.WriteString("\n=== STDERR ===\n")
+	buf.WriteString(stderr)
+	if err := os.WriteFile(path, []byte(buf.String()), 0o600); err != nil {
+		return "", fmt.Errorf("failed to write shell output spill file: %w", err)
+	}
+	return path, nil
+}
+
+// spillNotice returns the spill hint appended to formatted output, or ""
+// when no spill occurred.
+func spillNotice(metadata map[string]interface{}) string {
+	spilled, _ := metadata["output_spilled"].(bool)
+	if !spilled {
+		return ""
+	}
+	path, _ := metadata["output_file"].(string)
+	total, _ := metadata["total_bytes"].(int)
+	return fmt.Sprintf("[output truncated: full output written to %s, %d bytes total]", path, total)
 }
 
 func (t *ShellTool) buildEnvironment(environment string) []string {
@@ -862,6 +1008,11 @@ func (t *ShellTool) formatForUser(result *CommandResult, metadata map[string]int
 		}
 	}
 
+	// Add spill hint if the full output was written to a file
+	if notice := spillNotice(metadata); notice != "" {
+		fmt.Fprintf(&output, "⚠️  %s\n", notice)
+	}
+
 	return output.String()
 }
 
@@ -909,6 +1060,12 @@ func (t *ShellTool) formatForLLM(result *CommandResult, metadata map[string]inte
 		}
 	}
 
+	// Add spill hint if the full output was written to a file
+	if notice := spillNotice(metadata); notice != "" {
+		output.WriteString(notice)
+		output.WriteString("\n")
+	}
+
 	return output.String()
 }
 
@@ -924,10 +1081,10 @@ func (t *ShellTool) streamPipe(pipe io.Reader, stream string, cb OutputCallback,
 			chunk := buf[:n]
 			mu.Lock()
 			// Check if adding this chunk would exceed the limit
-			if accum.Len()+n > MaxShellOutputBytes {
+			if accum.Len()+n > t.captureOutputMaxBytes {
 				*truncated = true
 				// Calculate how much to drop from the beginning
-				drop := accum.Len() + n - MaxShellOutputBytes
+				drop := accum.Len() + n - t.captureOutputMaxBytes
 				if drop >= accum.Len() {
 					// Drop everything accumulated so far
 					accum.Reset()
@@ -941,16 +1098,16 @@ func (t *ShellTool) streamPipe(pipe io.Reader, stream string, cb OutputCallback,
 			accum.Write(chunk)
 
 			// Call the streaming callback if provided, but only if we haven't exceeded the limit
-			willExceedLimit := totalStreamed+n > MaxShellOutputBytes
+			willExceedLimit := totalStreamed+n > t.captureOutputMaxBytes
 			if cb != nil && !willExceedLimit {
 				cb(stream, string(chunk))
 				totalStreamed += n
-			} else if cb != nil && totalStreamed <= MaxShellOutputBytes {
+			} else if cb != nil && totalStreamed <= t.captureOutputMaxBytes {
 				// Send partial chunk to reach the limit exactly
-				remaining := MaxShellOutputBytes - totalStreamed
+				remaining := t.captureOutputMaxBytes - totalStreamed
 				if remaining > 0 {
 					cb(stream, string(chunk[:remaining]))
-					totalStreamed = MaxShellOutputBytes
+					totalStreamed = t.captureOutputMaxBytes
 				}
 			}
 			mu.Unlock()
@@ -959,6 +1116,24 @@ func (t *ShellTool) streamPipe(pipe io.Reader, stream string, cb OutputCallback,
 			return
 		}
 	}
+}
+
+// intConfigValue extracts an integer config value from the legacy tool config
+// map, tolerating the numeric types produced by JSON/YAML decoders.
+func intConfigValue(cfg map[string]interface{}, key string) (int, bool) {
+	v, ok := cfg[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
 }
 
 // containsInsensitive checks if a slice contains a string, case-insensitive

@@ -27,6 +27,7 @@ Feature-specific documentation:
 - [Mailbox System](features/MAILBOX.md) - Inter-agent communication infrastructure
 - [Intelligent Orchestration](features/INTELLIGENT_ORCHESTRATION.md) - Smart task distribution and sub-agent routing
 - [Hooks System](features/HOOKS.md) - Hook loading and execution service
+- [Shell Output Budgets](features/SHELL_OUTPUT.md) - Configurable inline output limits with spill-to-file
 - [Extensions](features/EXTENSIONS.md) - Extension manifests for skills, MCP servers, tools, and agents
 - [MCP OAuth](features/MCP_OAUTH.md) - OAuth integration for MCP servers
 

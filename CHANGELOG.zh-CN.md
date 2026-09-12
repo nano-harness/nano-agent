@@ -7,6 +7,15 @@ nano-agent 的所有重要变更都将记录在本文件中。
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [Unreleased]
+
+### 变更
+- **mcp**：`github.com/modelcontextprotocol/go-sdk` 从 v1.3.1 升级到 v1.7.0（最新稳定版）。现有客户端语义（OAuth、健康检查、沙箱化 stdio、重连）保持不变。
+
+### 新增
+- **hooks**：新增 `pre_model_switch` / `post_model_switch` 生命周期事件（对齐 Claude Code v2.1.251）。围绕 `MultiRouteClient` 的自动模型路由 fallback 触发（流式与非流式路径均已覆盖）。`pre_model_switch` 的 params 携带 `from_route`/`old_model`/`to_route`/`new_model`/`reason`，可用 block 决策否决切换；`post_model_switch` 为通知性质，在回退路由成功后触发。主路由成功或失败路由已是最后一条时不触发。手动 `/model use` 重启后生效，不触发这两个事件。详见 `docs/features/HOOKS.zh-CN.md`。
+- **tools/shell**：可配置的 shell 输出上限与落盘机制（spill-to-file）。新增 `shell.inline_output_max_bytes`（默认 64KB）限制内联进模型上下文的输出；超出的完整输出写入 `<用户缓存目录>/nano-shell-output/`，上下文中替换为头/尾预览及 `[output truncated: full output written to <path>, N bytes total]` 提示。新增 `shell.capture_output_max_bytes`（默认 16MB）替代原先硬编码的 16MB 捕获上限。结果 metadata 新增 `output_spilled`、`output_file`、`total_bytes`、`inline_output_max_bytes`。详见 `docs/features/SHELL_OUTPUT.zh-CN.md`。
+
 ## [0.8.8] - 2026-06-16
 
 ### 新增

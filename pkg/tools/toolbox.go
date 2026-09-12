@@ -71,6 +71,9 @@ type ToolboxConfig struct {
 
 	// Sandbox configuration for process-level and path-level isolation.
 	Sandbox *config.SandboxConfig `json:"sandbox"`
+
+	// Shell output capture / inline budget configuration.
+	Shell *config.ShellConfig `json:"shell"`
 }
 
 // UpdateEvent represents a tools update event

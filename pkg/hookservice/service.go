@@ -47,6 +47,8 @@ const (
 	EventPermissionRequest  Event = "permission_request"
 	EventPermissionDenied   Event = "permission_denied"
 	EventNotification       Event = "notification"
+	EventPreModelSwitch     Event = "pre_model_switch"
+	EventPostModelSwitch    Event = "post_model_switch"
 )
 
 // KnownEventNames is the authoritative set of valid hook event names.
@@ -67,6 +69,8 @@ var KnownEventNames = []Event{
 	EventPermissionRequest,
 	EventPermissionDenied,
 	EventNotification,
+	EventPreModelSwitch,
+	EventPostModelSwitch,
 }
 
 // IsKnownEvent reports whether ev is in the KnownEventNames set.
@@ -77,6 +81,22 @@ func IsKnownEvent(ev Event) bool {
 		}
 	}
 	return false
+}
+
+// NormalizeEventName maps a user-supplied hook event key (any case, with
+// optional underscores/dashes, e.g. "PreModelSwitch" or "pre-model-switch")
+// to a canonical Event. It returns ok=false for empty or unknown keys.
+func NormalizeEventName(key string) (Event, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	normalized = strings.ReplaceAll(normalized, "_", "")
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	for _, known := range KnownEventNames {
+		kn := strings.ReplaceAll(string(known), "_", "")
+		if normalized == kn {
+			return known, true
+		}
+	}
+	return "", false
 }
 
 // IsToolEvent reports whether ev receives a tool_name in its envelope.
@@ -105,6 +125,13 @@ func MatcherTarget(ev Event, input Input) string {
 		return ""
 	case EventPreCompact, EventPostCompact:
 		return input.Trigger
+	case EventPreModelSwitch, EventPostModelSwitch:
+		if v, ok := input.Params["new_model"]; ok {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+		return ""
 	case EventSessionStart:
 		return input.Source
 	case EventSessionEnd:
@@ -703,6 +730,10 @@ func hookEventName(event Event) string {
 		return "PermissionDenied"
 	case EventNotification:
 		return "Notification"
+	case EventPreModelSwitch:
+		return "PreModelSwitch"
+	case EventPostModelSwitch:
+		return "PostModelSwitch"
 	default:
 		return string(event)
 	}

@@ -79,6 +79,16 @@ Hook 引擎现在会触发此前仅为占位的事件：
 - `stop` / `stop_failure`：当一个回合（turn）成功结束或中止时触发。
 - `subagent_start` / `subagent_stop` / `teammate_idle`：针对派生的队友（spawned teammates）触发。
 
+## 模型切换事件
+
+`pre_model_switch` / `post_model_switch` 围绕自动模型路由切换（`pkg/llm.MultiRouteClient` 的多路由 fallback）触发：
+
+- `pre_model_switch` 在回退到下一条配置路由之前触发。`params` 携带 `from_route`、`old_model`、`to_route`、`new_model` 与 `reason`（触发回退的错误类别）；返回 block 决策可否决此次切换——请求将直接失败，而不是悄悄降级到另一家 provider。
+- `post_model_switch` 在回退路由成功后触发，纯属通知，携带相同参数。
+- 主路由成功、失败的路由已是最后一条（没有可守卫的切换）、或错误不具备回退资格（如鉴权失败）时，两个事件都不会触发。
+- matcher 模式匹配的是 `new_model`。
+- 手动 `/model use` 只写入配置、重启后生效，不存在会话内切换，因此这两个事件仅覆盖自动 fallback。
+
 ## 安全预期
 
 - Hook 的环境变量应使用白名单控制。

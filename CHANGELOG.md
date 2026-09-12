@@ -7,6 +7,15 @@ All notable changes to nano-agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **mcp**: Upgraded `github.com/modelcontextprotocol/go-sdk` from v1.3.1 to v1.7.0 (latest stable). Existing client semantics (OAuth, health checks, sandboxed stdio, reconnect) are unchanged.
+
+### Added
+- **hooks**: New `pre_model_switch` / `post_model_switch` lifecycle events (Claude Code v2.1.251 parity). They fire around automatic model-route fallback in `MultiRouteClient` (both streaming and non-streaming paths). `pre_model_switch` receives `from_route`/`old_model`/`to_route`/`new_model`/`reason` in params and may veto the switch with a block decision; `post_model_switch` is a notification fired after a fallback route succeeds. Neither fires when the primary route succeeds or when the failing route is the last one. Manual `/model use` changes apply on restart and do not fire these events. See `docs/features/HOOKS.md`.
+- **tools/shell**: Configurable shell output limits with spill-to-file. New `shell.inline_output_max_bytes` (default 64KB) caps what is inlined into the model context; oversized output is written to `<user-cache-dir>/nano-shell-output/` and replaced with a head/tail preview plus an `[output truncated: full output written to <path>, N bytes total]` hint. New `shell.capture_output_max_bytes` (default 16MB) replaces the previously hardcoded 16MB capture cap. Result metadata gains `output_spilled`, `output_file`, `total_bytes`, and `inline_output_max_bytes`. See `docs/features/SHELL_OUTPUT.md`.
+
 ## [0.8.8] - 2026-06-16
 
 ### Added

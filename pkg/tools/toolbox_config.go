@@ -39,6 +39,9 @@ func (c *ToolboxConfig) ToolConfigMap() map[string]interface{} {
 	config["blocked_env_vars"] = c.BlockedEnvVars
 	config["strict"] = c.Strict
 
+	config["shell_inline_output_max_bytes"] = c.Shell.InlineBudgetBytes()
+	config["shell_capture_output_max_bytes"] = c.Shell.CaptureLimitBytes()
+
 	if c.ImageAPIKey != "" {
 		config["image_api_key"] = c.ImageAPIKey
 	}

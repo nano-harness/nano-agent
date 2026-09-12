@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/nano-harness/nano-agent/pkg/event"
@@ -166,4 +167,117 @@ func hasEvent(events []event.StreamEvent, eventType event.EventType) bool {
 		}
 	}
 	return false
+}
+
+func TestModelSwitchHooksFireOnFallback(t *testing.T) {
+	primaryErr := fmt.Errorf("POST \"https://api.example/v1/chat/completions\": 429 Too Many Requests")
+	client := testMultiRouteClient([]MockResponse{{Error: primaryErr}, {Content: "fallback ok"}})
+
+	var preEvents, postEvents []ModelSwitchEvent
+	client.SetModelSwitchHooks(ModelSwitchHooks{
+		Pre:  func(_ context.Context, sw ModelSwitchEvent) string { preEvents = append(preEvents, sw); return "" },
+		Post: func(_ context.Context, sw ModelSwitchEvent) { postEvents = append(postEvents, sw) },
+	})
+
+	err := client.StreamCompletion(context.Background(), []Message{{Role: "user", Content: "hi"}}, func(event.StreamEvent) {})
+	if err != nil {
+		t.Fatalf("StreamCompletion failed: %v", err)
+	}
+	if len(preEvents) != 1 {
+		t.Fatalf("pre hook fired %d times, want 1", len(preEvents))
+	}
+	sw := preEvents[0]
+	if sw.FromRoute != "primary" || sw.ToRoute != "fallback" || sw.FromModel != "gpt-4.1" || sw.ToModel != "deepseek-chat" {
+		t.Fatalf("unexpected switch event: %+v", sw)
+	}
+	if sw.Reason == "" {
+		t.Fatal("switch reason must not be empty")
+	}
+	if len(postEvents) != 1 || postEvents[0] != sw {
+		t.Fatalf("post hook events = %+v, want the same single switch", postEvents)
+	}
+}
+
+func TestModelSwitchHooksPreCanVetoFallback(t *testing.T) {
+	primaryErr := fmt.Errorf("POST \"https://api.example/v1/chat/completions\": 429 Too Many Requests")
+	client := testMultiRouteClient([]MockResponse{{Error: primaryErr}, {Content: "should not run"}})
+
+	var postFired bool
+	client.SetModelSwitchHooks(ModelSwitchHooks{
+		Pre:  func(_ context.Context, _ ModelSwitchEvent) string { return "policy forbids deepseek" },
+		Post: func(_ context.Context, _ ModelSwitchEvent) { postFired = true },
+	})
+
+	err := client.StreamCompletion(context.Background(), []Message{{Role: "user", Content: "hi"}}, func(event.StreamEvent) {})
+	if err == nil || !strings.Contains(err.Error(), "blocked by hook") {
+		t.Fatalf("expected hook-blocked error, got %v", err)
+	}
+	if names := client.clientNames(); len(names) != 1 || names[0] != "primary" {
+		t.Fatalf("clients used = %v, want primary only", names)
+	}
+	if postFired {
+		t.Fatal("post hook must not fire when the switch was vetoed")
+	}
+}
+
+func TestModelSwitchHooksSilentWithoutFallback(t *testing.T) {
+	client := testMultiRouteClient([]MockResponse{{Content: "primary ok"}})
+
+	fired := false
+	client.SetModelSwitchHooks(ModelSwitchHooks{
+		Pre:  func(_ context.Context, _ ModelSwitchEvent) string { fired = true; return "" },
+		Post: func(_ context.Context, _ ModelSwitchEvent) { fired = true },
+	})
+
+	err := client.StreamCompletion(context.Background(), []Message{{Role: "user", Content: "hi"}}, func(event.StreamEvent) {})
+	if err != nil {
+		t.Fatalf("StreamCompletion failed: %v", err)
+	}
+	if fired {
+		t.Fatal("model switch hooks must not fire when no fallback occurred")
+	}
+}
+
+func TestModelSwitchHooksNoPostWhenAllRoutesFail(t *testing.T) {
+	failErr := fmt.Errorf("POST \"https://api.example/v1/chat/completions\": 500 Internal Server Error")
+	client := testMultiRouteClient([]MockResponse{{Error: failErr}, {Error: failErr}})
+
+	var preCount int
+	var postFired bool
+	client.SetModelSwitchHooks(ModelSwitchHooks{
+		Pre:  func(_ context.Context, _ ModelSwitchEvent) string { preCount++; return "" },
+		Post: func(_ context.Context, _ ModelSwitchEvent) { postFired = true },
+	})
+
+	if err := client.StreamCompletion(context.Background(), []Message{{Role: "user", Content: "hi"}}, func(event.StreamEvent) {}); err == nil {
+		t.Fatal("expected error when all routes fail")
+	}
+	if preCount != 1 {
+		t.Fatalf("pre hook fired %d times, want 1 (no switch to guard after the last route)", preCount)
+	}
+	if postFired {
+		t.Fatal("post hook must not fire when no fallback route succeeded")
+	}
+}
+
+func TestModelSwitchHooksFireOnGenerateContent(t *testing.T) {
+	primaryErr := fmt.Errorf("POST \"https://api.example/v1/chat/completions\": 429 Too Many Requests")
+	client := testMultiRouteClient([]MockResponse{{Error: primaryErr}, {Content: "fallback ok"}})
+
+	var preEvents, postEvents []ModelSwitchEvent
+	client.SetModelSwitchHooks(ModelSwitchHooks{
+		Pre:  func(_ context.Context, sw ModelSwitchEvent) string { preEvents = append(preEvents, sw); return "" },
+		Post: func(_ context.Context, sw ModelSwitchEvent) { postEvents = append(postEvents, sw) },
+	})
+
+	content, err := client.GenerateContent(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("GenerateContent failed: %v", err)
+	}
+	if content != "fallback ok" {
+		t.Fatalf("content = %q, want fallback response", content)
+	}
+	if len(preEvents) != 1 || len(postEvents) != 1 {
+		t.Fatalf("pre=%d post=%d, want 1 each", len(preEvents), len(postEvents))
+	}
 }

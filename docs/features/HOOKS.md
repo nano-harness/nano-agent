@@ -79,6 +79,25 @@ The hook engine now fires the previously stubbed events:
 - `stop` / `stop_failure` when a turn finishes successfully or aborts.
 - `subagent_start` / `subagent_stop` / `teammate_idle` for spawned teammates.
 
+## Model switch events
+
+`pre_model_switch` / `post_model_switch` fire around automatic model route
+switches (multi-route fallback in `pkg/llm.MultiRouteClient`):
+
+- `pre_model_switch` fires before falling back to the next configured route.
+  It receives `from_route`, `old_model`, `to_route`, `new_model`, and `reason`
+  (the error category that triggered the fallback) in `params`, and may veto
+  the switch by returning a block decision — the request then fails instead of
+  silently downgrading to another provider.
+- `post_model_switch` fires after a fallback route succeeds. It is a pure
+  notification and carries the same params.
+- Neither event fires when the primary route succeeds, when the failing route
+  is the last one (no switch to guard), or when the error is not
+  fallback-eligible (e.g. auth failures).
+- The matcher pattern is matched against `new_model`.
+- Manual `/model use` changes are written to config and take effect on restart;
+  no in-session switch occurs, so these events only cover automatic fallback.
+
 ## Security expectations
 
 - Hook environment variables should be allowlisted.

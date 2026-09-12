@@ -70,6 +70,7 @@ func buildAgentBootstrap(cfg *config.Config) (*agentBootstrap, error) {
 	toolScheduler.SetHookEngine(hookEngine)
 	toolScheduler.SetWorkDir(workingDir)
 	sessionManager.SetHookEngine(hookEngine)
+	wireModelSwitchHooks(llmClient, hookEngine)
 
 	return &agentBootstrap{
 		workingDir:        workingDir,
@@ -152,6 +153,7 @@ func newAgentToolboxConfig(cfg *config.Config, workingDir string) *tools.Toolbox
 		Strict:         cfg.Strict,
 
 		Sandbox: cfg.Sandbox,
+		Shell:   cfg.Shell,
 	}
 
 	if cfg.OpenSpec != nil && cfg.OpenSpec.Enabled {
@@ -600,6 +602,43 @@ func newAgentHookEngine(cfg *config.Config, workingDir string) *middleware.HookE
 	return hookEngine
 }
 
+// wireModelSwitchHooks connects automatic model-route fallback switches on a
+// MultiRouteClient to the hook engine, firing pre_model_switch (with veto) and
+// post_model_switch (notification) lifecycle events.
+func wireModelSwitchHooks(llmClient llm.LLMClient, hookEngine *middleware.HookEngine) {
+	mrc, ok := llmClient.(*llm.MultiRouteClient)
+	if !ok || hookEngine == nil {
+		return
+	}
+	switchParams := func(sw llm.ModelSwitchEvent) map[string]interface{} {
+		return map[string]interface{}{
+			"from_route": sw.FromRoute,
+			"old_model":  sw.FromModel,
+			"to_route":   sw.ToRoute,
+			"new_model":  sw.ToModel,
+			"reason":     sw.Reason,
+		}
+	}
+	mrc.SetModelSwitchHooks(llm.ModelSwitchHooks{
+		Pre: func(ctx context.Context, sw llm.ModelSwitchEvent) string {
+			decision, err := hookEngine.Execute(ctx, middleware.HookPreModelSwitch, "", switchParams(sw))
+			if err != nil {
+				logger.Warnf("pre_model_switch hook error: %v", err)
+				return ""
+			}
+			if decision != nil && decision.Action != middleware.ActionAllow {
+				return decision.Reason
+			}
+			return ""
+		},
+		Post: func(ctx context.Context, sw llm.ModelSwitchEvent) {
+			if _, err := hookEngine.Execute(ctx, middleware.HookPostModelSwitch, "", switchParams(sw)); err != nil {
+				logger.Warnf("post_model_switch hook error: %v", err)
+			}
+		},
+	})
+}
+
 func normalizeHookEventName(key string) hookservice.Event {
 	trimmed := strings.TrimSpace(key)
 	if trimmed == "" {
@@ -640,6 +679,10 @@ func normalizeHookEventName(key string) hookservice.Event {
 		return hookservice.EventPermissionDenied
 	case "notification":
 		return hookservice.EventNotification
+	case "premodelswitch":
+		return hookservice.EventPreModelSwitch
+	case "postmodelswitch":
+		return hookservice.EventPostModelSwitch
 	default:
 		logger.Warnf("Unknown hook event %q; defaulting to pre_tool_use", key)
 		return hookservice.EventPreToolUse
