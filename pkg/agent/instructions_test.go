@@ -296,3 +296,66 @@ func TestReadFile_Caches(t *testing.T) {
 		t.Errorf("expected cached content, got %q", result)
 	}
 }
+
+func TestEnforceFileBudget_UnderLimit(t *testing.T) {
+	il, dir := newTestInstructionLoader(t)
+	il.maxFileBytes = 1024
+	file := filepath.Join(dir, "NANO.md")
+	if err := os.WriteFile(file, []byte("short instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := il.readFile(file); got != "short instructions" {
+		t.Errorf("expected untouched content, got %q", got)
+	}
+}
+
+func TestEnforceFileBudget_OverLimit(t *testing.T) {
+	il, dir := newTestInstructionLoader(t)
+	il.maxFileBytes = 200
+	var sb strings.Builder
+	for i := 0; i < 40; i++ {
+		sb.WriteString(strings.Repeat("x", 10))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("TAIL-MARKER\n")
+	content := sb.String()
+	file := filepath.Join(dir, "NANO.md")
+	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := il.readFile(file)
+	if len(got) > 200+256 { // budget + bounded notice overhead
+		t.Errorf("truncated content too large: %d bytes", len(got))
+	}
+	if !strings.Contains(got, "instruction file truncated") {
+		t.Error("expected explicit truncation notice in content")
+	}
+	if !strings.Contains(got, "TAIL-MARKER") {
+		t.Error("expected tail preview to survive truncation")
+	}
+	if !strings.HasPrefix(got, "xxxxxxxxxx") {
+		t.Error("expected head preview to survive truncation")
+	}
+}
+
+func TestEnforceFileBudget_ZeroLimitUsesNoTruncation(t *testing.T) {
+	il, dir := newTestInstructionLoader(t)
+	il.maxFileBytes = 0
+	big := strings.Repeat("y", 100000)
+	file := filepath.Join(dir, "NANO.md")
+	if err := os.WriteFile(file, []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := il.readFile(file); got != big {
+		t.Errorf("expected no truncation with zero limit, got %d bytes", len(got))
+	}
+}
+
+func TestNewInstructionLoaderWithLimit_Default(t *testing.T) {
+	if il := NewInstructionLoaderWithLimit(t.TempDir(), 0); il.maxFileBytes != DefaultInstructionFileMaxBytes {
+		t.Errorf("expected default budget %d, got %d", DefaultInstructionFileMaxBytes, il.maxFileBytes)
+	}
+	if il := NewInstructionLoader(t.TempDir()); il.maxFileBytes != DefaultInstructionFileMaxBytes {
+		t.Errorf("expected default budget %d, got %d", DefaultInstructionFileMaxBytes, il.maxFileBytes)
+	}
+}

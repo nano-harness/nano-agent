@@ -13,28 +13,49 @@ package agent
 //	.nano/rules/*.md  (unconditional: loaded at session start when no "paths" frontmatter)
 //	.nano/rules/*.md  (conditional: loaded when paths match, via YAML frontmatter)
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/nano-harness/nano-agent/pkg/logger"
 )
 
 const maxImportDepth = 3
 
+// DefaultInstructionFileMaxBytes caps the size of a single instruction file
+// (NANO.md / rules) that is inlined into the system prompt. Industry practice
+// (Claude Code ~32KiB, OpenClaw ~12K chars, Hermes 25K chars) silently
+// truncates oversized instruction files; nano-agent instead truncates with an
+// explicit in-context notice so the model knows content was dropped.
+const DefaultInstructionFileMaxBytes = 32 * 1024
+
 // InstructionLoader manages hierarchical NANO.md instruction loading.
 type InstructionLoader struct {
-	workingDir string
-	homeDir    string
-	cache      map[string]string
+	workingDir   string
+	homeDir      string
+	cache        map[string]string
+	maxFileBytes int
 }
 
 // NewInstructionLoader creates a new InstructionLoader rooted at workingDir.
 func NewInstructionLoader(workingDir string) *InstructionLoader {
+	return NewInstructionLoaderWithLimit(workingDir, DefaultInstructionFileMaxBytes)
+}
+
+// NewInstructionLoaderWithLimit creates an InstructionLoader with an explicit
+// per-file byte budget. Values <= 0 fall back to DefaultInstructionFileMaxBytes.
+func NewInstructionLoaderWithLimit(workingDir string, maxFileBytes int) *InstructionLoader {
+	if maxFileBytes <= 0 {
+		maxFileBytes = DefaultInstructionFileMaxBytes
+	}
 	homeDir, _ := os.UserHomeDir()
 	return &InstructionLoader{
-		workingDir: workingDir,
-		homeDir:    homeDir,
-		cache:      make(map[string]string),
+		workingDir:   workingDir,
+		homeDir:      homeDir,
+		cache:        make(map[string]string),
+		maxFileBytes: maxFileBytes,
 	}
 }
 
@@ -239,8 +260,43 @@ func (il *InstructionLoader) readFile(path string) string {
 	content := il.stripHTMLComments(raw)
 	content = il.resolveImports(content, 0)
 	content = strings.TrimSpace(content)
+	content = il.enforceFileBudget(path, content)
 	il.cache[path] = content
 	return content
+}
+
+// enforceFileBudget truncates content exceeding the per-file byte budget,
+// keeping the head (~80%) and tail (~15%) with an explicit omission marker so
+// the model knows instructions were dropped, instead of silently truncating.
+func (il *InstructionLoader) enforceFileBudget(path, content string) string {
+	if il.maxFileBytes <= 0 || len(content) <= il.maxFileBytes {
+		return content
+	}
+	total := len(content)
+	headBytes := il.maxFileBytes * 4 / 5
+	tailBytes := il.maxFileBytes / 7
+	if headBytes+tailBytes >= total {
+		headBytes = total
+		tailBytes = 0
+	}
+	head := content[:headBytes]
+	if idx := strings.LastIndexByte(head, '\n'); idx > 0 {
+		head = head[:idx]
+		headBytes = idx
+	}
+	if tailBytes > 0 {
+		tail := content[total-tailBytes:]
+		if idx := strings.IndexByte(tail, '\n'); idx >= 0 && idx+1 < len(tail) {
+			tail = tail[idx+1:]
+			tailBytes = len(tail)
+		}
+		logger.Warnf("Instruction file %s exceeds budget (%d bytes > %d); truncated with notice", path, total, il.maxFileBytes)
+		return fmt.Sprintf("%s\n\n[... instruction file truncated: showing head %d + tail %d of %d bytes (limit %d); shorten the file or raise instruction_file_max_bytes ...]\n\n%s",
+			head, headBytes, tailBytes, total, il.maxFileBytes, tail)
+	}
+	logger.Warnf("Instruction file %s exceeds budget (%d bytes > %d); truncated with notice", path, total, il.maxFileBytes)
+	return fmt.Sprintf("%s\n\n[... instruction file truncated: showing head %d of %d bytes (limit %d); shorten the file or raise instruction_file_max_bytes ...]",
+		head, headBytes, total, il.maxFileBytes)
 }
 
 // readFileRaw reads a file without processing, returns "" on error.

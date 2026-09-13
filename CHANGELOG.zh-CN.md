@@ -14,6 +14,9 @@ nano-agent 的所有重要变更都将记录在本文件中。
 
 ### 新增
 - **hooks**：新增 `pre_model_switch` / `post_model_switch` 生命周期事件（对齐 Claude Code v2.1.251）。围绕 `MultiRouteClient` 的自动模型路由 fallback 触发（流式与非流式路径均已覆盖）。`pre_model_switch` 的 params 携带 `from_route`/`old_model`/`to_route`/`new_model`/`reason`，可用 block 决策否决切换；`post_model_switch` 为通知性质，在回退路由成功后触发。主路由成功或失败路由已是最后一条时不触发。手动 `/model use` 重启后生效，不触发这两个事件。详见 `docs/features/HOOKS.zh-CN.md`。
+- **agent**：内联进系统提示词的指令文件（NANO.md / `.nano/rules`）新增单文件字节预算。新增配置 `instruction_file_max_bytes`（默认 32KB，环境变量 `NANO_INSTRUCTION_FILE_MAX_BYTES`）；超限文件按头/尾截断并在上下文中附显式省略提示，而非静默截断（业界实践：Claude Code ~32KiB、OpenClaw ~12K 字符、Hermes ~25K 字符）。
+- **tools/shell**：内置敏感环境变量黑名单（`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`AWS_SECRET_ACCESS_KEY` 等）默认不再被子 shell 命令继承，堵住"子进程继承父进程环境变量、`printenv` 泄露 token"的残余风险。在 `allowed_env_vars` 中列出的 key 可豁免。
+- **skill**：skill 管理器新增会话级激活计数（为 `/skill:doctor` 做准备）。
 - **tools/shell**：可配置的 shell 输出上限与落盘机制（spill-to-file）。新增 `shell.inline_output_max_bytes`（默认 64KB）限制内联进模型上下文的输出；超出的完整输出写入 `<用户缓存目录>/nano-shell-output/`，上下文中替换为头/尾预览及 `[output truncated: full output written to <path>, N bytes total]` 提示。新增 `shell.capture_output_max_bytes`（默认 16MB）替代原先硬编码的 16MB 捕获上限。结果 metadata 新增 `output_spilled`、`output_file`、`total_bytes`、`inline_output_max_bytes`。详见 `docs/features/SHELL_OUTPUT.zh-CN.md`。
 
 ## [0.8.8] - 2026-06-16

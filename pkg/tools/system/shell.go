@@ -906,6 +906,32 @@ func spillNotice(metadata map[string]interface{}) string {
 	return fmt.Sprintf("[output truncated: full output written to %s, %d bytes total]", path, total)
 }
 
+// DefaultSensitiveEnvVars are credential-bearing environment variables that are
+// never passed to spawned shell commands by default: the agent process reads
+// its own provider keys from config/env in-process, and child commands almost
+// never need them. This closes the "sandbox inherits parent env, printenv
+// leaks tokens" residual risk. Escape hatch: listing a key in
+// allowed_env_vars exempts it from this built-in blocklist.
+var DefaultSensitiveEnvVars = []string{
+	"OPENAI_API_KEY",
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_AUTH_TOKEN",
+	"GEMINI_API_KEY",
+	"GOOGLE_API_KEY",
+	"DEEPSEEK_API_KEY",
+	"MOONSHOT_API_KEY",
+	"KIMI_API_KEY",
+	"OPENROUTER_API_KEY",
+	"AZURE_OPENAI_API_KEY",
+	"XAI_API_KEY",
+	"MISTRAL_API_KEY",
+	"TOGETHER_API_KEY",
+	"GROQ_API_KEY",
+	"COHERE_API_KEY",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SESSION_TOKEN",
+}
+
 func (t *ShellTool) buildEnvironment(environment string) []string {
 	baseEnv := os.Environ()
 	// Convert base env to map for easier filtering/overrides
@@ -920,6 +946,10 @@ func (t *ShellTool) buildEnvironment(environment string) []string {
 			}
 			// Drop blocked keys from base
 			if containsInsensitive(t.blockedEnvVars, key) {
+				continue
+			}
+			// Drop built-in sensitive keys unless explicitly allowed
+			if containsInsensitive(DefaultSensitiveEnvVars, key) && !containsInsensitive(t.allowedEnvVars, key) {
 				continue
 			}
 			envMap[key] = val
@@ -948,6 +978,10 @@ func (t *ShellTool) buildEnvironment(environment string) []string {
 			}
 			if t.strict && len(t.allowedEnvVars) > 0 && !containsInsensitive(t.allowedEnvVars, key) {
 				// not allowed under strict
+				continue
+			}
+			// Built-in sensitive keys require an explicit allowed_env_vars exemption
+			if containsInsensitive(DefaultSensitiveEnvVars, key) && !containsInsensitive(t.allowedEnvVars, key) {
 				continue
 			}
 			envMap[key] = val

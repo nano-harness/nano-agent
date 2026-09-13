@@ -49,13 +49,17 @@ type SystemPromptBuilder struct {
 // NewSystemPromptBuilder creates a new system prompt builder.
 // An InstructionLoader for NANO.md is initialised automatically from workingDir.
 func NewSystemPromptBuilder(workingDir string, tools []interfaces.Tool, memoryManager *memory.Manager, cfg *config.Config) *SystemPromptBuilder {
+	instructionMaxBytes := 0
+	if cfg != nil {
+		instructionMaxBytes = cfg.InstructionFileMaxBytes
+	}
 	return &SystemPromptBuilder{
 		workingDir:        workingDir,
 		tools:             tools,
 		memoryManager:     memoryManager,
 		config:            cfg,
 		userInfoReady:     make(chan struct{}),
-		instructionLoader: NewInstructionLoader(workingDir),
+		instructionLoader: NewInstructionLoaderWithLimit(workingDir, instructionMaxBytes),
 		contextAnalyzer:   NewContextAnalyzer(),
 		toolsFingerprint:  toolFingerprint(tools),
 	}

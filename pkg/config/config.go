@@ -779,6 +779,11 @@ type Config struct {
 	GitMaxLogEntries    int `mapstructure:"git_max_log_entries" yaml:"git_max_log_entries"`
 	MemoryMaxEntries    int `mapstructure:"memory_max_entries" yaml:"memory_max_entries"`
 
+	// InstructionFileMaxBytes caps the bytes of a single instruction file
+	// (NANO.md / .nano/rules) inlined into the system prompt; oversized files
+	// are truncated head/tail with an explicit notice. <= 0 uses the default (32KB).
+	InstructionFileMaxBytes int `mapstructure:"instruction_file_max_bytes" yaml:"instruction_file_max_bytes"`
+
 	// Tool management
 	EnabledTools  []string `mapstructure:"enabled_tools" yaml:"enabled_tools"`
 	DisabledTools []string `mapstructure:"disabled_tools" yaml:"disabled_tools"`
@@ -1157,6 +1162,7 @@ func DefaultConfig() *Config {
 		WebSearchTimeout:    10,              // 10 seconds
 		WebMaxContentSize:   2 * 1024 * 1024, // 2MB
 		WebSearchMaxResults: 10,
+		InstructionFileMaxBytes: 32 * 1024, // 32KB per instruction file
 		FileDiffMaxLines:    20,
 		GitMaxLogEntries:    100,
 		MemoryMaxEntries:    100,
@@ -1538,6 +1544,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	overrideIntFromEnv(&cfg.WebSearchMaxResults, "NANO_WEB_SEARCH_MAX_RESULTS")
 	overrideIntFromEnv(&cfg.FileDiffMaxLines, "NANO_FILE_DIFF_MAX_LINES")
 	overrideIntFromEnv(&cfg.GitMaxLogEntries, "NANO_GIT_MAX_LOG_ENTRIES")
+	overrideIntFromEnv(&cfg.InstructionFileMaxBytes, "NANO_INSTRUCTION_FILE_MAX_BYTES")
 	overrideIntFromEnv(&cfg.MemoryMaxEntries, "NANO_MEMORY_MAX_ENTRIES")
 
 	// Override with environment variables (boolean values)
@@ -2030,6 +2037,7 @@ func (c *Config) DeepCopy() *Config {
 		FileDiffMaxLines:    c.FileDiffMaxLines,
 		GitMaxLogEntries:    c.GitMaxLogEntries,
 		MemoryMaxEntries:    c.MemoryMaxEntries,
+		InstructionFileMaxBytes: c.InstructionFileMaxBytes,
 		EnableMCP:           c.EnableMCP,
 		ConfirmDestructive:  c.ConfirmDestructive,
 		Strict:              c.Strict,

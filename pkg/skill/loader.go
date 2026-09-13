@@ -28,6 +28,8 @@ type Manager struct {
 
 	activeSkills map[string]bool // currently activated skill names
 
+	activationCounts map[string]int // per-session activation counts (for /skill:doctor)
+
 	stateStore        *config.StateStore // optional persistent state store
 	builtinSkillNames map[string]bool
 }
@@ -68,6 +70,7 @@ func NewManager(workingDir string, personalDir, projectDir string, maxSkillSize 
 		skills:            make([]Skill, 0),
 		skillsByName:      make(map[string]int),
 		activeSkills:      make(map[string]bool),
+		activationCounts:  make(map[string]int),
 		builtinSkillNames: make(map[string]bool),
 	}
 }
@@ -224,6 +227,7 @@ func (m *Manager) ActivateSkill(name string) error {
 		return fmt.Errorf("maximum active skills (%d) reached", m.maxActiveSkills)
 	}
 	m.activeSkills[name] = true
+	m.activationCounts[name]++
 	if m.stateStore != nil {
 		m.stateStore.SetActiveSkills(m.getActiveSkillNames())
 		if err := m.stateStore.Save(); err != nil {
