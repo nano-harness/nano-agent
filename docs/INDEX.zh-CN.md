@@ -75,6 +75,8 @@
 - [E2E 测试](../e2e/README.md) - 端到端测试基础设施
 - [SWE-bench 测试](../swe_bench_test/README.md) - SWE-bench 评测脚本
 - [SWE-bench 测试（中文）](../swe_bench_test/README.zh-CN.md) - SWE-bench 评测脚本（中文）
+- [SWE-bench 评测报告](testing/SWE_BENCH.md) - 最新结果、方法论与复现命令
+- [SWE-bench 评测报告（中文）](testing/SWE_BENCH.zh-CN.md) - 最新结果、方法论与复现命令（中文）
 
 ## 参考资料
 

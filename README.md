@@ -1058,81 +1058,9 @@ Test files are located in `e2e/` and `swe_bench_test/`.
 
 ### SWE-bench Evaluation
 
-nano-agent has been evaluated on the SWE-bench benchmark, which tests the ability to resolve real-world GitHub issues. SWE-bench is a comprehensive benchmark that evaluates language models on software engineering tasks using actual GitHub issues and their corresponding fixes.
+nano-agent has been evaluated on a 31-instance subset of SWE-bench Verified, resolving **19 of 31 instances (61.3%)** with a 100% completion rate and zero errors or empty patches.
 
-#### Latest Test Results
-
-On a comprehensive test set of 31 instances, nano-agent achieved the following results:
-
-```json
-{
-    "total_instances": 31,
-    "submitted_instances": 31,
-    "completed_instances": 31,
-    "resolved_instances": 19,
-    "unresolved_instances": 12,
-    "empty_patch_instances": 0,
-    "error_instances": 0,
-    "success_rate": "61.3%"
-}
-```
-
-**Performance Summary:**
-- ✅ **Success Rate**: 61.3% (19/31 issues resolved)
-- ✅ **Completion Rate**: 100% (31/31 instances completed)
-- ✅ **Zero Errors**: No failed executions or empty patches
-
-**Resolved Issues (19 total):**
-- `django__django-10880` - Django framework issue
-- `django__django-10914` - Django framework issue
-- `django__django-11133` - Django framework issue
-- `matplotlib__matplotlib-13989` - Plotting library issue
-- `matplotlib__matplotlib-14623` - Plotting library issue
-- `matplotlib__matplotlib-23314` - Plotting library issue
-- `matplotlib__matplotlib-24149` - Plotting library issue
-- `matplotlib__matplotlib-25311` - Plotting library issue
-- `pydata__xarray-2905` - Data analysis library issue
-- `pydata__xarray-3095` - Data analysis library issue
-- `pytest-dev__pytest-5262` - Testing framework issue
-- `pytest-dev__pytest-5631` - Testing framework issue
-- `scikit-learn__scikit-learn-10297` - Machine learning library issue
-- `scikit-learn__scikit-learn-10844` - Machine learning library issue
-- `scikit-learn__scikit-learn-10908` - Machine learning library issue
-- `sympy__sympy-11618` - Symbolic mathematics library issue
-- `sympy__sympy-12096` - Symbolic mathematics library issue
-- `sympy__sympy-12419` - Symbolic mathematics library issue
-- `sympy__sympy-20590` - Symbolic mathematics library issue
-
-**Unresolved Issues (12 total):**
-- `astropy__astropy-12907` - Astronomy library issue
-- `astropy__astropy-13033` - Astronomy library issue
-- `astropy__astropy-13236` - Astronomy library issue
-- `astropy__astropy-14365` - Astronomy library issue
-- `astropy__astropy-14995` - Astronomy library issue
-- `django__django-10097` - Django framework issue
-- `django__django-10554` - Django framework issue
-- `django__django-11179` - Django framework issue
-- `matplotlib__matplotlib-20488` - Plotting library issue
-- `psf__requests-2317` - HTTP library issue
-- `sphinx-doc__sphinx-10323` - Documentation tool issue
-- `sphinx-doc__sphinx-10435` - Documentation tool issue
-
-#### Running SWE-bench Tests
-
-To run SWE-bench evaluation on nano-agent:
-
-```bash
-# Navigate to SWE-bench test directory
-cd swe_bench_test
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run evaluation
-python run_swe_bench.py
-```
-
-For more information about SWE-bench, visit the [official repository](https://github.com/princeton-nlp/SWE-bench).
+Full methodology, per-instance results, honest scope caveats, and reproduction instructions: [SWE-bench Evaluation Report](./docs/testing/SWE_BENCH.md).
 
 ## 🔧 Development
 

@@ -617,81 +617,9 @@ make benchmark
 
 ### SWE-bench评估
 
-nano-agent已在SWE-bench基准测试上进行了评估，该基准测试评估解决真实世界GitHub问题的能力。SWE-bench是一个综合基准，使用实际的GitHub问题及其相应的修复来评估语言模型在软件工程任务上的表现。
+nano-agent已在SWE-bench Verified的31个实例子集上进行了评估，解决了**31个实例中的19个（61.3%）**，完成率100%，无执行错误或空补丁。
 
-#### 最新测试结果
-
-在31个实例的综合测试集上，nano-agent取得了以下结果:
-
-```json
-{
-    "total_instances": 31,
-    "submitted_instances": 31,
-    "completed_instances": 31,
-    "resolved_instances": 19,
-    "unresolved_instances": 12,
-    "empty_patch_instances": 0,
-    "error_instances": 0,
-    "success_rate": "61.3%"
-}
-```
-
-**性能摘要:**
-- ✅ **成功率**: 61.3% (19/31个问题已解决)
-- ✅ **完成率**: 100% (31/31个实例已完成)
-- ✅ **零错误**: 没有失败的执行或空补丁
-
-**已解决的问题 (共19个):**
-- `django__django-10880` - Django框架问题
-- `django__django-10914` - Django框架问题
-- `django__django-11133` - Django框架问题
-- `matplotlib__matplotlib-13989` - 绘图库问题
-- `matplotlib__matplotlib-14623` - 绘图库问题
-- `matplotlib__matplotlib-23314` - 绘图库问题
-- `matplotlib__matplotlib-24149` - 绘图库问题
-- `matplotlib__matplotlib-25311` - 绘图库问题
-- `pydata__xarray-2905` - 数据分析库问题
-- `pydata__xarray-3095` - 数据分析库问题
-- `pytest-dev__pytest-5262` - 测试框架问题
-- `pytest-dev__pytest-5631` - 测试框架问题
-- `scikit-learn__scikit-learn-10297` - 机器学习库问题
-- `scikit-learn__scikit-learn-10844` - 机器学习库问题
-- `scikit-learn__scikit-learn-10908` - 机器学习库问题
-- `sympy__sympy-11618` - 符号数学库问题
-- `sympy__sympy-12096` - 符号数学库问题
-- `sympy__sympy-12419` - 符号数学库问题
-- `sympy__sympy-20590` - 符号数学库问题
-
-**未解决问题 (共12个):**
-- `astropy__astropy-12907` - 天文学库问题
-- `astropy__astropy-13033` - 天文学库问题
-- `astropy__astropy-13236` - 天文学库问题
-- `astropy__astropy-14365` - 天文学库问题
-- `astropy__astropy-14995` - 天文学库问题
-- `django__django-10097` - Django框架问题
-- `django__django-10554` - Django框架问题
-- `django__django-11179` - Django框架问题
-- `matplotlib__matplotlib-20488` - 绘图库问题
-- `psf__requests-2317` - HTTP库问题
-- `sphinx-doc__sphinx-10323` - 文档工具问题
-- `sphinx-doc__sphinx-10435` - 文档工具问题
-
-#### 运行SWE-bench测试
-
-要在nano-agent上运行SWE-bench评估:
-
-```bash
-# 导航到SWE-bench测试目录
-cd swe_bench_test
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 运行评估
-python run_swe_bench.py
-```
-
-有关SWE-bench的更多信息，请访问[官方仓库](https://github.com/princeton-nlp/SWE-bench)。
+完整的方法论、实例级结果、诚实口径说明与复现命令：[SWE-bench评测报告](./docs/testing/SWE_BENCH.zh-CN.md)。
 
 ## ⚙️ 配置
 

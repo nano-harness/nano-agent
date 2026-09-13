@@ -75,6 +75,8 @@ Testing infrastructure and guidelines:
 - [E2E Testing](../e2e/README.md) - End-to-end testing infrastructure
 - [SWE-bench Testing](../swe_bench_test/README.md) - SWE-bench evaluation scripts
 - [SWE-bench Testing (Chinese)](../swe_bench_test/README.zh-CN.md) - SWE-bench evaluation scripts (Chinese)
+- [SWE-bench Evaluation Report](testing/SWE_BENCH.md) - Latest results, methodology, and reproduction instructions
+- [SWE-bench Evaluation Report (Chinese)](testing/SWE_BENCH.zh-CN.md) - Latest results, methodology, and reproduction instructions (Chinese)
 
 ## References
 
