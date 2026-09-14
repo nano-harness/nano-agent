@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -41,8 +40,6 @@ type ContextAnalyzer struct{}
 func NewContextAnalyzer() *ContextAnalyzer {
 	return &ContextAnalyzer{}
 }
-
-const maxRecentContextFiles = 20
 
 // AnalyzeContext analyzes the working context without failing prompt construction
 // when optional filesystem or git probes are unavailable.
@@ -146,89 +143,6 @@ func detectProjectType(dir string) string {
 	return "unknown"
 }
 
-// getCodeFiles returns a list of code files in the directory.
-// Deprecated: use scanWorkspaceFiles instead. This is retained only for legacy
-// callers and is no longer used on the system prompt construction path.
-func getCodeFiles(dir string, maxFiles int) ([]string, error) {
-	var files []string
-	count := 0
-
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if count >= maxFiles {
-			return filepath.SkipDir
-		}
-
-		if info.IsDir() {
-			// Skip certain directories
-			basename := filepath.Base(path)
-			if basename == ".git" || basename == "node_modules" || basename == "vendor" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if isCodeFile(path) {
-			files = append(files, path)
-			count++
-		}
-
-		return nil
-	})
-
-	return files, err
-}
-
-func getRecentCodeFiles(dir string, maxFiles int) ([]string, error) {
-	type fileInfo struct {
-		path    string
-		modTime int64
-	}
-	var entries []fileInfo
-
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			basename := filepath.Base(path)
-			if basename == ".git" || basename == "node_modules" || basename == "vendor" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !isCodeFile(path) {
-			return nil
-		}
-		rel := path
-		if r, err := filepath.Rel(dir, path); err == nil {
-			rel = r
-		}
-		entries = append(entries, fileInfo{path: rel, modTime: info.ModTime().UnixNano()})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].modTime == entries[j].modTime {
-			return entries[i].path < entries[j].path
-		}
-		return entries[i].modTime > entries[j].modTime
-	})
-	if len(entries) > maxFiles {
-		entries = entries[:maxFiles]
-	}
-	files := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		files = append(files, entry.path)
-	}
-	return files, nil
-}
-
 func analyzeGitStatus(dir string) (*GitStatus, error) {
 	if _, err := runGitCommand(dir, "rev-parse", "--is-inside-work-tree"); err != nil {
 		return nil, err
@@ -279,39 +193,4 @@ func parseGitStatus(status *GitStatus, output []byte) {
 	}
 	status.HasChanges = len(status.Staged) > 0 || len(status.Modified) > 0 || len(status.Untracked) > 0
 	status.ModifiedCount = len(status.Staged) + len(status.Modified) + len(status.Untracked)
-}
-
-// isCodeFile checks if a file is a code file based on extension
-func isCodeFile(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	codeExtensions := map[string]bool{
-		".go":    true,
-		".js":    true,
-		".ts":    true,
-		".py":    true,
-		".java":  true,
-		".c":     true,
-		".cpp":   true,
-		".h":     true,
-		".hpp":   true,
-		".rs":    true,
-		".rb":    true,
-		".php":   true,
-		".cs":    true,
-		".kt":    true,
-		".swift": true,
-		".dart":  true,
-		".sql":   true,
-		".sh":    true,
-		".yaml":  true,
-		".yml":   true,
-		".json":  true,
-		".xml":   true,
-		".html":  true,
-		".css":   true,
-		".scss":  true,
-		".md":    true,
-	}
-
-	return codeExtensions[ext]
 }

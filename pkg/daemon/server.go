@@ -3694,7 +3694,7 @@ func (ds *Server) getSessionToolCallsHandler(w http.ResponseWriter, r *http.Requ
 	// In future, add session filtering logic here if tool scheduler tracks sessions
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id": sessionID,
 		"tool_calls": toolCalls,
 		"count":      len(toolCalls),
@@ -3719,7 +3719,7 @@ func (ds *Server) getToolCallStatusHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id": sessionID,
 		"tool_call":  toolCall,
 	})
@@ -3749,7 +3749,7 @@ func (ds *Server) cancelToolCallHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id": sessionID,
 		"call_id":    callID,
 		"status":     "cancelled",
@@ -3773,7 +3773,7 @@ func (ds *Server) getCompletedToolCallsHandler(w http.ResponseWriter, r *http.Re
 	// In future, add session filtering logic here
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id":      sessionID,
 		"completed_calls": completedCalls,
 		"count":           len(completedCalls),

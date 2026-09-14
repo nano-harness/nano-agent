@@ -13,7 +13,6 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/config"
 	"github.com/nano-harness/nano-agent/pkg/engine"
 	"github.com/nano-harness/nano-agent/pkg/filesearch"
-	"github.com/nano-harness/nano-agent/pkg/llm"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/slash"
 	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
@@ -133,9 +132,7 @@ type FullscreenModel struct {
 	engine              *engine.Engine
 
 	// Attachment manager for image paste and file input
-	attachmentMgr  *attachment.Manager
-	pendingImages  []llm.MultimodalImage
-	imageIndicator string
+	attachmentMgr *attachment.Manager
 
 	// bannerArt holds the rendered static product banner. When non-empty,
 	// renderMessageArea displays it while no messages exist.
@@ -184,7 +181,6 @@ type FullscreenModel struct {
 	streamingBuf    strings.Builder
 	isStreaming     bool
 	lastStreamFlush time.Time
-	streamingMsgID  string // ID of the active streaming FormattedMessage
 
 	// Local slash dispatcher mirrors the inline model so milktea handles
 	// /reviewer-style agent profile commands and built-in helpers locally.
@@ -1982,32 +1978,6 @@ func (m *FullscreenModel) buildThinkingPreview() string {
 	return strings.TrimSpace(strings.ReplaceAll(string(runes), "\n", " "))
 }
 
-func (m *FullscreenModel) expandedThinkingLines() []string {
-	lines := strings.Split(wordwrap.String(m.thinkingReasoning, m.thinkingWrapWidth()), "\n")
-	maxShow := len(lines)
-	if m.termHeight > 0 {
-		limit := m.termHeight / 3
-		if limit < 1 {
-			limit = 1
-		}
-		if maxShow > limit {
-			maxShow = limit
-		}
-	}
-	start := len(lines) - maxShow
-	if start < 0 {
-		start = 0
-	}
-	out := make([]string, 0, maxShow)
-	for _, line := range lines[start:] {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
-}
-
 func (m *FullscreenModel) resetThinkingState() {
 	m.thinkingTitle = ""
 	m.thinkingReasoning = ""
@@ -2101,26 +2071,6 @@ func (m *FullscreenModel) formatStatusForPhase(phase displayPhase, detail string
 	default:
 		return ""
 	}
-}
-
-func (m *FullscreenModel) renderContextBar() string {
-	if m.contextWindowMax <= 0 {
-		if m.contextUsedTokens > 0 {
-			return fmt.Sprintf("ctx: %s", formatCount(m.contextUsedTokens))
-		}
-		return ""
-	}
-	pct := float64(m.contextUsedTokens) / float64(m.contextWindowMax)
-	if pct < 0 {
-		pct = 0
-	}
-	if pct > 1 {
-		pct = 1
-	}
-	width := 10
-	filled := int(pct * float64(width))
-	bar := SafeProgressBar(filled, width, m.termCap)
-	return fmt.Sprintf("[%s] %d%%", bar, int(pct*100))
 }
 
 func (m *FullscreenModel) lastAssistantReply() string {

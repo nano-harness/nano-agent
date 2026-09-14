@@ -712,17 +712,6 @@ func (sm *SessionManager) UnregisterBackgroundCancel(sessionID string, idx int) 
 	sm.backgroundCancels[sessionID][idx] = nil
 }
 
-// cancelBackgroundsLocked cancels all registered background goroutines for a session.
-// Must be called while holding the write lock (sm.mutex).
-func (sm *SessionManager) cancelBackgroundsLocked(sessionID string) {
-	cancels := sm.popBackgroundCancelsLocked(sessionID)
-	for _, cancel := range cancels {
-		if cancel != nil {
-			cancel()
-		}
-	}
-}
-
 func (sm *SessionManager) popBackgroundCancelsLocked(sessionID string) []context.CancelFunc {
 	cancels := append([]context.CancelFunc(nil), sm.backgroundCancels[sessionID]...)
 	delete(sm.backgroundCancels, sessionID)

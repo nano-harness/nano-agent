@@ -346,11 +346,14 @@ func copyFile(src, dst string, mode os.FileMode) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return 0, err
 	}
-	defer out.Close()
-	return io.Copy(out, in)
+	n, err := io.Copy(out, in)
+	if cerr := out.Close(); cerr != nil && err == nil {
+		return n, cerr
+	}
+	return n, err
 }

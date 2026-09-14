@@ -39,12 +39,11 @@ func CreateAgentWorktree(baseDir, agentID string) (*WorktreeHandle, error) {
 	// Create worktree with a new branch from HEAD
 	cmd := exec.Command("git", "worktree", "add", "-b", branchName, worktreePath, "HEAD")
 	cmd.Dir = baseDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	if _, err := cmd.CombinedOutput(); err != nil {
 		// If branch already exists, try without -b
 		cmd = exec.Command("git", "worktree", "add", worktreePath, "HEAD")
 		cmd.Dir = baseDir
-		output, err = cmd.CombinedOutput()
+		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("git worktree add failed: %s: %w", strings.TrimSpace(string(output)), err)
 		}

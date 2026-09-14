@@ -46,7 +46,7 @@ func tryFlateDecode(in []byte) []byte {
 	if err != nil {
 		return nil
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	out, err := io.ReadAll(r)
 	if err != nil {
 		return nil

@@ -154,13 +154,6 @@ var readOnlyToolNames = map[string]bool{
 	"mcp_list_resources": true,
 }
 
-// readOnlyShellCommands lists shell command prefixes that are considered read-only.
-var readOnlyShellCommands = []string{
-	"ls", "cat", "head", "tail", "grep", "find", "git status", "git log",
-	"git diff", "git show", "pwd", "which", "echo", "env", "printenv",
-	"stat", "file", "wc", "sort", "uniq", "less", "more", "tree",
-}
-
 var readOnlyShellCommandNames = map[string]struct{}{
 	"ls":       {},
 	"cat":      {},

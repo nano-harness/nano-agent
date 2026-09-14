@@ -62,7 +62,7 @@ func (m *Manager) SaveFile(srcPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to open source file: %w", err)
 	}
-	defer srcFile.Close()
+	defer func() { _ = srcFile.Close() }()
 
 	// Get original filename and extension
 	basename := filepath.Base(srcPath)
@@ -77,10 +77,13 @@ func (m *Manager) SaveFile(srcPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create destination file: %w", err)
 	}
-	defer destFile.Close()
 
 	if _, err := io.Copy(destFile, srcFile); err != nil {
+		_ = destFile.Close()
 		return "", fmt.Errorf("failed to copy file: %w", err)
+	}
+	if err := destFile.Close(); err != nil {
+		return "", fmt.Errorf("failed to close destination file: %w", err)
 	}
 
 	return destPath, nil

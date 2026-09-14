@@ -13,9 +13,6 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 )
 
-// maxToolResultBytes is the per-message cap for tool result content before truncation.
-const maxToolResultBytes = 4096
-
 // CompressionInfo tracks compression statistics like Gemini CLI
 // inspired by google-gemini/gemini-cli ChatCompressionInfo
 type CompressionInfo struct {

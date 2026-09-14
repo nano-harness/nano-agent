@@ -111,9 +111,3 @@ func circuitBreakerRegistryKey(providerID, baseURL string) string {
 	}
 	return normalizedProvider + "|" + normalizedBaseURL
 }
-
-func resetCircuitBreakerRegistryForTest() {
-	sharedCircuitBreakers.mu.Lock()
-	defer sharedCircuitBreakers.mu.Unlock()
-	sharedCircuitBreakers.breakers = make(map[string]*CircuitBreaker)
-}

@@ -33,7 +33,7 @@ func FormatMessagesAsAttachment(messages []Message) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("# 📬 Mailbox Messages (%d new)\n\n", len(messages)))
+	fmt.Fprintf(&sb, "# 📬 Mailbox Messages (%d new)\n\n", len(messages))
 
 	for i, msg := range messages {
 		if i > 0 {
@@ -49,11 +49,11 @@ func FormatMessagesAsAttachment(messages []Message) string {
 func formatSingleMessage(msg Message) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("## Message from %s\n", msg.From))
-	sb.WriteString(fmt.Sprintf("**Topic:** %s\n", msg.Topic))
-	sb.WriteString(fmt.Sprintf("**Sent:** %s\n", formatTimestamp(msg.Timestamp)))
+	fmt.Fprintf(&sb, "## Message from %s\n", msg.From)
+	fmt.Fprintf(&sb, "**Topic:** %s\n", msg.Topic)
+	fmt.Fprintf(&sb, "**Sent:** %s\n", formatTimestamp(msg.Timestamp))
 	if msg.ReplyToID != "" {
-		sb.WriteString(fmt.Sprintf("**Reply to:** %s\n", msg.ReplyToID))
+		fmt.Fprintf(&sb, "**Reply to:** %s\n", msg.ReplyToID)
 	}
 	sb.WriteString("\n")
 

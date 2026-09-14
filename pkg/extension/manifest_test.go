@@ -94,7 +94,7 @@ func TestRegistryListsCommandExtensions(t *testing.T) {
 		Name:           "reviewer",
 		Description:    "Review code",
 		PermissionMode: "acceptEdits",
-		AllowedTools:   []string{"read_file"},
+		Tools:          []string{"read_file"},
 		Kind:           "in_process",
 		Source:         filepath.Join(t.TempDir(), ".nano", "agents", "reviewer.yaml"),
 	})

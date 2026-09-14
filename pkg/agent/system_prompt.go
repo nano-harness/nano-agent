@@ -1149,7 +1149,7 @@ func (spb *SystemPromptBuilder) buildTeammateAddendum(identity *swarm.TeammateId
 	var sb strings.Builder
 
 	sb.WriteString("# You are a Teammate Agent\n\n")
-	sb.WriteString(fmt.Sprintf("You are **%s**, a teammate agent in the **%s** team.\n\n", identity.AgentName, identity.TeamName))
+	fmt.Fprintf(&sb, "You are **%s**, a teammate agent in the **%s** team.\n\n", identity.AgentName, identity.TeamName)
 	sb.WriteString("## Your Responsibilities\n\n")
 	sb.WriteString("1. **Work on assigned subtasks**: Focus on the specific task assigned to you by the parent agent\n")
 	sb.WriteString("2. **Communicate progress**: Use `send_message` to report findings or request help\n")
@@ -1472,9 +1472,10 @@ func (spb *SystemPromptBuilder) buildOpenSpecSection() string {
 					continue
 				}
 				icon := "○"
-				if s == openspec.ArtifactStatusCreated {
+				switch s {
+				case openspec.ArtifactStatusCreated:
 					icon = "✓"
-				} else if s == openspec.ArtifactStatusReady {
+				case openspec.ArtifactStatusReady:
 					icon = "◆"
 				}
 				icons = append(icons, icon)

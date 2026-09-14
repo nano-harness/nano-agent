@@ -2,11 +2,6 @@ package llm
 
 import "net/http"
 
-// isAnthropicOverloadedStatus returns true for HTTP 529 (Anthropic-specific overloaded status).
-func isAnthropicOverloadedStatus(httpStatus int) bool {
-	return httpStatus == 529
-}
-
 // classifyAnthropicHTTPStatus maps Anthropic-specific HTTP status codes to
 // APIErrorInfo. Returns nil when the status is not a special Anthropic code so
 // the general handler can take over.

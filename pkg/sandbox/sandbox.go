@@ -337,24 +337,6 @@ func (p *PathChecker) AllowedPaths() []string {
 	return p.cfg.AllowedPaths
 }
 
-// expandHome expands ~ to the user's home directory.
-func expandHome(path string) string {
-	if !strings.HasPrefix(path, "~") {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	if path == "~" {
-		return home
-	}
-	if strings.HasPrefix(path, "~/") {
-		return filepath.Join(home, path[2:])
-	}
-	return path
-}
-
 // enforceDefaultBlocklist checks the given path against the always-enforced default blacklist.
 // Returns an error if the path matches any default blocked path, dir, or pattern.
 // This function is called unconditionally, even when sandbox is disabled.

@@ -682,7 +682,8 @@ func matchPattern(pattern, target string) bool {
 // isAlternationPattern returns true if pattern contains only alphanumeric, underscore, and pipe chars.
 func isAlternationPattern(pattern string) bool {
 	for _, c := range pattern {
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '|') {
+		isAlnum := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+		if !isAlnum && c != '_' && c != '|' {
 			return false
 		}
 	}

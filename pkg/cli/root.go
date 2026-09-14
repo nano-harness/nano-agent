@@ -835,9 +835,7 @@ func runTUIMode(cmd *cobra.Command, args []string) error {
 	}
 	var cwd string
 	cwd, _ = os.Getwd()
-	for _, raw := range allowlistStore.RulesForWorkdir(cwd) {
-		cfg.AllowedRules = append(cfg.AllowedRules, raw)
-	}
+	cfg.AllowedRules = append(cfg.AllowedRules, allowlistStore.RulesForWorkdir(cwd)...)
 
 	// Build the engine (agent + scheduler + watcher)
 	// Check if team-lead mode is requested
@@ -1065,8 +1063,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	}
 
 	// Prepare program (fullscreen models set AltScreen in their View() return)
-	var p *tea.Program
-	p = tea.NewProgram(m)
+	p := tea.NewProgram(m)
 
 	// Predeclare agentInstance for use in approval handler
 	var agentInstance *agent.Agent
@@ -1155,9 +1152,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 		logger.Warnf("Failed to load persistent allowlist: %v", err)
 	}
 	cwd, _ = os.Getwd()
-	for _, raw := range allowlistStore.RulesForWorkdir(cwd) {
-		cfg.AllowedRules = append(cfg.AllowedRules, raw)
-	}
+	cfg.AllowedRules = append(cfg.AllowedRules, allowlistStore.RulesForWorkdir(cwd)...)
 
 	// Build the engine (agent + scheduler + watcher).
 	// agentInstance is assigned here so related closures can resolve it.
@@ -1441,7 +1436,7 @@ func runBubbleTeaMode(cmd *cobra.Command, args []string) error {
 	// Run program (blocks)
 	if _, err := p.Run(); err != nil {
 		color.Red("Bubble Tea TUI error: %v", err)
-		return fmt.Errorf("Bubble Tea TUI error: %w", err)
+		return fmt.Errorf("bubble tea TUI error: %w", err)
 	}
 
 	color.Green("👋 Bubble Tea TUI session ended")

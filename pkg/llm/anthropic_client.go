@@ -163,7 +163,7 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 		totalTimeout = c.cfg.ResponseTimeout
 	}
 	streamCtx := ctx
-	cancel := func() {}
+	var cancel context.CancelFunc
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		streamCtx, cancel = context.WithTimeout(ctx, totalTimeout)
 	} else {

@@ -142,7 +142,7 @@ func formatGoalTranscriptBudgeted(messages []llm.Message, cfg goalTranscriptConf
 				}
 				if cutAt > 0 && cutAt < len(formatted) {
 					b.WriteString(formatted[:cutAt])
-					b.WriteString(fmt.Sprintf("...[message truncated %d bytes]\n", len(formatted)-cutAt))
+					fmt.Fprintf(&b, "...[message truncated %d bytes]\n", len(formatted)-cutAt)
 				}
 				truncated = true
 				stats.PreservedMessages++

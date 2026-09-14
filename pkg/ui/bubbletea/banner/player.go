@@ -39,21 +39,21 @@ func Play(w io.Writer, opts Options) error {
 	// Non-TTY or NO_COLOR: print only last frame static LOGO (no clear, no animation)
 	if !opts.Colorize {
 		if len(frames) > 0 {
-			fmt.Fprintln(w, RenderFrame(frames[len(frames)-1], opts.Theme, false))
+			_, _ = fmt.Fprintln(w, RenderFrame(frames[len(frames)-1], opts.Theme, false))
 		}
 		return nil
 	}
 
 	// Hide cursor
-	fmt.Fprint(w, "\x1b[?25l")
-	defer fmt.Fprint(w, "\x1b[?25h")
+	_, _ = fmt.Fprint(w, "\x1b[?25l")
+	defer func() { _, _ = fmt.Fprint(w, "\x1b[?25h") }()
 
 	for i, f := range frames {
 		// After first frame, move cursor up N lines back to banner top, then clear to screen end
 		if i > 0 {
 			clearRenderedFrame(w, frames[i-1].Content)
 		}
-		fmt.Fprintln(w, RenderFrame(f, opts.Theme, true))
+		_, _ = fmt.Fprintln(w, RenderFrame(f, opts.Theme, true))
 
 		select {
 		case <-ctx.Done():
@@ -92,7 +92,7 @@ func countLines(s string) int {
 }
 
 func clearRenderedFrame(w io.Writer, content string) {
-	fmt.Fprint(w, clearFrameSequence(content))
+	_, _ = fmt.Fprint(w, clearFrameSequence(content))
 }
 
 func clearFrameSequence(content string) string {

@@ -177,7 +177,7 @@ func (m *BackgroundTaskManager) Spawn(ctx context.Context, sessionID, command, w
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
+		_ = logFile.Close()
 		cancel()
 		return nil, fmt.Errorf("failed to start command: %w", err)
 	}
@@ -287,7 +287,7 @@ func (m *BackgroundTaskManager) ReadOutput(taskID string, fromOffset int64, bloc
 	if err != nil {
 		return "", fromOffset, task.GetStatus(), fmt.Errorf("failed to open log file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Seek to offset
 	if _, err := file.Seek(fromOffset, io.SeekStart); err != nil {

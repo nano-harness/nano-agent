@@ -79,44 +79,6 @@ func (t *Turn) skillPreprocessorStep(ctx context.Context, cfg *config.Config) pr
 	}
 }
 
-// preprocessOpenSpecCommand detects /opsx: commands in user input and enriches
-// the turn with OpenSpec context, system prompt additions, and modified user messages.
-func (t *Turn) preprocessOpenSpecCommand(cfg *config.Config) {
-	if cfg == nil || cfg.OpenSpec == nil || !cfg.OpenSpec.Enabled {
-		return
-	}
-
-	result := preprocessor.ProcessOpenSpecCommand(t.UserInput, preprocessor.OpenSpecOptions{
-		Enabled:         cfg.OpenSpec.Enabled,
-		RootDir:         cfg.OpenSpec.RootDir,
-		WorkingDir:      t.WorkingDir,
-		DefaultSchema:   cfg.OpenSpec.DefaultSchema,
-		MaxArtifactSize: cfg.OpenSpec.MaxArtifactSize,
-	})
-	if !result.Handled {
-		return
-	}
-
-	logger.Infof("Detected OpenSpec command: /opsx:%s (change: %s)", result.CommandType, result.ChangeName)
-	if result.Err != nil {
-		logger.Errorf("OpenSpec command failed: %v", result.Err)
-		t.UserInput = result.UserInput
-		return
-	}
-
-	t.UserInput = result.UserInput
-
-	// Inject additional system prompt context
-	if result.SystemPromptAddition != "" {
-		if t.systemPrompt == "" {
-			// Build the unified system prompt before appending the OpenSpec addition
-			t.systemPrompt = t.buildUnifiedSystemPrompt() + result.SystemPromptAddition
-		} else {
-			t.systemPrompt += result.SystemPromptAddition
-		}
-	}
-}
-
 // preprocessSkillCommand detects /skill: commands in user input and handles
 // skill activation/deactivation. It also performs auto-matching of skills
 // based on user input when auto_invoke is enabled.
@@ -241,20 +203,4 @@ func (t *Turn) handleSkillSlashCommand(ctx context.Context, sm *skill.Manager, i
 	default:
 		t.UserInput = fmt.Sprintf("Unknown skill command '/skill:%s'. Available commands: /skill:list, /skill:use <name>, /skill:off <name>, /skill:info <name>, /skill:install <url>", cmd)
 	}
-}
-
-// preprocessRoutinesCommand detects /routines slash commands and converts them
-// into LLM prompts that invoke the manage_routine tool.
-//
-// The implementation is now a single-step preprocessor.Pipeline so future
-// command-style preprocessors can be added by appending steps instead of
-// branching here.
-func (t *Turn) preprocessRoutinesCommand() {
-	pipeline := preprocessor.NewPipeline(preprocessor.RoutinesStep())
-	req := &preprocessor.Request{UserInput: t.UserInput, WorkingDir: t.WorkingDir}
-	if err := pipeline.Run(context.Background(), req); err != nil {
-		logger.Warnf("Routines preprocessing failed: %v", err)
-		return
-	}
-	t.UserInput = req.UserInput
 }

@@ -301,7 +301,7 @@ func (r *Registry) agentProfileManifests() []Manifest {
 				Description: "Applies an independent permission mode to the spawned teammate",
 			})
 		}
-		for _, tool := range profile.AllowedTools {
+		for _, tool := range profile.Tools {
 			permissions = append(permissions, Permission{
 				Type:        "tool_execution",
 				Scope:       tool,
@@ -333,7 +333,7 @@ func (r *Registry) agentProfileManifests() []Manifest {
 				"model":             profile.Model,
 				"context_providers": profile.ContextProviders,
 				"permission_mode":   profile.PermissionMode,
-				"allowed_tools":     profile.AllowedTools,
+				"allowed_tools":     profile.Tools,
 			},
 		})
 	}

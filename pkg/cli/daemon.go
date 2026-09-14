@@ -671,9 +671,7 @@ func runDaemonForeground() error {
 		logger.Warnf("Failed to load persistent allowlist: %v", err)
 	}
 	cwd, _ := os.Getwd()
-	for _, raw := range allowlistStore.RulesForWorkdir(cwd) {
-		cfg.AllowedRules = append(cfg.AllowedRules, raw)
-	}
+	cfg.AllowedRules = append(cfg.AllowedRules, allowlistStore.RulesForWorkdir(cwd)...)
 
 	// Create engine instance
 	eng, err := engine.New(cfg, engine.WithScheduler())

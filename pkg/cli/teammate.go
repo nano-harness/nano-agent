@@ -132,7 +132,7 @@ func runTeammate(cmd *cobra.Command, args []string) error {
 	eng.Agent.SetApprovalHandlerV2(func(*agent.ToolCallInfo) agent.ApprovalDecision {
 		return agent.ApprovalApproveOnce
 	})
-	defer eng.Shutdown()
+	defer func() { _ = eng.Shutdown() }()
 
 	// Run the teammate with initial prompt
 	err = runTeammateLoop(ctx, eng, identity, initialPrompt)

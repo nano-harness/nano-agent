@@ -602,28 +602,3 @@ func formatChangeStatus(status *ChangeStatus) string {
 
 	return sb.String()
 }
-
-// formatChangeStatusCompact formats a change status as a single line.
-func formatChangeStatusCompact(status *ChangeStatus) string {
-	var parts []string
-	artifactOrder := []string{"proposal", "specs", "design", "tasks"}
-	for _, id := range artifactOrder {
-		s, ok := status.ArtifactStatuses[id]
-		if !ok {
-			continue
-		}
-		icon := "○"
-		switch s {
-		case ArtifactStatusCreated:
-			icon = "✓"
-		case ArtifactStatusReady:
-			icon = "◆"
-		}
-		parts = append(parts, fmt.Sprintf("%s %s", icon, id))
-	}
-	line := fmt.Sprintf("- %s: %s", status.Name, strings.Join(parts, " | "))
-	if status.TasksTotal > 0 {
-		line += fmt.Sprintf(" (%d/%d tasks)", status.TasksCompleted, status.TasksTotal)
-	}
-	return line + "\n"
-}

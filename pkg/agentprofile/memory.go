@@ -75,9 +75,11 @@ func WriteAgentMemory(dirs MemoryDirs, level MemoryLevel, agentName, content str
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.WriteString(content + "\n")
-	return err
+	if _, err := f.WriteString(content + "\n"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // ReadAgentMemory reads the memory file for a specific agent at a given level.

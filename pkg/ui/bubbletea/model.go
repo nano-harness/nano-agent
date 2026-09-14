@@ -1453,11 +1453,6 @@ func (m *Model) setAgentStatus(phase displayPhase, detail string) {
 	m.status = m.formatStatusForPhase(phase, detail)
 }
 
-func (m *Model) transitionToDonePhase() {
-	m.currentPhase = phaseDone
-	m.status = m.formatStatusForPhase(phaseDone, "")
-}
-
 func (m *Model) formatStatusForPhase(phase displayPhase, detail string) string {
 	switch phase {
 	case phaseIdle:
@@ -2745,24 +2740,6 @@ func (m *Model) getLocalDispatcher() *slash.LocalDispatcher {
 		m.localDispatcher = d
 	}
 	return m.localDispatcher
-}
-
-// handleLocalSlashCommand dispatches the input through the shared
-// LocalDispatcher. It returns (true, cmd) when the dispatcher handled the
-// input (in which case the resulting message has already been appended to
-// the conversation), or (false, nil) for the caller to fall through to its
-// existing pipeline.
-//
-// Note: this helper does not surface the dispatcher's ShouldSubmit branch.
-// Callers that need to forward a rewritten command to the agent should call
-// the dispatcher directly and use recordLocalSlashResult to render local
-// messages.
-func (m *Model) handleLocalSlashCommand(input string) (bool, tea.Cmd) {
-	r := m.getLocalDispatcher().Dispatch(input)
-	if !r.Handled {
-		return false, nil
-	}
-	return m.recordLocalSlashResult(r)
 }
 
 // recordLocalSlashResult appends a dispatcher Result message to the

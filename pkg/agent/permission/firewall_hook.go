@@ -124,7 +124,7 @@ func (h *FirewallHook) Execute(ctx context.Context, event hookservice.Event, too
 	}
 
 	warnings := []string{
-		fmt.Sprintf("⚠️  Dangerous command detected"),
+		"⚠️  Dangerous command detected",
 		fmt.Sprintf("Command: %s", command),
 		fmt.Sprintf("Reason: %s", rule.Reason),
 		fmt.Sprintf("Severity: %s", rule.Severity),

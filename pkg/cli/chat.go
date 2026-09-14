@@ -94,9 +94,7 @@ func runChat(cmd *cobra.Command, args []string) error {
 		if err := allowlistStore.Load(); err != nil {
 			logger.Warnf("Failed to load persistent allowlist: %v", err)
 		}
-		for _, raw := range allowlistStore.RulesForWorkdir(cwd) {
-			cfg.AllowedRules = append(cfg.AllowedRules, raw)
-		}
+		cfg.AllowedRules = append(cfg.AllowedRules, allowlistStore.RulesForWorkdir(cwd)...)
 
 		// Resolve permission mode using unified resolver
 		res, warns := ResolvePermission(cfg, PermissionResolveOpts{

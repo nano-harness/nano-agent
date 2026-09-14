@@ -93,8 +93,8 @@ func (s *SandboxExecSandbox) WrapCommand(workingDir, cmd string, args []string) 
 		if !ok {
 			continue
 		}
-		switch {
-		case k == "PATH", k == "TERM", k == "LANG", k == "LC_ALL", k == "HOME":
+		switch k {
+		case "PATH", "TERM", "LANG", "LC_ALL", "HOME":
 			envArgs = append(envArgs, k+"="+v)
 		default:
 			if _, allowed := allowedNanoVars[k]; allowed {

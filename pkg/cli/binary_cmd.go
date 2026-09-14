@@ -79,7 +79,7 @@ claude -p --output-format json shape. Patch artifacts are written to --output-di
 			resultEmitted := false
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "panic recovered in binary exec: %v\n", r)
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "panic recovered in binary exec: %v\n", r)
 					if !resultEmitted {
 						emitPanicResult(cmd.OutOrStdout(), outputDir, r)
 					}
@@ -394,7 +394,7 @@ stdout emits byte-identical JSON to <output-dir>/result.json.`,
 			resultEmitted := false
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "panic recovered in swebench: %v\n", r)
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "panic recovered in swebench: %v\n", r)
 					if !resultEmitted {
 						emitPanicResult(cmd.OutOrStdout(), outputDir, r)
 					}
@@ -469,14 +469,4 @@ stdout emits byte-identical JSON to <output-dir>/result.json.`,
 	c.Flags().StringArrayVar(&disallowedTools, "disallowedTools", nil, "repeatable deny-pattern for tools")
 	_ = c.MarkFlagRequired("output-dir")
 	return c
-}
-
-// formatPresetsBrief is exported here so other CLI surfaces (e.g. /models)
-// can call it without re-implementing the format.
-func formatPresetsBrief(presets []llm.ProviderPreset) string {
-	var b strings.Builder
-	for _, p := range presets {
-		fmt.Fprintf(&b, "- %s (%s)\n", p.DisplayName, p.BaseURL)
-	}
-	return strings.TrimRight(b.String(), "\n")
 }

@@ -69,9 +69,9 @@ func (t *ListBackgroundTool) Execute(ctx context.Context, params map[string]inte
 
 	// Format as table
 	var output strings.Builder
-	output.WriteString(fmt.Sprintf("Background Tasks (%d):\n", len(tasks)))
+	fmt.Fprintf(&output, "Background Tasks (%d):\n", len(tasks))
 	output.WriteString("─────────────────────────────────────────────────────────────────────\n")
-	output.WriteString(fmt.Sprintf("%-10s %-12s %-8s %-20s %s\n", "TASK_ID", "STATUS", "EXIT", "STARTED", "COMMAND"))
+	fmt.Fprintf(&output, "%-10s %-12s %-8s %-20s %s\n", "TASK_ID", "STATUS", "EXIT", "STARTED", "COMMAND")
 	output.WriteString("─────────────────────────────────────────────────────────────────────\n")
 
 	for _, task := range tasks {
@@ -89,8 +89,8 @@ func (t *ListBackgroundTool) Execute(ctx context.Context, params map[string]inte
 			cmd = cmd[:37] + "..."
 		}
 
-		output.WriteString(fmt.Sprintf("%-10s %-12s %-8s %-20s %s\n",
-			task.ID, status, exitCode, started, cmd))
+		fmt.Fprintf(&output, "%-10s %-12s %-8s %-20s %s\n",
+			task.ID, status, exitCode, started, cmd)
 	}
 
 	content := output.String()

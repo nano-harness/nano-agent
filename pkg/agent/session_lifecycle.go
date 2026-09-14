@@ -54,10 +54,8 @@ func (h *hookEngineLifecycleAdapter) OnSessionLifecycle(ctx context.Context, ses
 		"session_id": sessionID,
 		"event":      string(ev),
 	}
-	if meta != nil {
-		for k, v := range meta {
-			params[k] = v
-		}
+	for k, v := range meta {
+		params[k] = v
 	}
 
 	_, err := h.hookEngine.Execute(ctx, hookEvent, "session_lifecycle", params)

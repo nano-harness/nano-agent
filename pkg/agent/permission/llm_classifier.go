@@ -69,7 +69,7 @@ func (c *LLMClassifier) Classify(ctx context.Context, req ClassifyRequest) (*Cla
 		var sb strings.Builder
 		sb.WriteString("\n\n<transcript>\n")
 		for _, entry := range req.Transcript {
-			sb.WriteString(fmt.Sprintf("[%s] %s\n", entry.Role, entry.Content))
+			fmt.Fprintf(&sb, "[%s] %s\n", entry.Role, entry.Content)
 		}
 		sb.WriteString("</transcript>")
 		transcriptBlock = sb.String()
@@ -143,9 +143,7 @@ func stripMarkdownFences(content string) string {
 	}
 
 	// Remove closing fence
-	if strings.HasSuffix(content, "```") {
-		content = strings.TrimSuffix(content, "```")
-	}
+	content = strings.TrimSuffix(content, "```")
 
 	return strings.TrimSpace(content)
 }

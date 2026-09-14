@@ -9,7 +9,6 @@ import (
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
-	"github.com/nano-harness/nano-agent/pkg/tools"
 )
 
 // cacheBoundaryMarker mirrors agent.CacheBoundaryMarker and is copied here to
@@ -348,22 +347,4 @@ func applyEphemeralToLastBlock(msg *anthropic.MessageParam) {
 	case last.OfImage != nil:
 		last.OfImage.CacheControl = cacheControl
 	}
-}
-
-// convertToolResults converts a slice of ToolResult to synthetic tool role messages.
-// This can be used to bridge ToolResult slices into the agent's Message format.
-func toolResultsAsMessages(results []tools.ToolResult) []Message {
-	msgs := make([]Message, 0, len(results))
-	for _, r := range results {
-		content := r.Content
-		if r.Error != "" {
-			content = fmt.Sprintf("Error: %s", r.Error)
-		}
-		msgs = append(msgs, Message{
-			Role:       "tool",
-			Content:    content,
-			ToolCallID: r.ID,
-		})
-	}
-	return msgs
 }

@@ -56,7 +56,7 @@ string to stdout. No sandbox is invoked; nothing is written to disk.`,
 			}
 
 			sb := sandbox.NewSandboxExecSandbox(cfg.Sandbox, workdir)
-			fmt.Fprint(cmd.OutOrStdout(), sb.BuildProfileForInspection())
+			_, _ = fmt.Fprint(cmd.OutOrStdout(), sb.BuildProfileForInspection())
 			return nil
 		},
 	}

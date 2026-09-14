@@ -14,10 +14,6 @@ func (t *Turn) events() turnEventEmitter {
 	}
 }
 
-func (e turnEventEmitter) emit(eventType event.EventType, content string, metadata map[string]interface{}) {
-	e.emitPayload(eventType, content, metadata, nil)
-}
-
 func (e turnEventEmitter) emitPayload(eventType event.EventType, content string, metadata map[string]interface{}, payload interface{}) {
 	if e.handler == nil {
 		return

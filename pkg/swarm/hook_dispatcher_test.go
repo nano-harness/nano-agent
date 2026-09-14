@@ -34,7 +34,11 @@ func TestSwarmHookDispatcherFiresLifecycleEvents(t *testing.T) {
 		{Name: "sub-stop", Event: middleware.HookSubagentStop, Pattern: "*", Command: stopScript, Enabled: true},
 		{Name: "tm-idle", Event: middleware.HookNotification, Pattern: "*", Command: idleScript, Enabled: true},
 	}
-	engine := middleware.NewHookEngine(hooks)
+	// Hook execution is synchronous, but spawning the shell script can take
+	// seconds on a heavily loaded machine (e.g. full `make test` runs). The
+	// hookservice default timeout (5s) would kill the script and fail open
+	// with a warning, so give this test ample headroom.
+	engine := middleware.NewHookEngineWithOptions(hooks, middleware.HookOptions{Timeout: time.Minute})
 	d := NewSwarmHookDispatcher(engine)
 	if d == nil {
 		t.Fatal("dispatcher should not be nil")
@@ -57,12 +61,10 @@ func TestSwarmHookDispatcherFiresLifecycleEvents(t *testing.T) {
 		t.Fatalf("DispatchSubagentStop: %v", err)
 	}
 
+	// Dispatch is synchronous: when each call returns, its hook script has
+	// already run to completion, so the recording logs must exist.
 	for _, p := range []string{startLog, idleLog, stopLog} {
-		p := p
-		require.Eventually(t, func() bool {
-			_, err := os.Stat(p)
-			return err == nil
-		}, 10*time.Second, 50*time.Millisecond, "expected hook log %s", p)
+		require.FileExists(t, p, "expected hook log %s", p)
 	}
 }
 

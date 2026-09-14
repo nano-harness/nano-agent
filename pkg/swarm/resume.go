@@ -97,7 +97,7 @@ func BuildResumePrompt(resumeResult *ResumeResult) string {
 
 	var sb strings.Builder
 	sb.WriteString("## Resumed from previous session\n\n")
-	sb.WriteString(fmt.Sprintf("Resuming with %d transcript entries from previous execution.\n", len(resumeResult.Transcript)))
+	fmt.Fprintf(&sb, "Resuming with %d transcript entries from previous execution.\n", len(resumeResult.Transcript))
 	sb.WriteString("Continue from where you left off.\n")
 
 	return sb.String()

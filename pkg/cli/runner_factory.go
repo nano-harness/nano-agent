@@ -38,7 +38,7 @@ func runDefaultTeammate(ctx context.Context, identity *swarm.TeammateIdentity, i
 	eng.Agent.SetApprovalHandlerV2(func(*agent.ToolCallInfo) agent.ApprovalDecision {
 		return agent.ApprovalApproveOnce
 	})
-	defer eng.Shutdown()
+	defer func() { _ = eng.Shutdown() }()
 
 	ctx = swarm.WithTeammate(ctx, identity)
 	sessionID := nanoruntime.BuildTeammateSessionID(identity.TeamName, identity.AgentName)

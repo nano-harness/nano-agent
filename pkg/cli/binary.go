@@ -249,7 +249,7 @@ type binaryAgentContext struct {
 // resolution, directory change, agent creation, session/goal setup.
 // Callers must invoke cleanup() when done.
 func prepareBinaryAgent(prompt, projectPath string, opts binaryOptions, mode string) (*binaryAgentContext, error) {
-	prompt, goalCondition, goalFromPrompt := prepareBinaryGoal(prompt, opts)
+	_, goalCondition, goalFromPrompt := prepareBinaryGoal(prompt, opts)
 	cfg := config.Get()
 	if cfg == nil {
 		return nil, fmt.Errorf("configuration not initialized")

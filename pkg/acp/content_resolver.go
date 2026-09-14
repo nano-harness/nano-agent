@@ -66,20 +66,14 @@ func formatResourceAsContext(resource *ResourceContent) string {
 
 	var sb strings.Builder
 
-	// Extract filename from URI if available
-	uri := resource.URI
-	filename := filepath.Base(uri)
-	if filename == "." || filename == "/" {
-		filename = uri
-	}
-
 	// Infer language from URI
+	uri := resource.URI
 	lang := inferLanguageFromURI(uri)
 
 	// Format as markdown code block for text resources
 	if resource.Text != "" {
-		sb.WriteString(fmt.Sprintf("\n```%s\n", lang))
-		sb.WriteString(fmt.Sprintf("# File: %s\n", uri))
+		fmt.Fprintf(&sb, "\n```%s\n", lang)
+		fmt.Fprintf(&sb, "# File: %s\n", uri)
 		sb.WriteString(resource.Text)
 		if !strings.HasSuffix(resource.Text, "\n") {
 			sb.WriteString("\n")
@@ -87,9 +81,9 @@ func formatResourceAsContext(resource *ResourceContent) string {
 		sb.WriteString("```\n")
 	} else if resource.Blob != "" {
 		// Binary content - just note its presence
-		sb.WriteString(fmt.Sprintf("\n[Binary file: %s (mime: %s)]\n", uri, resource.MimeType))
+		fmt.Fprintf(&sb, "\n[Binary file: %s (mime: %s)]\n", uri, resource.MimeType)
 	} else {
-		sb.WriteString(fmt.Sprintf("\n[Resource: %s]\n", uri))
+		fmt.Fprintf(&sb, "\n[Resource: %s]\n", uri)
 	}
 
 	return sb.String()
@@ -133,8 +127,8 @@ func (s *Server) resolveResourceLink(uri string, cwd string) (string, error) {
 	// Format as context with file path
 	lang := inferLanguageFromURI(filePath)
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("\n```%s\n", lang))
-	sb.WriteString(fmt.Sprintf("# File: %s\n", filePath))
+	fmt.Fprintf(&sb, "\n```%s\n", lang)
+	fmt.Fprintf(&sb, "# File: %s\n", filePath)
 	sb.WriteString(string(content))
 	if !strings.HasSuffix(string(content), "\n") {
 		sb.WriteString("\n")

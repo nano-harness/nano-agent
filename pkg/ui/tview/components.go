@@ -240,7 +240,7 @@ func (i *InputField) SetDisabled(disabled bool) {
 
 // IsDisabled returns whether the input field is disabled.
 func (i *InputField) IsDisabled() bool {
-	return i.TextArea.GetDisabled()
+	return i.GetDisabled()
 }
 
 // SetTextColor sets the text color

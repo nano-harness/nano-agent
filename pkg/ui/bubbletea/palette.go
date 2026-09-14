@@ -28,10 +28,4 @@ const (
 
 	// paletteSystem is the warm gold for system / thinking messages.
 	paletteSystem = "179" // warm gold   – system / thinking
-
-	// paletteMuted is the medium gray used for borders, help text, separators.
-	paletteMuted = "245"
-
-	// paletteDetail is the light gray for detail / description text.
-	paletteDetail = "252"
 )

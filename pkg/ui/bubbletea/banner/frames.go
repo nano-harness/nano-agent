@@ -4,7 +4,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 )
@@ -89,14 +88,4 @@ func TotalDuration(frames []Frame) time.Duration {
 		total += f.Duration
 	}
 	return total
-}
-
-// sortedKeys is used to stabilize colors iteration (test-only).
-func sortedKeys(m map[string]AnimationElement) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

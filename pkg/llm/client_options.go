@@ -45,10 +45,6 @@ func newOpenAIRequestOptions(apiKey, baseURL string, cfg *config.Config) []optio
 	return opts
 }
 
-func newCircuitBreakerFromConfig(cfg *config.Config) *CircuitBreaker {
-	return newCircuitBreakerForRoute("", "", cfg)
-}
-
 func newCircuitBreakerForRoute(providerID, baseURL string, cfg *config.Config) *CircuitBreaker {
 	cbCfg := DefaultCircuitBreakerConfig()
 	if cfg != nil && cfg.Advanced != nil && cfg.Advanced.CircuitBreaker != nil {
