@@ -901,10 +901,12 @@ func (cs *CompressionStrategy) CompressMessages(ctx context.Context, client llm.
 		toPreserve = toPreserve[1:]
 	}
 
-	// 2) Add compressed summary as a user message (not modifying system prompt)
+	// 2) Add compressed summary as a user message (not modifying system prompt).
+	// The artifact manifest is appended deterministically from tool call records:
+	// it is not part of the LLM summary and stays intact after compression.
 	summaryMsg := llm.Message{
 		Role:    "user",
-		Content: fmt.Sprintf("<!-- COMPRESSED CONTEXT -->\n%s\n<!-- END COMPRESSED CONTEXT -->", summary),
+		Content: cs.appendArtifactManifest(fmt.Sprintf("<!-- COMPRESSED CONTEXT -->\n%s\n<!-- END COMPRESSED CONTEXT -->", summary), toCompress),
 	}
 	compressedMessages = append(compressedMessages, summaryMsg)
 
@@ -956,6 +958,33 @@ func (cs *CompressionStrategy) CompressMessages(ctx context.Context, client llm.
 	return compressedMessages, compressionInfo, nil
 }
 
+// artifactTrackingEnabled reports whether deterministic artifact tracking is
+// enabled. It defaults to on when no config is available.
+func (cs *CompressionStrategy) artifactTrackingEnabled() bool {
+	if cs.cfg == nil {
+		return true
+	}
+	return cs.cfg.ContextConfig.EnableArtifactTracking
+}
+
+// appendArtifactManifest appends the session artifact manifest (files
+// written/modified/deleted) to a compressed-context message. The manifest is
+// extracted deterministically from tool call records — never from the LLM
+// summary — and must survive compression intact so the agent can keep doing
+// correct incremental edits afterwards. SourceMessages are the messages being
+// compressed away; any manifest they contain from an earlier compaction is
+// merged in by ExtractArtifactRecords.
+func (cs *CompressionStrategy) appendArtifactManifest(content string, sourceMessages []llm.Message) string {
+	if !cs.artifactTrackingEnabled() {
+		return content
+	}
+	manifest := FormatArtifactManifest(ExtractArtifactRecords(sourceMessages))
+	if manifest == "" {
+		return content
+	}
+	return content + "\n\n" + manifest
+}
+
 // fallbackTruncate implements a simple truncation strategy when LLM summarization fails.
 // It preserves system messages and the most recent conversation turns.
 func (cs *CompressionStrategy) fallbackTruncate(messages []llm.Message) ([]llm.Message, *CompressionInfo, error) {
@@ -993,6 +1022,16 @@ func (cs *CompressionStrategy) fallbackTruncate(messages []llm.Message) ([]llm.M
 	for i := recentStart; i < len(messages); i++ {
 		if messages[i].Role != "system" || i >= systemCount {
 			result = append(result, messages[i])
+		}
+	}
+
+	// Attach a deterministic artifact manifest covering the dropped history so
+	// file mutation knowledge survives the fallback path as well. Insert it
+	// right after the system messages to keep it ahead of recent turns.
+	if cs.artifactTrackingEnabled() {
+		if manifest := FormatArtifactManifest(ExtractArtifactRecords(messages)); manifest != "" {
+			manifestMsg := llm.Message{Role: "user", Content: manifest}
+			result = append(result[:systemCount], append([]llm.Message{manifestMsg}, result[systemCount:]...)...)
 		}
 	}
 

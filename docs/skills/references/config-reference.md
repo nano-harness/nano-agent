@@ -77,6 +77,11 @@ context:
   compression_ratio: 0.25         # Target compression ratio
   preserve_recent_turns: 6        # Always keep N recent turns
   enable_compression: true        # Enable auto-compression
+  enable_context_editing: true    # Clear stale tool results before compaction
+  edit_trigger_ratio: 0.5         # Edit when usage exceeds 50% of the budget
+  edit_stale_turns: 4             # Tool results older than N turns are stale
+  edit_keep_recent_turns: 3       # Most recent N turns are never edited
+  enable_artifact_tracking: true  # Attach deterministic file-mutation manifest to compactions
 ```
 
 **Modes:** All modes
@@ -504,6 +509,11 @@ Complete list of environment variables:
 - `NANO_CONTEXT_MAX_TOKENS` → `context.max_tokens`
 - `NANO_CONTEXT_COMPRESSION_RATIO` → `context.compression_ratio`
 - `NANO_CONTEXT_PRESERVE_RECENT_TURNS` → `context.preserve_recent_turns`
+- `NANO_CONTEXT_ENABLE_CONTEXT_EDITING` → `context.enable_context_editing`
+- `NANO_CONTEXT_EDIT_TRIGGER_RATIO` → `context.edit_trigger_ratio`
+- `NANO_CONTEXT_EDIT_STALE_TURNS` → `context.edit_stale_turns`
+- `NANO_CONTEXT_EDIT_KEEP_RECENT_TURNS` → `context.edit_keep_recent_turns`
+- `NANO_CONTEXT_ENABLE_ARTIFACT_TRACKING` → `context.enable_artifact_tracking`
 
 ### Memory
 - `NANO_MEMORY_API_KEY` → `memory.api_key`

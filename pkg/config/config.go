@@ -988,6 +988,14 @@ type ContextConfig struct {
 	PreserveRecentTurns int     `mapstructure:"preserve_recent_turns" yaml:"preserve_recent_turns"` // Default: 4
 	EnableCompression   bool    `mapstructure:"enable_compression" yaml:"enable_compression"`       // Default: true
 	ModelContextWindow  int     `mapstructure:"model_context_window" yaml:"model_context_window"`   // Override inferred context window size
+
+	// Context editing: cheap, deterministic clearing of stale tool results that
+	// runs before (and independently of) LLM compaction.
+	EnableContextEditing   bool    `mapstructure:"enable_context_editing" yaml:"enable_context_editing"`     // Default: true
+	EditTriggerRatio       float64 `mapstructure:"edit_trigger_ratio" yaml:"edit_trigger_ratio"`             // Default: 0.5 (edit earlier than compaction)
+	EditStaleTurns         int     `mapstructure:"edit_stale_turns" yaml:"edit_stale_turns"`                 // Default: 4 (turns older than this are stale)
+	EditKeepRecentTurns    int     `mapstructure:"edit_keep_recent_turns" yaml:"edit_keep_recent_turns"`     // Default: 3 (recent turns always kept intact)
+	EnableArtifactTracking bool    `mapstructure:"enable_artifact_tracking" yaml:"enable_artifact_tracking"` // Default: true
 }
 
 // OpenSpecConfig configures OpenSpec (spec-driven development) integration.
@@ -1156,23 +1164,28 @@ func DefaultConfig() *Config {
 		HTTPTimeout:     180 * time.Second,
 
 		// Tool-specific configurations
-		ReadFileMaxLines:    200,
-		SearchMaxResults:    20,
-		WebRequestTimeout:   30,              // 30 seconds
-		WebSearchTimeout:    10,              // 10 seconds
-		WebMaxContentSize:   2 * 1024 * 1024, // 2MB
-		WebSearchMaxResults: 10,
+		ReadFileMaxLines:        200,
+		SearchMaxResults:        20,
+		WebRequestTimeout:       30,              // 30 seconds
+		WebSearchTimeout:        10,              // 10 seconds
+		WebMaxContentSize:       2 * 1024 * 1024, // 2MB
+		WebSearchMaxResults:     10,
 		InstructionFileMaxBytes: 32 * 1024, // 32KB per instruction file
-		FileDiffMaxLines:    20,
-		GitMaxLogEntries:    100,
-		MemoryMaxEntries:    100,
+		FileDiffMaxLines:        20,
+		GitMaxLogEntries:        100,
+		MemoryMaxEntries:        100,
 
 		// Default context management settings (auto-tuned via model registry)
 		ContextConfig: ContextConfig{
-			MaxTokens:           0, // 0 = auto-detect from model registry
-			CompressionRatio:    0, // 0 = use registry-derived threshold; non-zero = explicit user override
-			PreserveRecentTurns: 6,
-			EnableCompression:   true,
+			MaxTokens:              0, // 0 = auto-detect from model registry
+			CompressionRatio:       0, // 0 = use registry-derived threshold; non-zero = explicit user override
+			PreserveRecentTurns:    6,
+			EnableCompression:      true,
+			EnableContextEditing:   true,
+			EditTriggerRatio:       0.5,
+			EditStaleTurns:         4,
+			EditKeepRecentTurns:    3,
+			EnableArtifactTracking: true,
 		},
 
 		// Default reasoning configuration
@@ -1581,6 +1594,11 @@ func LoadConfig(configPath string) (*Config, error) {
 	overrideIntFromEnv(&cfg.ContextConfig.PreserveRecentTurns, "NANO_CONTEXT_PRESERVE_RECENT_TURNS")
 	overrideBoolFromEnv(&cfg.ContextConfig.EnableCompression, "NANO_CONTEXT_ENABLE_COMPRESSION")
 	overrideIntFromEnv(&cfg.ContextConfig.ModelContextWindow, "NANO_CONTEXT_MODEL_WINDOW")
+	overrideBoolFromEnv(&cfg.ContextConfig.EnableContextEditing, "NANO_CONTEXT_ENABLE_CONTEXT_EDITING")
+	overrideFloatFromEnv(&cfg.ContextConfig.EditTriggerRatio, "NANO_CONTEXT_EDIT_TRIGGER_RATIO")
+	overrideIntFromEnv(&cfg.ContextConfig.EditStaleTurns, "NANO_CONTEXT_EDIT_STALE_TURNS")
+	overrideIntFromEnv(&cfg.ContextConfig.EditKeepRecentTurns, "NANO_CONTEXT_EDIT_KEEP_RECENT_TURNS")
+	overrideBoolFromEnv(&cfg.ContextConfig.EnableArtifactTracking, "NANO_CONTEXT_ENABLE_ARTIFACT_TRACKING")
 
 	// Override Daemon configuration from environment
 	if cfg.Daemon == nil {
@@ -2018,33 +2036,33 @@ func (c *Config) DeepCopy() *Config {
 
 	// Create a new config with all scalar fields copied
 	copied := &Config{
-		APIKey:              c.APIKey,
-		BaseURL:             c.BaseURL,
-		Model:               c.Model,
-		Verbose:             c.Verbose,
-		WorkingDir:          c.WorkingDir,
-		IsSubAgent:          c.IsSubAgent,
-		IsDaemon:            c.IsDaemon,
-		MaxFileSize:         c.MaxFileSize,
-		ResponseTimeout:     c.ResponseTimeout,
-		HTTPTimeout:         c.HTTPTimeout,
-		ReadFileMaxLines:    c.ReadFileMaxLines,
-		SearchMaxResults:    c.SearchMaxResults,
-		WebRequestTimeout:   c.WebRequestTimeout,
-		WebSearchTimeout:    c.WebSearchTimeout,
-		WebMaxContentSize:   c.WebMaxContentSize,
-		WebSearchMaxResults: c.WebSearchMaxResults,
-		FileDiffMaxLines:    c.FileDiffMaxLines,
-		GitMaxLogEntries:    c.GitMaxLogEntries,
-		MemoryMaxEntries:    c.MemoryMaxEntries,
+		APIKey:                  c.APIKey,
+		BaseURL:                 c.BaseURL,
+		Model:                   c.Model,
+		Verbose:                 c.Verbose,
+		WorkingDir:              c.WorkingDir,
+		IsSubAgent:              c.IsSubAgent,
+		IsDaemon:                c.IsDaemon,
+		MaxFileSize:             c.MaxFileSize,
+		ResponseTimeout:         c.ResponseTimeout,
+		HTTPTimeout:             c.HTTPTimeout,
+		ReadFileMaxLines:        c.ReadFileMaxLines,
+		SearchMaxResults:        c.SearchMaxResults,
+		WebRequestTimeout:       c.WebRequestTimeout,
+		WebSearchTimeout:        c.WebSearchTimeout,
+		WebMaxContentSize:       c.WebMaxContentSize,
+		WebSearchMaxResults:     c.WebSearchMaxResults,
+		FileDiffMaxLines:        c.FileDiffMaxLines,
+		GitMaxLogEntries:        c.GitMaxLogEntries,
+		MemoryMaxEntries:        c.MemoryMaxEntries,
 		InstructionFileMaxBytes: c.InstructionFileMaxBytes,
-		EnableMCP:           c.EnableMCP,
-		ConfirmDestructive:  c.ConfirmDestructive,
-		Strict:              c.Strict,
-		CustomSystemPrompt:  c.CustomSystemPrompt,
-		PermissionMode:      c.PermissionMode,
-		EnablePprof:         c.EnablePprof,
-		PprofPort:           c.PprofPort,
+		EnableMCP:               c.EnableMCP,
+		ConfirmDestructive:      c.ConfirmDestructive,
+		Strict:                  c.Strict,
+		CustomSystemPrompt:      c.CustomSystemPrompt,
+		PermissionMode:          c.PermissionMode,
+		EnablePprof:             c.EnablePprof,
+		PprofPort:               c.PprofPort,
 	}
 
 	// Deep copy slices
@@ -2096,11 +2114,16 @@ func (c *Config) DeepCopy() *Config {
 
 	// Deep copy ContextConfig
 	copied.ContextConfig = ContextConfig{
-		MaxTokens:           c.ContextConfig.MaxTokens,
-		CompressionRatio:    c.ContextConfig.CompressionRatio,
-		PreserveRecentTurns: c.ContextConfig.PreserveRecentTurns,
-		EnableCompression:   c.ContextConfig.EnableCompression,
-		ModelContextWindow:  c.ContextConfig.ModelContextWindow,
+		MaxTokens:              c.ContextConfig.MaxTokens,
+		CompressionRatio:       c.ContextConfig.CompressionRatio,
+		PreserveRecentTurns:    c.ContextConfig.PreserveRecentTurns,
+		EnableCompression:      c.ContextConfig.EnableCompression,
+		ModelContextWindow:     c.ContextConfig.ModelContextWindow,
+		EnableContextEditing:   c.ContextConfig.EnableContextEditing,
+		EditTriggerRatio:       c.ContextConfig.EditTriggerRatio,
+		EditStaleTurns:         c.ContextConfig.EditStaleTurns,
+		EditKeepRecentTurns:    c.ContextConfig.EditKeepRecentTurns,
+		EnableArtifactTracking: c.ContextConfig.EnableArtifactTracking,
 	}
 
 	// Deep copy Memory

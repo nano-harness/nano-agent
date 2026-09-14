@@ -28,6 +28,7 @@ Feature-specific documentation:
 - [Intelligent Orchestration](features/INTELLIGENT_ORCHESTRATION.md) - Smart task distribution and sub-agent routing
 - [Hooks System](features/HOOKS.md) - Hook loading and execution service
 - [Shell Output Budgets](features/SHELL_OUTPUT.md) - Configurable inline output limits with spill-to-file
+- [Context Engineering](features/CONTEXT_ENGINEERING.md) - Context editing (stale tool-result clearing) and deterministic artifact tracking
 - [Extensions](features/EXTENSIONS.md) - Extension manifests for skills, MCP servers, tools, and agents
 - [MCP OAuth](features/MCP_OAUTH.md) - OAuth integration for MCP servers
 

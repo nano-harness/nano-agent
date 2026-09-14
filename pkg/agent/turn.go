@@ -120,6 +120,9 @@ type Turn struct {
 	wasCompressed       bool
 	lastCompressionInfo *CompressionInfo
 
+	// Context editing (cheap pre-compaction clearing of stale tool results)
+	contextEditor *ContextEditor
+
 	// Completion criteria and stopping conditions
 	CompletionCriteria *CompletionCriteria
 
@@ -435,6 +438,51 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 	return nil
 }
 
+// maybeEditContext applies context editing — deterministic clearing of stale
+// tool results — when the context approaches the budget. Editing is cheaper
+// than compaction (no LLM call) and runs first; compaction remains the
+// fallback. See ContextEditor for the design constraints (stable turn
+// boundaries, idempotent placeholders, trigger-before-compaction).
+func (t *Turn) maybeEditContext() {
+	if t.agentConfig != nil && !t.agentConfig.ContextConfig.EnableContextEditing {
+		return
+	}
+	if len(t.Messages) == 0 {
+		return
+	}
+
+	compressionStrategy := t.compressionStrategy
+	if compressionStrategy == nil {
+		compressionStrategy = NewCompressionStrategy(t.agentConfig)
+		t.compressionStrategy = compressionStrategy
+	}
+	if t.contextEditor == nil {
+		t.contextEditor = NewContextEditor(t.agentConfig, compressionStrategy)
+	}
+
+	currentTokens := compressionStrategy.EstimateTokenCountWithSystemPrompt(t.Messages, t.systemPrompt)
+	if !t.contextEditor.ShouldEdit(t.Messages, currentTokens) {
+		return
+	}
+
+	edited, cleared := t.contextEditor.EditContext(t.Messages)
+	if cleared == 0 {
+		return
+	}
+	afterTokens := compressionStrategy.EstimateTokenCount(edited)
+	t.Messages = edited
+	logger.Infof("Context edited: cleared %d stale tool results, ~%d → ~%d tokens", cleared, currentTokens, afterTokens)
+
+	if t.eventHandler != nil {
+		evt := event.NewStreamEvent(event.EventTypeCompression, "agent_turn")
+		evt = evt.WithContent(fmt.Sprintf("🧹 Context edited: cleared %d stale tool results (~%d → ~%d tokens)",
+			cleared, currentTokens, afterTokens))
+		evt = evt.WithMetadata("kind", "context_editing")
+		evt = evt.WithMetadata("cleared_results", fmt.Sprintf("%d", cleared))
+		t.eventHandler(evt)
+	}
+}
+
 // ShouldCompress determines if compression is needed
 func (t *Turn) ShouldCompress() bool {
 	if t.agentConfig != nil && !t.agentConfig.ContextConfig.EnableCompression {
@@ -740,7 +788,13 @@ func (t *Turn) requestOpenAIAPI(ctx context.Context) (string, []*tools.ToolCall,
 	// 2) Append current user input once (avoid duplicates)
 	t.ensureUserMessage()
 
-	// 3) Check and perform context compression before LLM call
+	// 3) Context editing first: clear stale tool results (cheap, no LLM call).
+	// Editing runs at a lower utilization ratio than compaction and only at
+	// stable turn boundaries, keeping the prompt-cache prefix deterministic.
+	// Compaction below remains the fallback when editing is not enough.
+	t.maybeEditContext()
+
+	// 4) Check and perform context compression before LLM call
 	// System prompt is already ensured above; ShouldCompress counts system tokens.
 	if t.ShouldCompress() {
 		logger.Infof("Context nearing token threshold, performing compression before LLM call")
