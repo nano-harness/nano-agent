@@ -31,6 +31,8 @@ Feature-specific documentation:
 - [Context Engineering](features/CONTEXT_ENGINEERING.md) - Context editing (stale tool-result clearing) and deterministic artifact tracking
 - [Extensions](features/EXTENSIONS.md) - Extension manifests for skills, MCP servers, tools, and agents
 - [MCP OAuth](features/MCP_OAUTH.md) - OAuth integration for MCP servers
+- [Observability](features/OBSERVABILITY.md) - OpenTelemetry GenAI tracing (orchestration, LLM, tool, context spans)
+- [MCP Tool Search](features/MCP_TOOL_SEARCH.md) - Threshold-based MCP tool lazy loading via the discover_tools meta-tool
 
 ## Operations
 

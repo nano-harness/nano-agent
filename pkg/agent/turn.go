@@ -14,6 +14,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/memory"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/skill"
+	"github.com/nano-harness/nano-agent/pkg/telemetry"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 )
 
@@ -342,13 +343,21 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 		}
 	}
 
-	compressedMessages, compressionInfo, err := compressionStrategy.CompressMessages(ctx, t.LLMClient, t.Messages, force)
+	compressCtx, compressSpan := telemetry.StartContextSpan(ctx, telemetry.OperationContextCompression, t.SessionID)
+	compressedMessages, compressionInfo, err := compressionStrategy.CompressMessages(compressCtx, t.LLMClient, t.Messages, force)
 	if err != nil {
 		logger.Errorf("Compression failed: %v", err)
+		telemetry.EndWithError(compressSpan, err)
 		return err
 	}
 
 	if compressedMessages != nil && compressionInfo != nil {
+		telemetry.SetCompressionOutcome(compressSpan,
+			compressionInfo.MessagesBefore,
+			compressionInfo.MessagesAfter,
+			compressionInfo.OriginalTokens,
+			compressionInfo.CompressedTokens)
+		compressSpan.End()
 		// Filter orphaned thinking-only messages that compression may have created
 		compressedMessages = llm.FilterOrphanedThinkingOnlyMessages(compressedMessages)
 		t.Messages = compressedMessages
@@ -434,6 +443,7 @@ func (t *Turn) CompressMessages(ctx context.Context, force bool) error {
 		}
 	} else {
 		logger.Info("No compression performed - messages or info is nil")
+		compressSpan.End()
 	}
 	return nil
 }
@@ -465,13 +475,22 @@ func (t *Turn) maybeEditContext() {
 		return
 	}
 
+	editCtx := t.ctx
+	if editCtx == nil {
+		editCtx = context.Background()
+	}
+	_, editSpan := telemetry.StartContextSpan(editCtx, telemetry.OperationContextEditing, t.SessionID)
 	edited, cleared := t.contextEditor.EditContext(t.Messages)
 	if cleared == 0 {
+		editSpan.End()
 		return
 	}
 	afterTokens := compressionStrategy.EstimateTokenCount(edited)
 	t.Messages = edited
 	logger.Infof("Context edited: cleared %d stale tool results, ~%d → ~%d tokens", cleared, currentTokens, afterTokens)
+
+	telemetry.SetEditingOutcome(editSpan, cleared, currentTokens, afterTokens)
+	editSpan.End()
 
 	if t.eventHandler != nil {
 		evt := event.NewStreamEvent(event.EventTypeCompression, "agent_turn")

@@ -11,9 +11,22 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/telemetry"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/openai/openai-go/v3"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// messagesCharLength returns the total character length of message contents.
+// Used only as a size attribute on trace spans; content itself is never
+// recorded.
+func messagesCharLength(messages []Message) int {
+	total := 0
+	for _, msg := range messages {
+		total += len(msg.Content)
+	}
+	return total
+}
 
 // MessageContent represents content that can be text or image
 type MessageContent struct {
@@ -90,7 +103,9 @@ func NewClient(apiKey, baseURL, model string, tools []interfaces.Tool) *Client {
 }
 
 // GenerateContent generates content from prompt
-func (c *Client) GenerateContent(ctx context.Context, prompt string) (string, error) {
+func (c *Client) GenerateContent(ctx context.Context, prompt string) (_ string, retErr error) {
+	ctx, llmSpan := telemetry.StartLLMSpan(ctx, InferProviderID(c.baseURL, c.model), c.model, len(prompt))
+	defer func() { telemetry.EndWithError(llmSpan, retErr) }()
 	params := openai.ChatCompletionNewParams{
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.UserMessage(prompt),
@@ -111,7 +126,9 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string) (string, er
 }
 
 // StreamCompletion creates a streaming completion with function calling support
-func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEvent func(event.StreamEvent)) error {
+func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEvent func(event.StreamEvent)) (retErr error) {
+	ctx, llmSpan := telemetry.StartLLMSpan(ctx, InferProviderID(c.baseURL, c.model), c.model, messagesCharLength(messages))
+	defer func() { telemetry.EndWithError(llmSpan, retErr) }()
 	logger.Debugf("Starting LLM stream completion with %d messages", len(messages))
 
 	// Wrap onEvent with sanitizer to prevent secret leakage at the source
@@ -441,7 +458,7 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 		}
 
 		// Finalize response without tool execution
-		return c.finalizeResponse(assembler.Content(), assembler.Reasoning(), toolCalls, sanitizedOnEvent, tokenStats, finishMetadata(truncated, finishReason))
+		return c.finalizeResponse(ctx, assembler.Content(), assembler.Reasoning(), toolCalls, sanitizedOnEvent, tokenStats, finishMetadata(truncated, finishReason))
 	}
 
 	// All retries exhausted (should not normally reach here)
@@ -454,7 +471,9 @@ func (c *Client) StreamCompletion(ctx context.Context, messages []Message, onEve
 
 // streamCompletionWithoutReasoning performs streaming completion without reasoning parameters
 // This is used as a fallback when reasoning requests fail
-func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages []Message, onEvent func(event.StreamEvent)) error {
+func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages []Message, onEvent func(event.StreamEvent)) (retErr error) {
+	ctx, llmSpan := telemetry.StartLLMSpan(ctx, InferProviderID(c.baseURL, c.model), c.model, messagesCharLength(messages))
+	defer func() { telemetry.EndWithError(llmSpan, retErr) }()
 	logger.Debugf("Starting fallback stream completion without reasoning for model: %s", c.model)
 
 	// Create sanitized event handler
@@ -761,7 +780,7 @@ func (c *Client) streamCompletionWithoutReasoning(ctx context.Context, messages 
 		logger.Debugf("Fallback stream completed successfully without reasoning")
 
 		// Finalize response without tool execution
-		return c.finalizeResponse(responseContent.String(), "", toolCalls, sanitizedOnEvent, tokenStats, finishMetadata(truncated, finishReason))
+		return c.finalizeResponse(ctx, responseContent.String(), "", toolCalls, sanitizedOnEvent, tokenStats, finishMetadata(truncated, finishReason))
 	}
 
 	// All retries exhausted
@@ -785,7 +804,7 @@ func (c *Client) StreamCompletionWithoutReasoning(ctx context.Context, messages 
 }
 
 // finalizeResponse sends the final response events
-func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []tools.ToolCall, onEvent func(event.StreamEvent), tokenStats *TokenStats, finalMetadata ...map[string]interface{}) error {
+func (c *Client) finalizeResponse(ctx context.Context, content string, reasoning string, toolCalls []tools.ToolCall, onEvent func(event.StreamEvent), tokenStats *TokenStats, finalMetadata ...map[string]interface{}) error {
 	metadata := map[string]interface{}(nil)
 	if len(finalMetadata) > 0 {
 		metadata = finalMetadata[0]
@@ -794,6 +813,12 @@ func (c *Client) finalizeResponse(content string, reasoning string, toolCalls []
 	tokenStats.StopStreaming()
 	tokenStats.ResponseSizeBytes = len(content)
 	tokenStats.Finish() // Update session totals
+
+	// Record GenAI usage attributes on the enclosing LLM span (no-op when
+	// tracing is disabled).
+	finishReason, _ := metadata["finish_reason"].(string)
+	telemetry.SetLLMUsage(trace.SpanFromContext(ctx),
+		tokenStats.InputTokens, tokenStats.OutputTokens, finishReason, len(content))
 
 	reasoningActive := false
 	reasoningExclude := false

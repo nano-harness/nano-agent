@@ -79,6 +79,10 @@ type Agent struct {
 
 	progressiveDisclosure *ProgressiveDisclosure
 
+	// toolSearchGate gates MCP tool schema exposure based on the tool search
+	// (lazy loading) threshold decision.
+	toolSearchGate *ToolSearchGate
+
 	// approvalConfirmFnOverride optionally overrides the default auto-confirm logic.
 	approvalConfirmFnOverride func(string) bool
 
@@ -276,6 +280,8 @@ func New(cfg *config.Config, opts ...Option) (*Agent, error) {
 				agent.progressiveDisclosure.IndexTools([]interfaces.Tool{tool})
 			}
 		}
+		// Re-evaluate the MCP lazy-loading threshold as the tool inventory changes.
+		agent.reevaluateToolSearch(tools)
 	})
 
 	maybeStartAgentMCPClient(cfg, agent.toolbox)
@@ -286,6 +292,10 @@ func New(cfg *config.Config, opts ...Option) (*Agent, error) {
 	// Only preload when auto-detection is enabled and no custom system prompt overrides it
 	// (custom prompt callers often disable detection to avoid subprocess side effects in tests).
 	agent.cachedSystemPromptBuilder = newPreloadedSystemPromptBuilder(cfg, bootstrap.workingDir, agent.toolbox, agent.memoryManager)
+	// Sync the MCP lazy-loading mode decided during tool registration.
+	if agent.toolSearchGate != nil {
+		agent.cachedSystemPromptBuilder.SetMCPLazyLoad(agent.toolSearchGate.Lazy())
+	}
 
 	return agent, nil
 }
@@ -1088,13 +1098,38 @@ func (a *Agent) registerBuiltinManagementTools(tb *tools.Toolbox, cfg *config.Co
 	a.progressiveDisclosure = NewProgressiveDisclosure(20, 5)
 	discoverToolsTool.SetOnExpand(a.progressiveDisclosure.MarkExpanded)
 	a.progressiveDisclosure.IndexTools(tb.List())
+	a.toolSearchGate = NewToolSearchGate(a.progressiveDisclosure)
+	a.reevaluateToolSearch(tb.List())
 	if setter, ok := a.llmClient.(interface{ SetToolGate(interfaces.ToolGate) }); ok {
-		setter.SetToolGate(a.progressiveDisclosure)
+		setter.SetToolGate(a.toolSearchGate)
 	}
 	// Connect ProgressiveDisclosure to ToolScheduler for schema auto-injection
 	a.toolScheduler.SetProgressiveDisclosure(a.progressiveDisclosure)
 
 	logger.Info("Conversational management tools registered")
+}
+
+// reevaluateToolSearch recomputes the MCP lazy-loading decision for the
+// current tool inventory and propagates it to the schema gate and the system
+// prompt builder. Called after the built-in tools are registered and again
+// whenever MCP tools (un)register asynchronously.
+func (a *Agent) reevaluateToolSearch(tools []interfaces.Tool) {
+	if a.toolSearchGate == nil {
+		return
+	}
+	enabled, contextWindow, ratio := toolSearchConfigResolved(a.config)
+	decision := ToolSearchDecision{}
+	if enabled {
+		decision = EvaluateToolSearch(tools, contextWindow, ratio)
+	}
+	a.toolSearchGate.Update(tools, decision)
+	if a.cachedSystemPromptBuilder != nil {
+		a.cachedSystemPromptBuilder.SetMCPLazyLoad(decision.Lazy)
+	}
+	if decision.MCPToolCount > 0 {
+		logger.Infof("Tool search evaluation: %d MCP tools ≈ %d tokens (threshold %d of %d), lazy_load=%t",
+			decision.MCPToolCount, decision.MCPToolTokens, decision.ThresholdTokens, decision.ContextWindow, decision.Lazy)
+	}
 }
 
 // approvalConfirmFn is a stub that auto-confirms. In TUI mode, the caller

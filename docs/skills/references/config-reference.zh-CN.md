@@ -279,6 +279,40 @@ mcp:
 **模式：** 所有模式（在 TUI/Daemon 中最有用）
 **环境变量：** `NANO_ENABLE_MCP`、`NANO_MCP_DEFAULT_TRANSPORT`、`NANO_MCP_TIMEOUT`
 
+## MCP 工具搜索（懒加载）
+
+基于阈值的 MCP 工具懒加载。当 MCP 工具定义总量超过
+`threshold_ratio × context_window` 时，不再全量注入 schema，agent 改为
+通过 `discover_tools` 按需检索。
+
+```yaml
+tool_search:
+  enabled: true          # 默认：true；false 强制积极（全量 schema）模式
+  threshold_ratio: 0.10  # 触发懒加载的上下文窗口占比
+  context_window: 0      # 覆盖值；默认取 context.model_context_window，否则 200000
+```
+
+**模式：** 所有模式
+**详见：** [MCP 工具搜索](../../features/MCP_TOOL_SEARCH.zh-CN.md)
+
+## OpenTelemetry（GenAI 追踪）
+
+遵循 GenAI 语义约定的 OTel trace 导出。默认关闭；关闭时管道为 no-op。
+
+```yaml
+otel:
+  enabled: false               # 默认：false
+  endpoint: "localhost:4317"   # OTLP collector（4317 gRPC / 4318 HTTP）
+  protocol: "grpc"             # "grpc"（默认）或 "http"
+  insecure: false              # 关闭 TLS
+  service_name: "nano-agent"   # service.name 资源属性
+  sample_ratio: 1.0            # 采样率，(0, 1] 区间
+  headers: {}                  # 额外导出请求头
+```
+
+**模式：** 所有模式
+**详见：** [可观测性](../../features/OBSERVABILITY.zh-CN.md)
+
 ## Daemon 配置
 
 ```yaml

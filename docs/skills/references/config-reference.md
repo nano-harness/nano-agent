@@ -279,6 +279,41 @@ mcp:
 **Modes:** All modes (most useful in TUI/Daemon)
 **Environment:** `NANO_ENABLE_MCP`, `NANO_MCP_DEFAULT_TRANSPORT`, `NANO_MCP_TIMEOUT`
 
+## MCP Tool Search (Lazy Loading)
+
+Threshold-based MCP tool lazy loading. When the aggregate size of MCP tool
+definitions exceeds `threshold_ratio × context_window`, full schemas are
+withheld and the agent retrieves them on demand via `discover_tools`.
+
+```yaml
+tool_search:
+  enabled: true          # default: true; false forces eager (full schema) mode
+  threshold_ratio: 0.10  # context-window share that triggers lazy loading
+  context_window: 0      # override; default: context.model_context_window, else 200000
+```
+
+**Modes:** All modes
+**Details:** [MCP Tool Search](../../features/MCP_TOOL_SEARCH.md)
+
+## OpenTelemetry (GenAI Tracing)
+
+OTel trace export following the GenAI semantic conventions. Disabled by
+default; when disabled the pipeline is a no-op.
+
+```yaml
+otel:
+  enabled: false               # default: false
+  endpoint: "localhost:4317"   # OTLP collector (4317 gRPC / 4318 HTTP)
+  protocol: "grpc"             # "grpc" (default) or "http"
+  insecure: false              # disable TLS
+  service_name: "nano-agent"   # service.name resource attribute
+  sample_ratio: 1.0            # sampling ratio in (0, 1]
+  headers: {}                  # extra export headers
+```
+
+**Modes:** All modes
+**Details:** [Observability](../../features/OBSERVABILITY.md)
+
 ## Daemon Configuration
 
 ```yaml

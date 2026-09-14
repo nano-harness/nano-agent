@@ -15,6 +15,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
 	"github.com/nano-harness/nano-agent/pkg/agent"
 	"github.com/nano-harness/nano-agent/pkg/agent/permission"
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -24,14 +26,13 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/runtime"
 	"github.com/nano-harness/nano-agent/pkg/slash"
+	"github.com/nano-harness/nano-agent/pkg/telemetry"
 	"github.com/nano-harness/nano-agent/pkg/ui"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea"
 	"github.com/nano-harness/nano-agent/pkg/ui/bubbletea/banner"
 	"github.com/nano-harness/nano-agent/pkg/ui/eventsource"
 	"github.com/nano-harness/nano-agent/pkg/ui/tview"
 	"github.com/nano-harness/nano-agent/pkg/version"
-	"github.com/fatih/color"
-	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -316,6 +317,25 @@ func initConfig() {
 		// which doesn't support error returns. Config initialization failure prevents all commands
 		// from functioning properly, so exiting here is the appropriate behavior.
 		os.Exit(1)
+	}
+
+	// Initialize OpenTelemetry trace export when configured. Disabled by
+	// default; initialization failures are non-fatal (tracing stays off).
+	if cfg := config.Get(); cfg != nil && cfg.OTel != nil && cfg.OTel.Enabled {
+		shutdown, err := telemetry.Init(context.Background(), cfg.OTel)
+		if err != nil {
+			logger.Errorf("Failed to initialize OpenTelemetry (tracing disabled): %v", err)
+			return
+		}
+		if shutdown != nil {
+			cobra.OnFinalize(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := shutdown(ctx); err != nil {
+					logger.Warnf("OpenTelemetry shutdown error: %v", err)
+				}
+			})
+		}
 	}
 }
 

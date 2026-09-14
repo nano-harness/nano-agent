@@ -47,6 +47,7 @@ make release
 - `pkg/tools/` — 工具实现（文件系统、shell、搜索、Web 等）。
 - `pkg/llm/` — LLM 客户端抽象与提供商集成。
 - `pkg/mcp/` — Model Context Protocol 客户端与服务器支持。
+- `pkg/telemetry/` — OpenTelemetry GenAI 追踪（默认关闭，关闭时为 no-op）。
 - `pkg/sandbox/` — 原生沙箱隔离与路径访问控制。
 - `pkg/skill/` — skill 的发现、匹配与加载。
 - `pkg/daemon/` — HTTP/WebSocket daemon 模式。

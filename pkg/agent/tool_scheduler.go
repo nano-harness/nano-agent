@@ -17,6 +17,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
 	"github.com/nano-harness/nano-agent/pkg/sandbox"
+	"github.com/nano-harness/nano-agent/pkg/telemetry"
 	"github.com/nano-harness/nano-agent/pkg/toolruntime"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 	"github.com/nano-harness/nano-agent/pkg/tools/system"
@@ -1631,6 +1632,17 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 	// Inject tool call ID into context for sub-agent WorkerID derivation
 	callCtx = WithToolCallID(callCtx, toolCall.ID)
 
+	// OTel GenAI tool span (no-op when tracing is disabled)
+	callCtx, toolSpan := telemetry.StartToolSpan(callCtx, toolCall.Name, toolCall.ID)
+	var execResult *ToolExecutionResult
+	defer func() {
+		if execResult != nil {
+			success := execResult.Error == nil && (execResult.Result == nil || execResult.Result.Success)
+			telemetry.SetToolOutcome(toolSpan, success, execResult.Error)
+		}
+		toolSpan.End()
+	}()
+
 	ts.mutex.Lock()
 	if call, ok := ts.toolCalls[toolCall.ID]; ok {
 		call.cancel = cancel
@@ -1717,7 +1729,7 @@ func (ts *ToolScheduler) executeSingleToolCall(ctx context.Context, toolCall *To
 		})
 	}
 
-	execResult := ts.executeViaRuntime(callCtx, toolToExecute)
+	execResult = ts.executeViaRuntime(callCtx, toolToExecute)
 
 	if execResult.Error != nil {
 		logger.Errorf("Tool %s failed after recovery: %v", toolCall.Name, execResult.Error)

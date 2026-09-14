@@ -42,6 +42,11 @@ type SystemPromptBuilder struct {
 	userInfoReady  chan struct{}
 	preloadStarted atomic.Bool
 
+	// mcpLazyLoad controls whether MCP tools render as a compact index
+	// (name + one-line description, full schema via discover_tools) or with
+	// their full schemas inline. Driven by the tool search threshold logic.
+	mcpLazyLoad atomic.Bool
+
 	promptCache      sync.Map
 	toolsFingerprint string
 }
@@ -53,7 +58,7 @@ func NewSystemPromptBuilder(workingDir string, tools []interfaces.Tool, memoryMa
 	if cfg != nil {
 		instructionMaxBytes = cfg.InstructionFileMaxBytes
 	}
-	return &SystemPromptBuilder{
+	spb := &SystemPromptBuilder{
 		workingDir:        workingDir,
 		tools:             tools,
 		memoryManager:     memoryManager,
@@ -63,6 +68,9 @@ func NewSystemPromptBuilder(workingDir string, tools []interfaces.Tool, memoryMa
 		contextAnalyzer:   NewContextAnalyzer(),
 		toolsFingerprint:  toolFingerprint(tools),
 	}
+	// Legacy default: compact MCP index until tool search evaluation runs.
+	spb.mcpLazyLoad.Store(true)
+	return spb
 }
 
 // PreloadUserInfo triggers user info detection asynchronously.
@@ -1615,7 +1623,9 @@ func (spb *SystemPromptBuilder) buildToolsSection() string {
 			return true
 		}
 		if strings.HasPrefix(tool.Name(), "mcp_") {
-			return false
+			// In tool search (lazy load) mode MCP tools render as a compact
+			// index; otherwise their full schemas are inlined.
+			return !spb.mcpLazyLoad.Load()
 		}
 		switch tool.Category() {
 		case interfaces.CategoryFileSystem, interfaces.CategoryShell, interfaces.CategoryAgent:
@@ -1930,6 +1940,20 @@ Direct response: single-file reads, conceptual questions, quick answers
 3. Memory integration: check for relevant context, save discoveries
 4. Progressive: break complex tasks into manageable steps
 5. Efficient: choose appropriate tools for each step`, spb.workingDir)
+}
+
+// SetMCPLazyLoad switches MCP tool rendering between the compact index
+// (lazy loading / tool search mode) and full inline schemas. It invalidates
+// the prompt cache when the mode actually changes.
+func (spb *SystemPromptBuilder) SetMCPLazyLoad(lazy bool) {
+	if spb.mcpLazyLoad.Swap(lazy) != lazy {
+		spb.InvalidatePromptCache()
+	}
+}
+
+// MCPLazyLoad reports whether MCP tools render as a compact index.
+func (spb *SystemPromptBuilder) MCPLazyLoad() bool {
+	return spb.mcpLazyLoad.Load()
 }
 
 // UpdateTools updates the available tools

@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -88,7 +89,7 @@ func TestReasoningIntegration(t *testing.T) {
 		}
 
 		// Test finalizeResponse method signature
-		err := client.finalizeResponse("test content", "test reasoning", []tools.ToolCall{}, onEvent, tokenStats)
+		err := client.finalizeResponse(context.Background(), "test content", "test reasoning", []tools.ToolCall{}, onEvent, tokenStats)
 		if err != nil {
 			t.Errorf("finalizeResponse failed: %v", err)
 		}

@@ -31,6 +31,8 @@
 - [上下文工程](features/CONTEXT_ENGINEERING.zh-CN.md) - 上下文编辑（清除陈旧工具结果）与确定性制品追踪
 - [扩展](features/EXTENSIONS.md) - skill、MCP server、工具和 agent 的扩展清单
 - [MCP OAuth](features/MCP_OAUTH.md) - MCP server 的 OAuth 集成
+- [可观测性](features/OBSERVABILITY.zh-CN.md) - OpenTelemetry GenAI 追踪（编排、LLM、工具、上下文 span）
+- [MCP 工具搜索](features/MCP_TOOL_SEARCH.zh-CN.md) - 基于阈值的 MCP 工具懒加载（discover_tools 元工具）
 
 ## 运维
 

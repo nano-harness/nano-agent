@@ -47,6 +47,7 @@ make release
 - `pkg/tools/` — tool implementations (filesystem, shell, search, web, etc.).
 - `pkg/llm/` — LLM client abstractions and provider integrations.
 - `pkg/mcp/` — Model Context Protocol client and server support.
+- `pkg/telemetry/` — OpenTelemetry GenAI tracing (opt-in, no-op when disabled).
 - `pkg/sandbox/` — native sandboxing and path access control.
 - `pkg/skill/` — skill discovery, matching, and loading.
 - `pkg/daemon/` — HTTP/WebSocket daemon mode.

@@ -900,6 +900,51 @@ type Config struct {
 
 	// Checkpoint configures the filesystem checkpointer (M2-4).
 	Checkpoint *CheckpointConfig `mapstructure:"checkpoint" yaml:"checkpoint,omitempty"`
+
+	// OTel configures OpenTelemetry GenAI trace export. Disabled by default;
+	// when disabled the tracing pipeline is a no-op with zero overhead.
+	OTel *OTelConfig `mapstructure:"otel" yaml:"otel,omitempty"`
+
+	// ToolSearch configures MCP tool lazy loading (tool search mode). When the
+	// aggregate size of registered MCP tool definitions exceeds the configured
+	// context threshold, full tool schemas are withheld and the agent retrieves
+	// them on demand via the discover_tools meta-tool.
+	ToolSearch *ToolSearchConfig `mapstructure:"tool_search" yaml:"tool_search,omitempty"`
+}
+
+// OTelConfig configures OpenTelemetry trace export following the GenAI
+// semantic conventions (gen_ai.* attributes).
+type OTelConfig struct {
+	// Enabled turns on trace export. Default: false.
+	Enabled bool `mapstructure:"enabled" yaml:"enabled"`
+	// Endpoint is the OTLP collector address (host:port), e.g. "localhost:4318"
+	// for HTTP or "localhost:4317" for gRPC.
+	Endpoint string `mapstructure:"endpoint" yaml:"endpoint"`
+	// Protocol selects the OTLP transport: "grpc" or "http" (default: "grpc").
+	Protocol string `mapstructure:"protocol" yaml:"protocol"`
+	// Insecure disables TLS for the exporter connection.
+	Insecure bool `mapstructure:"insecure" yaml:"insecure"`
+	// ServiceName overrides the service.name resource attribute.
+	// Default: "nano-agent".
+	ServiceName string `mapstructure:"service_name" yaml:"service_name"`
+	// Headers are extra headers sent with every export request (e.g. auth tokens
+	// for managed collectors).
+	Headers map[string]string `mapstructure:"headers" yaml:"headers,omitempty"`
+	// SampleRatio is the trace sampling ratio in (0, 1]. Default: 1.0.
+	SampleRatio float64 `mapstructure:"sample_ratio" yaml:"sample_ratio"`
+}
+
+// ToolSearchConfig configures MCP tool lazy loading (tool search mode).
+type ToolSearchConfig struct {
+	// Enabled controls threshold-based lazy loading. Default: true.
+	Enabled *bool `mapstructure:"enabled" yaml:"enabled"`
+	// ThresholdRatio is the fraction of the model context window that MCP tool
+	// definitions may occupy before lazy loading activates. Default: 0.10,
+	// mirroring Claude Code's ~10% context-share behavior.
+	ThresholdRatio float64 `mapstructure:"threshold_ratio" yaml:"threshold_ratio"`
+	// ContextWindow overrides the context window size used for threshold
+	// computation. Default: 0 (auto: context.model_context_window, else 200000).
+	ContextWindow int `mapstructure:"context_window" yaml:"context_window"`
 }
 
 // PolicyConfig groups permission-related configuration.

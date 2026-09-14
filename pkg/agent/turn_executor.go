@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/logger"
 	"github.com/nano-harness/nano-agent/pkg/middleware"
+	"github.com/nano-harness/nano-agent/pkg/telemetry"
 	"github.com/nano-harness/nano-agent/pkg/tools"
 )
 
@@ -27,9 +29,18 @@ func newTurnExecutor(turn *Turn) *turnExecutor {
 	}
 }
 
-func (e *turnExecutor) Execute(ctx context.Context) error {
+func (e *turnExecutor) Execute(ctx context.Context) (execErr error) {
 	t := e.turn
 	ctx = context.WithValue(ctx, interfaces.TurnContextKey{}, interfaces.TurnContext{SessionID: t.SessionID})
+	ctx, turnSpan := telemetry.StartAgentSpan(ctx, t.SessionID, t.ID)
+	defer func() {
+		// ErrContinueRequested is a continuation signal, not a failure.
+		if errors.Is(execErr, ErrContinueRequested) {
+			telemetry.EndWithError(turnSpan, nil)
+			return
+		}
+		telemetry.EndWithError(turnSpan, execErr)
+	}()
 	logger.Infof("Starting turn execution: %s", t.ID)
 	t.StartTime = time.Now()
 

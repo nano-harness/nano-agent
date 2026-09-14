@@ -15,7 +15,9 @@ import (
 	"github.com/nano-harness/nano-agent/pkg/event"
 	"github.com/nano-harness/nano-agent/pkg/interfaces"
 	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/telemetry"
 	"github.com/nano-harness/nano-agent/pkg/tools"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -118,7 +120,9 @@ func (c *AnthropicClient) UpdateTools(newTools []interfaces.Tool) {
 }
 
 // GenerateContent generates a non-streaming completion for the given prompt.
-func (c *AnthropicClient) GenerateContent(ctx context.Context, prompt string) (string, error) {
+func (c *AnthropicClient) GenerateContent(ctx context.Context, prompt string) (_ string, retErr error) {
+	ctx, llmSpan := telemetry.StartLLMSpan(ctx, "anthropic", c.model, len(prompt))
+	defer func() { telemetry.EndWithError(llmSpan, retErr) }()
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(c.model),
 		MaxTokens: anthropicDefaultMaxTokens,
@@ -150,7 +154,9 @@ func (c *AnthropicClient) StreamCompletionWithoutReasoning(ctx context.Context, 
 	return c.stream(ctx, messages, onEvent, true)
 }
 
-func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEvent func(event.StreamEvent), disableThinking bool) error {
+func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEvent func(event.StreamEvent), disableThinking bool) (retErr error) {
+	ctx, llmSpan := telemetry.StartLLMSpan(ctx, "anthropic", c.model, messagesCharLength(messages))
+	defer func() { telemetry.EndWithError(llmSpan, retErr) }()
 	// Apply response timeout
 	totalTimeout := 15 * time.Minute
 	if c.cfg != nil && c.cfg.ResponseTimeout > 0 {
@@ -381,10 +387,11 @@ func (c *AnthropicClient) stream(ctx context.Context, messages []Message, onEven
 		c.cb.RecordSuccess()
 	}
 
-	return c.finalizeAnthropicResponse(textContent, reasoningContent, reasoningBlocks, toolCalls, onEvent, tokenStats)
+	return c.finalizeAnthropicResponse(ctx, textContent, reasoningContent, reasoningBlocks, toolCalls, onEvent, tokenStats)
 }
 
 func (c *AnthropicClient) finalizeAnthropicResponse(
+	ctx context.Context,
 	content string,
 	reasoning string,
 	reasoningBlocks []ReasoningBlock,
@@ -395,6 +402,9 @@ func (c *AnthropicClient) finalizeAnthropicResponse(
 	tokenStats.StopStreaming()
 	tokenStats.ResponseSizeBytes = len(content)
 	tokenStats.Finish()
+
+	telemetry.SetLLMUsage(trace.SpanFromContext(ctx),
+		tokenStats.InputTokens, tokenStats.OutputTokens, "", len(content))
 
 	if reasoning != "" {
 		tokenStats.SetReasoningTokens(EstimateTokensFromChars(reasoning))

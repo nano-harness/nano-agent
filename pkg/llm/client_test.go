@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"testing"
 
 	"github.com/nano-harness/nano-agent/pkg/config"
@@ -25,7 +26,7 @@ func TestFinalizeResponse_EmitsCompleteThinkingWithFullReasoning(t *testing.T) {
 	var events []event.StreamEvent
 	onEvent := func(ev event.StreamEvent) { events = append(events, ev) }
 
-	if err := c.finalizeResponse("the answer", reasoning, nil, onEvent, NewTokenStats()); err != nil {
+	if err := c.finalizeResponse(context.Background(), "the answer", reasoning, nil, onEvent, NewTokenStats()); err != nil {
 		t.Fatalf("finalizeResponse returned error: %v", err)
 	}
 
@@ -65,7 +66,7 @@ func TestFinalizeResponse_NoCompleteEventWhenReasoningEmpty(t *testing.T) {
 	var events []event.StreamEvent
 	onEvent := func(ev event.StreamEvent) { events = append(events, ev) }
 
-	if err := c.finalizeResponse("hello", "", nil, onEvent, NewTokenStats()); err != nil {
+	if err := c.finalizeResponse(context.Background(), "hello", "", nil, onEvent, NewTokenStats()); err != nil {
 		t.Fatalf("finalizeResponse returned error: %v", err)
 	}
 
@@ -90,7 +91,7 @@ func TestFinalizeResponse_EmitsCompleteEvenWhenReasoningDisabled(t *testing.T) {
 	var events []event.StreamEvent
 	onEvent := func(ev event.StreamEvent) { events = append(events, ev) }
 
-	if err := c.finalizeResponse("hi", reasoning, nil, onEvent, NewTokenStats()); err != nil {
+	if err := c.finalizeResponse(context.Background(), "hi", reasoning, nil, onEvent, NewTokenStats()); err != nil {
 		t.Fatalf("finalizeResponse returned error: %v", err)
 	}
 
