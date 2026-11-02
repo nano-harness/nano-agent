@@ -1,0 +1,14 @@
+# Minimal test configuration for smoke tests
+openai:
+  base_url: "MOCK_URL_PLACEHOLDER"
+  api_key: "test-key"
+  model: "gpt-4"
+
+agent:
+  max_turns: 5
+  max_context_tokens: 4000
+
+auto_approve:
+  enabled: true
+  patterns:
+    - "*"

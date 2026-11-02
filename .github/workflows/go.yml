@@ -1,0 +1,36 @@
+name: Go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go-version: ['1.25']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Install dependencies
+        run: go mod tidy
+      - name: Run tests
+        run: go test ./...
+      - name: TUI teatest (L2)
+        run: go test -race ./pkg/ui/bubbletea/...
+      - name: TUI PTY E2E (L3)
+        # PTY-based e2e hangs intermittently on headless CI runners; keep it
+        # informational (non-blocking) until it is made CI-safe
+        if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        run: go test -race -tags=e2e -timeout=5m ./e2e/tui/...
+        env:
+          NO_COLOR: "0"
+          TERM: "xterm-256color"

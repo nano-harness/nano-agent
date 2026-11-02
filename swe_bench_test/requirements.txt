@@ -1,0 +1,4 @@
+# SWE-bench testing requirements for nano-agent
+datasets>=2.14.0
+docker>=6.0.0
+requests>=2.28.0

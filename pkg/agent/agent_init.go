@@ -1,0 +1,719 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/nano-harness/nano-agent/pkg/agent/permission"
+	"github.com/nano-harness/nano-agent/pkg/config"
+	"github.com/nano-harness/nano-agent/pkg/event"
+	"github.com/nano-harness/nano-agent/pkg/hookservice"
+	"github.com/nano-harness/nano-agent/pkg/interfaces"
+	"github.com/nano-harness/nano-agent/pkg/llm"
+	"github.com/nano-harness/nano-agent/pkg/logger"
+	"github.com/nano-harness/nano-agent/pkg/memory"
+	"github.com/nano-harness/nano-agent/pkg/middleware"
+	agentruntime "github.com/nano-harness/nano-agent/pkg/runtime"
+	"github.com/nano-harness/nano-agent/pkg/skill"
+	"github.com/nano-harness/nano-agent/pkg/tools"
+)
+
+func newAgentRuntime(agent *Agent) *agentruntime.AgentRuntime {
+	return agentruntime.NewAgentRuntime(
+		agent.llmClient,
+		agent.toolbox,
+		agent.sessionManager,
+		agent.memoryManager,
+		agentruntime.EventHandler(agent.eventHandler),
+	)
+}
+
+type agentBootstrap struct {
+	workingDir        string
+	agentCtx          context.Context
+	agentCancel       context.CancelFunc
+	toolbox           *tools.Toolbox
+	llmClient         llm.LLMClient
+	memoryManager     *memory.Manager
+	toolScheduler     *ToolScheduler
+	sessionManager    *SessionManager
+	stateStore        *config.StateStore
+	permissionManager *permission.Manager
+	skillManager      *skill.Manager
+	hookEngine        *middleware.HookEngine
+}
+
+func buildAgentBootstrap(cfg *config.Config) (*agentBootstrap, error) {
+	workingDir, err := resolveAgentWorkingDir(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	toolbox := newAgentToolbox(cfg, workingDir)
+	llmClient := newAgentLLMClient(cfg, toolbox)
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+
+	memoryManager := newAgentMemoryManager(cfg, workingDir)
+	toolScheduler := newAgentToolScheduler(cfg, toolbox)
+	stateStore := newAgentStateStore(cfg)
+	sessionManager := newAgentSessionManager(cfg, workingDir)
+	permissionManager := newAgentPermissionManager(cfg, workingDir)
+	toolScheduler.SetPermissionManager(permissionManager)
+	skillManager := newAgentSkillManager(cfg, workingDir, stateStore)
+	hookEngine := newAgentHookEngine(cfg, workingDir)
+
+	// Wire hook engine into components
+	toolScheduler.SetHookEngine(hookEngine)
+	toolScheduler.SetWorkDir(workingDir)
+	sessionManager.SetHookEngine(hookEngine)
+	wireModelSwitchHooks(llmClient, hookEngine)
+
+	return &agentBootstrap{
+		workingDir:        workingDir,
+		agentCtx:          agentCtx,
+		agentCancel:       agentCancel,
+		toolbox:           toolbox,
+		llmClient:         llmClient,
+		memoryManager:     memoryManager,
+		toolScheduler:     toolScheduler,
+		sessionManager:    sessionManager,
+		stateStore:        stateStore,
+		permissionManager: permissionManager,
+		skillManager:      skillManager,
+		hookEngine:        hookEngine,
+	}, nil
+}
+
+func resolveAgentWorkingDir(cfg *config.Config) (string, error) {
+	if cfg.WorkingDir == "" {
+		workingDir, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get working directory: %w", err)
+		}
+		return workingDir, nil
+	}
+
+	expanded := cfg.WorkingDir
+	if strings.HasPrefix(expanded, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve home directory: %w", err)
+		}
+		expanded = filepath.Join(home, expanded[2:])
+	}
+	absDir, err := filepath.Abs(expanded)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve working directory %q: %w", cfg.WorkingDir, err)
+	}
+	return absDir, nil
+}
+
+func newAgentToolbox(cfg *config.Config, workingDir string) *tools.Toolbox {
+	return tools.NewToolbox(workingDir, newAgentToolboxConfig(cfg, workingDir), nil)
+}
+
+func newAgentToolboxConfig(cfg *config.Config, workingDir string) *tools.ToolboxConfig {
+	webAPIKeys := make(map[string]string)
+	if cfg.WebSearchAPIKeys.Serper != "" {
+		webAPIKeys["serper"] = cfg.WebSearchAPIKeys.Serper
+	}
+	if cfg.WebSearchAPIKeys.Tavily != "" {
+		webAPIKeys["tavily"] = cfg.WebSearchAPIKeys.Tavily
+	}
+
+	toolboxConfig := &tools.ToolboxConfig{
+		WorkingDirectory:      workingDir,
+		Timeout:               cfg.ResponseTimeout,
+		MaxFileSize:           cfg.MaxFileSize,
+		MaxResponseSize:       cfg.MaxFileSize,
+		UserAgent:             "nano/1.0",
+		AllowedCommands:       cfg.AllowedCommands,
+		BlockedCommands:       cfg.BlockedCommands,
+		SensitiveReadPaths:    cfg.SensitiveReadPaths,
+		ArbitraryExecCommands: cfg.ArbitraryExecCommands,
+		WebSearchAPIKeys:      webAPIKeys,
+		EnableMCP:             cfg.EnableMCP,
+		MCPConfig:             convertMCPConfig(cfg.MCP),
+
+		ReadFileMaxLines:    cfg.ReadFileMaxLines,
+		SearchMaxResults:    cfg.SearchMaxResults,
+		WebRequestTimeout:   cfg.WebRequestTimeout,
+		WebSearchTimeout:    cfg.WebSearchTimeout,
+		WebMaxContentSize:   cfg.WebMaxContentSize,
+		WebSearchMaxResults: cfg.WebSearchMaxResults,
+		FileDiffMaxLines:    cfg.FileDiffMaxLines,
+		GitMaxLogEntries:    cfg.GitMaxLogEntries,
+
+		AllowedEnvVars: cfg.AllowedEnvVars,
+		BlockedEnvVars: cfg.BlockedEnvVars,
+		Strict:         cfg.Strict,
+
+		Sandbox: cfg.Sandbox,
+		Shell:   cfg.Shell,
+	}
+
+	if cfg.OpenSpec != nil && cfg.OpenSpec.Enabled {
+		toolboxConfig.EnableOpenSpec = true
+		toolboxConfig.OpenSpecRootDir = cfg.OpenSpec.RootDir
+		toolboxConfig.OpenSpecDefaultSchema = cfg.OpenSpec.DefaultSchema
+		toolboxConfig.OpenSpecMaxArtifact = cfg.OpenSpec.MaxArtifactSize
+	}
+
+	return toolboxConfig
+}
+
+func newAgentLLMClient(cfg *config.Config, toolbox *tools.Toolbox) llm.LLMClient {
+	primary, fallbacks, err := llm.ResolveRoutes(cfg)
+	if err != nil {
+		logger.Warnf("failed to resolve model routes; falling back to legacy client: %v", err)
+		return llm.NewClient(
+			cfg.APIKey,
+			cfg.BaseURL,
+			cfg.Model,
+			toolbox.List(),
+		)
+	}
+	if len(fallbacks) == 0 {
+		return llm.NewClientForRoute(primary, toolbox.List(), cfg)
+	}
+	routes := append([]llm.ResolvedRoute{primary}, fallbacks...)
+	return llm.NewMultiRouteClient(routes, toolbox.List(), cfg)
+}
+
+func newAgentMemoryManager(cfg *config.Config, workingDir string) *memory.Manager {
+	return memory.NewManager(workingDir, "", cfg.Memory != nil)
+}
+
+func newAgentToolScheduler(cfg *config.Config, toolbox *tools.Toolbox) *ToolScheduler {
+	defaultEventHandler := func(event event.StreamEvent) {
+		logger.Debugf("Tool scheduler event: %s", event.Type)
+	}
+	recovery := newAgentToolRecoveryStrategy(cfg, defaultEventHandler)
+
+	toolScheduler := NewToolSchedulerWithOptions(ToolSchedulerOptions{
+		Toolbox:          toolbox,
+		EventHandler:     defaultEventHandler,
+		RecoveryStrategy: recovery,
+	})
+	toolScheduler.SetAgentConfig(cfg)
+	return toolScheduler
+}
+
+func startToolboxLLMUpdates(ctx context.Context, toolbox *tools.Toolbox, client llm.LLMClient, onToolsChanged func([]interfaces.Tool)) {
+	go func() {
+		ch := toolbox.GetToolsUpdateChannel()
+		for {
+			select {
+			case event, ok := <-ch:
+				if !ok {
+					return
+				}
+				logger.Debugf("Received tools update event: %s", event.Type)
+				client.UpdateTools(event.Tools)
+				logger.Infof("Updated LLM client with %d tools after MCP registration", len(event.Tools))
+				if onToolsChanged != nil {
+					onToolsChanged(event.Tools)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func newAgentToolRecoveryStrategy(cfg *config.Config, eventHandler func(event.StreamEvent)) *ToolRecoveryStrategy {
+	recovery := NewToolRecoveryStrategy(eventHandler)
+	if cfg.ToolRecovery == nil {
+		return recovery
+	}
+
+	maxRetries := cfg.ToolRecovery.Default.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	retryDelay := cfg.ToolRecovery.Default.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = time.Second
+	}
+	backoffMultiplier := cfg.ToolRecovery.Default.BackoffMultiplier
+	if backoffMultiplier <= 0 {
+		backoffMultiplier = 2.0
+	}
+	recovery.UpdateStrategy(maxRetries, retryDelay, backoffMultiplier)
+
+	maxDelay := cfg.ToolRecovery.Default.MaxDelay
+	if maxDelay <= 0 {
+		maxDelay = 30 * time.Second
+	}
+	jitterRatio := cfg.ToolRecovery.Default.JitterRatio
+	if jitterRatio < 0 {
+		jitterRatio = 0
+	}
+	recovery.UpdateBackoffOptions(maxDelay, jitterRatio)
+
+	for toolName, p := range cfg.ToolRecovery.PerTool {
+		recovery.SetToolPolicy(toolName, ToolRetryPolicy{
+			MaxRetries:        p.MaxRetries,
+			RetryDelay:        p.RetryDelay,
+			BackoffMultiplier: p.BackoffMultiplier,
+			MaxDelay:          p.MaxDelay,
+			JitterRatio:       p.JitterRatio,
+		})
+	}
+
+	return recovery
+}
+
+func newAgentStateStore(cfg *config.Config) *config.StateStore {
+	schedulerEnabled := true
+	stateFilePath := ""
+	if cfg.Scheduler != nil {
+		schedulerEnabled = cfg.Scheduler.Enabled
+		stateFilePath = cfg.Scheduler.StateFile
+	}
+	if !schedulerEnabled {
+		return nil
+	}
+
+	if stateFilePath == "" {
+		if defaultPath, err := config.DefaultStateStorePath(); err == nil {
+			stateFilePath = defaultPath
+		}
+	}
+	if stateFilePath == "" {
+		return nil
+	}
+
+	stateStore := config.NewStateStore(stateFilePath)
+	if err := stateStore.Load(); err != nil {
+		logger.Warnf("Failed to load state store: %v", err)
+	}
+	return stateStore
+}
+
+func newAgentSessionManager(cfg *config.Config, workingDir string) *SessionManager {
+	return NewSessionManager(
+		WithSessionTTL(30*time.Minute),
+		WithSessionStorage(newAgentSessionStorage(cfg, workingDir)),
+	)
+}
+
+func newAgentSessionStorage(cfg *config.Config, workingDir string) SessionStorage {
+	if cfg.OSS != nil && cfg.OSS.Enabled {
+		storage, err := NewOSSSessionStorage(cfg.OSS)
+		if err != nil {
+			logger.Errorf("Failed to initialize OSS session storage: %v", err)
+		} else {
+			logger.Info("OSS session storage initialized")
+			return storage
+		}
+	}
+
+	if workingDir != "" && !cfg.IsDaemon {
+		projectStorage, err := NewProjectSessionStorage(workingDir)
+		if err != nil {
+			logger.Warnf("Failed to initialize project session storage: %v, falling back to local storage", err)
+			logger.Info("Local session storage initialized (fallback)")
+			return NewLocalSessionStorage("")
+		}
+		logger.Info("Project session storage initialized")
+		return projectStorage
+	}
+
+	logger.Info("Local session storage initialized")
+	return NewLocalSessionStorage("")
+}
+
+func newAgentPermissionManager(cfg *config.Config, workingDir string) *permission.Manager {
+	mode := permission.ModeDefault
+	switch permission.PermissionMode(cfg.PermissionMode) {
+	case permission.ModeAcceptEdits, permission.ModePlan, permission.ModeAuto, permission.ModeYOLO:
+		mode = permission.PermissionMode(cfg.PermissionMode)
+	}
+	var rules []permission.PermissionRule
+	if mode == permission.ModeAuto && cfg.PermissionAuto != nil {
+		for _, raw := range permission.ApplyModeAutoHardening(cfg.PermissionAuto.AllowRules) {
+			rules = append(rules, permission.ParseRule(raw))
+		}
+	} else {
+		for _, raw := range cfg.AllowedRules {
+			rules = append(rules, permission.ParseRule(raw))
+		}
+	}
+	pm := permission.NewManagerWithWorkdir(mode, rules, workingDir)
+
+	// Wire classifier for ModeAuto
+	if mode == permission.ModeAuto && cfg.PermissionAuto != nil {
+		classifier := wirePermissionClassifier(cfg)
+		if classifier != nil {
+			pm.SetClassifier(classifier)
+			if cfg.PermissionAuto.ConfidenceThreshold > 0 {
+				pm.SetConfidenceThreshold(cfg.PermissionAuto.ConfidenceThreshold)
+			}
+		}
+		// Apply fail-closed setting from policy.classifier if present.
+		if cfg.Policy != nil && cfg.Policy.Classifier != nil {
+			pm.SetFailClosed(cfg.Policy.Classifier.FailClosed)
+		}
+
+		maxConsecutive := cfg.PermissionAuto.DenialMaxConsecutive
+		maxTotal := cfg.PermissionAuto.DenialMaxTotal
+		if maxConsecutive == 0 {
+			maxConsecutive = 3
+		}
+		if maxTotal == 0 {
+			maxTotal = 20
+		}
+		pm.SetDenialTracker(permission.NewDenialTracker(maxConsecutive, maxTotal))
+	}
+
+	return pm
+}
+
+// wirePermissionClassifier constructs a Classifier based on cfg.PermissionAuto settings.
+// When cfg.Policy.Classifier is enabled with two-stage configuration, a
+// TwoStageClassifier (Fast→Deep) is returned instead of a single LLMClassifier.
+func wirePermissionClassifier(cfg *config.Config) permission.Classifier {
+	if cfg.PermissionAuto == nil {
+		return nil
+	}
+
+	backend := cfg.PermissionAuto.Backend
+	if backend == "" {
+		backend = "llm" // default
+	}
+
+	switch backend {
+	case "fail_closed":
+		timeout := 15 * time.Second
+		if cfg.PermissionAuto.TimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
+		}
+		return &permission.FailClosedClassifier{
+			Reason:   "fail_closed backend configured",
+			Timeout_: timeout,
+		}
+
+	case "llm":
+		// Check for two-stage classifier configuration under policy.classifier.
+		if cfg.Policy != nil && cfg.Policy.Classifier != nil && cfg.Policy.Classifier.Enabled {
+			return wireTwoStageClassifier(cfg)
+		}
+		return wireSingleStageClassifier(cfg)
+
+	default:
+		logger.Warnf("Unknown permission_auto backend %q, falling back to nil classifier", backend)
+		return nil
+	}
+}
+
+// wireSingleStageClassifier builds a single LLMClassifier wrapped with caching.
+func wireSingleStageClassifier(cfg *config.Config) permission.Classifier {
+	model := cfg.PermissionAuto.Model
+	if model == "" {
+		model = cfg.Model
+	}
+
+	timeout := 15 * time.Second
+	if cfg.PermissionAuto.TimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
+	}
+
+	llmClassifier := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, model, timeout)
+
+	cacheTTL := 30 * time.Minute
+	if cfg.PermissionAuto.CacheTTLMinutes > 0 {
+		cacheTTL = time.Duration(cfg.PermissionAuto.CacheTTLMinutes) * time.Minute
+	}
+
+	return &permission.CachingClassifier{
+		Delegate: llmClassifier,
+		TTL:      cacheTTL,
+		MaxSize:  512,
+	}
+}
+
+// wireTwoStageClassifier builds a TwoStageClassifier from policy.classifier config.
+func wireTwoStageClassifier(cfg *config.Config) permission.Classifier {
+	cc := cfg.Policy.Classifier
+
+	// Stage 1 (fast) timeout — configurable; default 15s.
+	fastTimeout := 15 * time.Second
+	if cc.Timeout > 0 {
+		fastTimeout = cc.Timeout
+	} else if cfg.PermissionAuto.TimeoutSeconds > 0 {
+		fastTimeout = time.Duration(cfg.PermissionAuto.TimeoutSeconds) * time.Second
+	}
+
+	// Stage 2 (deep) timeout — 2× Stage 1, minimum 15s.
+	deepTimeout := fastTimeout * 2
+	if deepTimeout < 15*time.Second {
+		deepTimeout = 15 * time.Second
+	}
+
+	// Stage 1 model: fast_model → permission_auto.model → main model.
+	fastModel := cc.FastModel
+	if fastModel == "" {
+		fastModel = cfg.PermissionAuto.Model
+	}
+	if fastModel == "" {
+		fastModel = cfg.Model
+	}
+
+	// Stage 2 model: think_model → same as fast model (degraded but functional).
+	deepModel := cc.ThinkModel
+	if deepModel == "" {
+		deepModel = fastModel
+	}
+
+	fast := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, fastModel, fastTimeout)
+	deep := permission.NewLLMClassifier(cfg.APIKey, cfg.BaseURL, deepModel, deepTimeout)
+
+	twoStage := &permission.TwoStageClassifier{
+		Fast:       fast,
+		Deep:       deep,
+		FailClosed: cc.FailClosed,
+	}
+
+	// Wrap with caching so identical (tool, params) pairs skip both stages.
+	cacheTTL := 30 * time.Minute
+	if cfg.PermissionAuto.CacheTTLMinutes > 0 {
+		cacheTTL = time.Duration(cfg.PermissionAuto.CacheTTLMinutes) * time.Minute
+	}
+	if cc.CacheTTL > 0 {
+		cacheTTL = cc.CacheTTL
+	}
+	cacheSize := 512
+	if cc.CacheSize > 0 {
+		cacheSize = cc.CacheSize
+	}
+
+	return &permission.CachingClassifier{
+		Delegate: twoStage,
+		TTL:      cacheTTL,
+		MaxSize:  cacheSize,
+	}
+}
+
+func newAgentSkillManager(cfg *config.Config, workingDir string, stateStore *config.StateStore) *skill.Manager {
+	if cfg.Skills == nil || !cfg.Skills.Enabled {
+		return nil
+	}
+
+	sm := skill.NewManager(
+		workingDir,
+		cfg.Skills.PersonalDir,
+		cfg.Skills.ProjectDir,
+		cfg.Skills.MaxSkillSize,
+		cfg.Skills.MaxSkills,
+		cfg.Skills.MaxActiveSkills,
+		cfg.Skills.AutoInvoke,
+	)
+	if stateStore != nil {
+		sm.SetStateStore(stateStore)
+	}
+	sm.EnableBuiltinSkills(cfg.Skills.AutoActivate)
+	if err := sm.Discover(); err != nil {
+		logger.Warnf("Failed to discover skills: %v", err)
+		return nil
+	}
+
+	logger.Infof("Skills support initialized: %d skills discovered", sm.Count())
+	if stateStore != nil {
+		for _, skillName := range stateStore.GetActiveSkills() {
+			if err := sm.ActivateSkill(skillName); err != nil {
+				logger.Warnf("Failed to restore active skill %q: %v", skillName, err)
+			}
+		}
+	}
+	for _, skillName := range cfg.Skills.AutoActivate {
+		if err := sm.ActivateSkill(skillName); err != nil {
+			logger.Warnf("Failed to auto-activate skill %q: %v", skillName, err)
+		}
+	}
+
+	return sm
+}
+
+func maybeStartAgentMCPClient(cfg *config.Config, toolbox *tools.Toolbox) {
+	if !cfg.EnableMCP || !toolbox.IsMCPEnabled() {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		logger.Info("Starting MCP client asynchronously with 60s timeout...")
+		err := toolbox.StartMCP(ctx)
+		if err != nil {
+			logger.Errorf("Failed to start MCP client: %v", err)
+			logger.Warn("Continuing without MCP functionality")
+		} else {
+			logger.Info("MCP client started successfully")
+		}
+	}()
+	logger.Info("MCP client initialization started in background")
+}
+
+func newPreloadedSystemPromptBuilder(cfg *config.Config, workingDir string, toolbox *tools.Toolbox, memoryManager *memory.Manager) *SystemPromptBuilder {
+	preloadSPB := NewSystemPromptBuilder(workingDir, toolbox.List(), memoryManager, cfg)
+	if cfg.UserInfo != nil && cfg.UserInfo.AutoDetectUserInfo && cfg.CustomSystemPrompt == "" {
+		preloadSPB.PreloadUserInfo()
+	}
+	return preloadSPB
+}
+
+func newAgentHookEngine(cfg *config.Config, workingDir string) *middleware.HookEngine {
+	var hooks []middleware.Hook
+	if cfg.Hooks != nil && len(cfg.Hooks.Events) > 0 {
+		for eventKey, cmds := range cfg.Hooks.Events {
+			ev := normalizeHookEventName(eventKey)
+			for i, cmd := range cmds {
+				pattern := strings.TrimSpace(cmd.Matcher)
+				if pattern == "" {
+					pattern = "*"
+				}
+				hooks = append(hooks, middleware.Hook{
+					Name:    fmt.Sprintf("%s-%d", eventKey, i),
+					Event:   ev,
+					Pattern: pattern,
+					Command: cmd.Command,
+					Enabled: true,
+					Timeout: time.Duration(cmd.Timeout) * time.Second,
+				})
+			}
+		}
+	}
+
+	firewallEnabled := cfg.Firewall == nil || cfg.Firewall.Enabled
+	if len(hooks) == 0 && !firewallEnabled {
+		return nil
+	}
+
+	hookEngine := middleware.NewHookEngine(hooks)
+	if firewallEnabled {
+		hookEngine.RegisterProgrammaticHook(permission.NewFirewallHook(newAgentFirewallConfig(cfg.Firewall)))
+	}
+	return hookEngine
+}
+
+// wireModelSwitchHooks connects automatic model-route fallback switches on a
+// MultiRouteClient to the hook engine, firing pre_model_switch (with veto) and
+// post_model_switch (notification) lifecycle events.
+func wireModelSwitchHooks(llmClient llm.LLMClient, hookEngine *middleware.HookEngine) {
+	mrc, ok := llmClient.(*llm.MultiRouteClient)
+	if !ok || hookEngine == nil {
+		return
+	}
+	switchParams := func(sw llm.ModelSwitchEvent) map[string]interface{} {
+		return map[string]interface{}{
+			"from_route": sw.FromRoute,
+			"old_model":  sw.FromModel,
+			"to_route":   sw.ToRoute,
+			"new_model":  sw.ToModel,
+			"reason":     sw.Reason,
+		}
+	}
+	mrc.SetModelSwitchHooks(llm.ModelSwitchHooks{
+		Pre: func(ctx context.Context, sw llm.ModelSwitchEvent) string {
+			decision, err := hookEngine.Execute(ctx, middleware.HookPreModelSwitch, "", switchParams(sw))
+			if err != nil {
+				logger.Warnf("pre_model_switch hook error: %v", err)
+				return ""
+			}
+			if decision != nil && decision.Action != middleware.ActionAllow {
+				return decision.Reason
+			}
+			return ""
+		},
+		Post: func(ctx context.Context, sw llm.ModelSwitchEvent) {
+			if _, err := hookEngine.Execute(ctx, middleware.HookPostModelSwitch, "", switchParams(sw)); err != nil {
+				logger.Warnf("post_model_switch hook error: %v", err)
+			}
+		},
+	})
+}
+
+func normalizeHookEventName(key string) hookservice.Event {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return hookservice.EventPreToolUse
+	}
+	normalized := strings.ToLower(trimmed)
+	normalized = strings.ReplaceAll(normalized, "_", "")
+	normalized = strings.ReplaceAll(normalized, "-", "")
+
+	switch normalized {
+	case "pretooluse":
+		return hookservice.EventPreToolUse
+	case "posttooluse":
+		return hookservice.EventPostToolUse
+	case "posttoolusefailure":
+		return hookservice.EventPostToolUseFailure
+	case "sessionstart":
+		return hookservice.EventSessionStart
+	case "sessionend":
+		return hookservice.EventSessionEnd
+	case "precompact":
+		return hookservice.EventPreCompact
+	case "postcompact":
+		return hookservice.EventPostCompact
+	case "userpromptsubmit":
+		return hookservice.EventUserPromptSubmit
+	case "stop":
+		return hookservice.EventStop
+	case "stopfailure":
+		return hookservice.EventStopFailure
+	case "subagentstart":
+		return hookservice.EventSubagentStart
+	case "subagentstop":
+		return hookservice.EventSubagentStop
+	case "permissionrequest":
+		return hookservice.EventPermissionRequest
+	case "permissiondenied":
+		return hookservice.EventPermissionDenied
+	case "notification":
+		return hookservice.EventNotification
+	case "premodelswitch":
+		return hookservice.EventPreModelSwitch
+	case "postmodelswitch":
+		return hookservice.EventPostModelSwitch
+	default:
+		logger.Warnf("Unknown hook event %q; defaulting to pre_tool_use", key)
+		return hookservice.EventPreToolUse
+	}
+}
+
+func newAgentFirewallConfig(cfg *config.FirewallConfig) permission.FirewallConfig {
+	firewallConfig := permission.DefaultFirewallConfig()
+	if cfg == nil {
+		return firewallConfig
+	}
+	if cfg.SeverityThreshold != "" {
+		firewallConfig.SeverityThreshold = permission.Severity(cfg.SeverityThreshold)
+	}
+	if cfg.FailurePolicy != "" {
+		firewallConfig.FailurePolicy = cfg.FailurePolicy
+	}
+	firewallConfig.CustomPatterns = convertFirewallPatterns(cfg.CustomPatterns)
+	firewallConfig.Overrides = append([]string(nil), cfg.Overrides...)
+	return firewallConfig
+}
+
+func convertFirewallPatterns(patterns []config.DangerousCommandPattern) []permission.DangerousCommandRule {
+	var rules []permission.DangerousCommandRule
+	for _, p := range patterns {
+		rules = append(rules, permission.DangerousCommandRule{
+			Pattern:  p.Pattern,
+			Reason:   p.Reason,
+			Severity: permission.Severity(p.Severity),
+			Category: p.Category,
+		})
+	}
+	return rules
+}
